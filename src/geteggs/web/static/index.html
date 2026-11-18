@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GetEggs · 本地自动签到控制台</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-badge">🥚</div>
+        <div>
+          <h1>GetEggs</h1>
+          <p class="subtitle">Local-First AI Agent 自动签到控制台</p>
+        </div>
+      </div>
+
+      <nav class="nav" role="tablist">
+        <button class="nav-btn active" data-tab="overview">总览看板</button>
+        <button class="nav-btn" data-tab="doctor">体检与日志</button>
+        <button class="nav-btn" data-tab="history">历史账本</button>
+        <button class="nav-btn" data-tab="settings">调度与设置</button>
+      </nav>
+
+      <div class="topbar-actions">
+        <span id="biz-date-pill" class="pill pill-muted">--</span>
+        <button id="btn-run-all" class="btn btn-primary">立即签到</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <!-- Tab 1: Overview -->
+      <section id="tab-overview" class="tab-panel active">
+        <div class="metrics-grid">
+          <article class="metric-card">
+            <span class="metric-label">累计可用积分（最近快照）</span>
+            <strong id="metric-balance" class="metric-value">--</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">今日新增积分</span>
+            <strong id="metric-today-delta" class="metric-value accent">+0</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Windows 计划任务</span>
+            <strong id="metric-schedule" class="metric-value small">--</strong>
+          </article>
+        </div>
+
+        <div class="section-header">
+          <h2>已接入工具</h2>
+          <div class="inline-actions">
+            <button id="btn-dry-run" class="btn btn-ghost">全部预检</button>
+            <button id="btn-refresh-overview" class="btn btn-ghost">刷新</button>
+          </div>
+        </div>
+
+        <div class="provider-toolbar">
+          <label class="checkbox-field compact">
+            <input id="select-all-providers" type="checkbox" checked />
+            <span>全选工具</span>
+          </label>
+          <span id="selected-provider-count" class="muted">已选 0 个</span>
+          <div class="inline-actions">
+            <button id="btn-run-selected" class="btn btn-primary">运行已选</button>
+            <button id="btn-dry-run-selected" class="btn btn-ghost">预检已选</button>
+          </div>
+        </div>
+
+        <div id="providers-grid" class="providers-grid"></div>
+
+        <div class="panel chart-panel">
+          <div class="section-header">
+            <h2>近 30 天积分领取趋势</h2>
+            <span class="muted">按业务自然日聚合（Asia/Shanghai）</span>
+          </div>
+          <div id="trend-chart" class="trend-chart"></div>
+        </div>
+      </section>
+
+      <!-- Tab 2: Doctor & Live Stream -->
+      <section id="tab-doctor" class="tab-panel">
+        <div class="section-header">
+          <h2>本地环境与凭证体检</h2>
+          <button id="btn-run-doctor" class="btn btn-primary">一键体检</button>
+        </div>
+        <div id="doctor-results" class="doctor-grid">
+          <div class="panel muted">点击“一键体检”扫描本机客户端安装路径与登录态健康度（全程只读，不泄露明文 Token）。</div>
+        </div>
+
+        <div class="section-header" style="margin-top: 24px;">
+          <h2>实时执行日志 (SSE)</h2>
+          <button id="btn-clear-logs" class="btn btn-ghost">清空日志</button>
+        </div>
+        <pre id="sse-terminal" class="terminal">等待执行任务...</pre>
+      </section>
+
+      <!-- Tab 3: History -->
+      <section id="tab-history" class="tab-panel">
+        <div class="section-header">
+          <h2>本月打卡日历</h2>
+          <div class="inline-actions">
+            <select id="history-provider" class="input">
+              <option value="">全部工具</option>
+            </select>
+            <input id="history-month" type="month" class="input" />
+            <button id="btn-load-history" class="btn btn-ghost">查询</button>
+            <button id="btn-load-more-history" class="btn btn-ghost">加载更多</button>
+          </div>
+        </div>
+        <div id="calendar-grid" class="calendar-grid panel"></div>
+
+        <div class="section-header" style="margin-top: 24px;">
+          <h2>签到流水记录</h2>
+        </div>
+        <div class="panel table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>工具</th>
+                <th>状态</th>
+                <th>变动</th>
+                <th>余额</th>
+                <th>连签</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody id="history-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="section-header" style="margin-top: 24px;">
+          <h2>最近执行批次</h2>
+          <button id="btn-refresh-runs" class="btn btn-ghost">刷新</button>
+        </div>
+        <div class="panel table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>开始时间</th>
+                <th>触发方式</th>
+                <th>批次状态</th>
+                <th>结束时间</th>
+                <th>批次 ID</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="runs-tbody"></tbody>
+          </table>
+        </div>
+
+        <div id="run-detail" class="panel" style="margin-top: 16px; display: none;"></div>
+      </section>
+
+      <!-- Tab 4: Settings -->
+      <section id="tab-settings" class="tab-panel">
+        <div class="settings-grid">
+          <form id="form-global-settings" class="panel form-card">
+            <h2>全局调度与通知设置</h2>
+            <label class="field">
+              <span>每日计划执行时间（24小时制）</span>
+              <input id="set-schedule-time" type="time" class="input" required />
+            </label>
+            <label class="field">
+              <span>随机抖动窗口（分钟，防整点并发）</span>
+              <input id="set-jitter-minutes" type="number" min="0" max="120" class="input" required />
+            </label>
+            <label class="checkbox-field">
+              <input id="set-toast-enabled" type="checkbox" />
+              <span>启用 Windows 系统右下角弹窗通知</span>
+            </label>
+            <label class="checkbox-field">
+              <input id="set-notify-already" type="checkbox" />
+              <span>今日已签跳过时也发送通知</span>
+            </label>
+            <label class="checkbox-field">
+              <input id="set-catchup-logon" type="checkbox" />
+              <span>开机 / 解锁登录时自动补跑今日漏签</span>
+            </label>
+            <hr class="divider" />
+            <h3>数据清理</h3>
+            <label class="checkbox-field">
+              <input id="set-auto-cleanup" type="checkbox" />
+              <span>每日自动清理过期数据（由定时签到触发）</span>
+            </label>
+            <label class="field">
+              <span>执行日志保留天数</span>
+              <input id="set-events-retention" type="number" min="1" max="3650" class="input" />
+            </label>
+            <label class="field">
+              <span>通知记录保留天数</span>
+              <input id="set-notification-retention" type="number" min="1" max="3650" class="input" />
+            </label>
+            <label class="field">
+              <span>运行批次保留天数</span>
+              <input id="set-run-retention" type="number" min="1" max="3650" class="input" />
+            </label>
+            <label class="field">
+              <span>签到流水保留天数</span>
+              <input id="set-ledger-retention" type="number" min="1" max="3650" class="input" />
+            </label>
+            <label class="field">
+              <span>VACUUM 间隔天数</span>
+              <input id="set-vacuum-interval" type="number" min="1" max="3650" class="input" />
+            </label>
+            <div id="maintenance-info" class="info-box">--</div>
+            <div class="form-actions">
+              <button type="button" id="btn-run-maintenance" class="btn btn-ghost">立即清理旧数据</button>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">保存配置</button>
+              <button type="button" id="btn-test-toast" class="btn btn-ghost">发送测试弹窗</button>
+            </div>
+          </form>
+
+          <div class="panel form-card">
+            <h2>Windows 系统计划任务</h2>
+            <p class="muted">注册后即使关闭本网页，每天到点仍会静默执行签到并在系统睡醒/登录后自动补漏。</p>
+            <div id="schedule-detail-box" class="info-box">--</div>
+            <div class="form-actions">
+              <button id="btn-install-schedule" class="btn btn-primary">安装 / 更新计划任务</button>
+              <button id="btn-uninstall-schedule" class="btn btn-danger">卸载计划任务</button>
+            </div>
+
+            <hr class="divider" />
+            <h3>Web 服务生命周期</h3>
+            <p class="muted">查看完毕后可随时关闭当前本地 Web 进程，已注册的定时任务不受影响。</p>
+            <div class="form-actions">
+              <button id="btn-shutdown-web" class="btn btn-ghost">关闭 Web 服务</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="provider-settings-container" class="panel form-card" style="margin-top: 20px;">
+          <div class="section-header">
+            <div>
+              <h2>工具接入</h2>
+              <p class="muted">勾选需要自动签到的工具；标记为“即将支持”的工具暂不可启用。</p>
+            </div>
+          </div>
+          <div id="tool-catalog-grid" class="tool-catalog-grid"></div>
+        </div>
+
+        <div class="panel form-card" style="margin-top: 20px;">
+          <h2>WorkBuddy 适配器路径与覆盖设置</h2>
+          <p class="muted">通常无需填写，系统会自动扫描标准目录；若安装在自定义位置或需要指定接口域名，可在此覆盖。</p>
+          <form id="form-workbuddy-settings" class="subgrid-form">
+            <label class="field">
+              <span>自定义登录态文件路径 (workbuddy-desktop.info)</span>
+              <input id="wb-auth-path" type="text" class="input" placeholder="留空自动探测，如 C:\Users\...\workbuddy-desktop.info" />
+            </label>
+            <label class="field">
+              <span>自定义客户端 exe 路径</span>
+              <input id="wb-exe-path" type="text" class="input" placeholder="留空自动探测，如 D:\WorkBuddy\WorkBuddy.exe" />
+            </label>
+            <label class="field">
+              <span>自定义 API Base URL</span>
+              <input id="wb-base-url" type="text" class="input" placeholder="留空自动推断，如 https://www.codebuddy.cn" />
+            </label>
+            <label class="field">
+              <span>自定义浏览器会话文件路径 (storageState JSON)</span>
+              <input id="wb-browser-state" type="text" class="input" placeholder="留空使用默认路径，如 C:\Users\...\workbuddy_browser_state.json" />
+            </label>
+            <label class="field">
+              <span>Provider 最早可执行时间（补跑时生效）</span>
+              <input id="wb-earliest-time" type="time" class="input" />
+            </label>
+            <label class="field">
+              <span>Provider 级随机抖动（分钟，0-120；留空继承全局）</span>
+              <input id="wb-jitter-minutes" type="number" min="0" max="120" class="input" placeholder="继承全局设置" />
+            </label>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">保存 WorkBuddy 设置</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel form-card" style="margin-top: 20px;">
+          <h2>Qoder CN 接入配置</h2>
+          <p class="muted">
+            可直接在下方填写 PAT（保存在本机加密存储，优先级最高）；留空时依次读取环境变量
+            <code>QODERCN_PERSONAL_ACCESS_TOKEN</code> 和只读 PAT 文件。
+            PAT 不会写入数据库，也不会出现在日志和接口响应中。
+          </p>
+          <label class="field">
+            <span>Qoder CN PAT（推荐直接填写）</span>
+            <input id="qoder-pat-token" type="password" class="input" autocomplete="off" spellcheck="false" placeholder="粘贴 pt- / jt- 开头的 PAT" />
+          </label>
+          <div class="form-actions" style="margin-bottom: 12px;">
+            <button id="btn-save-qoder-pat" type="button" class="btn btn-primary">保存 PAT</button>
+            <button id="btn-clear-qoder-pat" type="button" class="btn btn-ghost">清除已保存 PAT</button>
+          </div>
+          <p id="qoder-pat-status" class="muted">PAT 状态读取中...</p>
+          <form id="form-qoder-settings" class="subgrid-form">
+            <label class="field">
+              <span>PAT 文件路径（可选，文件内容为 pt- 开头的令牌）</span>
+              <input id="qoder-pat-file" type="text" class="input" placeholder="留空则不读取 PAT 文件，如 C:\Users\...\qoder_pat.txt" />
+            </label>
+            <label class="field">
+              <span>自定义客户端 exe 路径</span>
+              <input id="qoder-exe-path" type="text" class="input" placeholder="留空自动探测，如 C:\Users\...\Qoder.exe" />
+            </label>
+            <label class="field">
+              <span>Provider 最早可执行时间（补跑时生效）</span>
+              <input id="qoder-earliest-time" type="time" class="input" />
+            </label>
+            <label class="field">
+              <span>Provider 级随机抖动（分钟，0-120；留空继承全局）</span>
+              <input id="qoder-jitter-minutes" type="number" min="0" max="120" class="input" placeholder="继承全局设置" />
+            </label>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">保存 Qoder 设置</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel table-wrap" style="margin-top: 20px;">
+          <div class="section-header">
+            <h2>最近通知记录</h2>
+            <button id="btn-refresh-notifications" class="btn btn-ghost">刷新</button>
+          </div>
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>发送时间</th>
+                <th>渠道</th>
+                <th>级别</th>
+                <th>标题</th>
+                <th>结果</th>
+                <th>错误信息</th>
+              </tr>
+            </thead>
+            <tbody id="notifications-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast-banner" class="toast-banner" aria-live="polite"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

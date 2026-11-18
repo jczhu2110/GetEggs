@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local runtime state & logs
+.geteggs/
+data/
+backups/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.lock
+ui-state.json
+
+# Test / browser artifacts
+test-results/
+playwright-report/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
