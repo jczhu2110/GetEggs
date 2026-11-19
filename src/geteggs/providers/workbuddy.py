@@ -655,6 +655,11 @@ class WorkBuddyProvider(BaseProvider):
             if expiring_at is None and isinstance(raw_expiring_at, str):
                 expiring_at = raw_expiring_at.strip() or None
 
+        # 状态接口在“已签到”场景会返回 0，但这不是有效连签天数；
+        # 统一按未知处理，避免覆盖签到成功时记录的真实连签。
+        if streak is not None and streak <= 0:
+            streak = None
+
         return checked_in, CreditSnapshot(
             streak_days=streak,
             expiring_soon=expiring_soon,
@@ -708,8 +713,29 @@ class WorkBuddyProvider(BaseProvider):
         code = body.get("code")
         msg_text = str(body.get("message") or body.get("msg") or "")
         low_msg = msg_text.lower()
+        reward = _to_int(
+            extract_first(
+                body,
+                "rewardCredits",
+                "reward_credits",
+                "earnedCredits",
+                "earned_credits",
+                "delta",
+                "points",
+                "reward",
+            )
+        )
 
-        if code == 10001 or "already" in low_msg or "已签到" in msg_text or "重复" in msg_text:
+        # "已领取" alone is an already-done hint. A success message such as
+        # "签到成功，已领取 100 积分" must remain a real success.
+        success_hint = any(marker in msg_text for marker in ("签到成功", "领取成功"))
+        already_hint = (
+            code == 10001
+            or "already" in low_msg
+            or any(marker in msg_text for marker in ("已签到", "今日已签", "重复"))
+            or ("已领取" in msg_text and not success_hint)
+        )
+        if already_hint and (code == 10001 or reward is None):
             return CheckinResult(
                 provider_id=self.id,
                 display_name=self.display_name,
@@ -741,23 +767,13 @@ class WorkBuddyProvider(BaseProvider):
                 raw_error_type=f"Code_{code}",
             )
 
-        reward = _to_int(
-            extract_first(
-                body,
-                "rewardCredits",
-                "reward_credits",
-                "earnedCredits",
-                "earned_credits",
-                "delta",
-                "points",
-                "reward",
-            )
-        )
         delta = reward if reward is not None else default_credits
         delta = min(max(delta, 0), MAX_CHECKIN_CREDITS)
         streak = _to_int(
             extract_first(body, "streakDays", "streak_days", "continuousDays")
         )
+        if streak is not None and streak <= 0:
+            streak = None
 
         if post_snapshot is not None and streak is None:
             streak = post_snapshot.streak_days
@@ -1077,6 +1093,19 @@ class WorkBuddyProvider(BaseProvider):
                         log=log,
                         started=started,
                     )
+                browser_creds = self._load_browser_credentials(config, info_err)
+                if browser_creds is not None:
+                    if log:
+                        log("info", "桌面登录态不可用，切换受控浏览器会话重试...")
+                    return await self._checkin_via_browser(
+                        config,
+                        biz_date,
+                        uid=browser_creds.uid,
+                        base_url=active_url,
+                        dry_run=dry_run,
+                        log=log,
+                        started=started,
+                    )
                 return CheckinResult(
                     provider_id=self.id,
                     display_name=self.display_name,
@@ -1210,16 +1239,30 @@ class WorkBuddyProvider(BaseProvider):
                     raw_error_type=type(exc).__name__,
                 )
 
-            if checkin_resp.status_code in (401, 403) and using_browser_state:
-                return await self._checkin_via_browser(
-                    config,
-                    biz_date,
-                    uid=creds.uid,
-                    base_url=active_url,
-                    dry_run=dry_run,
-                    log=log,
-                    started=started,
-                )
+            if checkin_resp.status_code in (401, 403):
+                if using_browser_state:
+                    return await self._checkin_via_browser(
+                        config,
+                        biz_date,
+                        uid=creds.uid,
+                        base_url=active_url,
+                        dry_run=dry_run,
+                        log=log,
+                        started=started,
+                    )
+                browser_creds = self._load_browser_credentials(config, info_err)
+                if browser_creds is not None:
+                    if log:
+                        log("info", "提交签到返回未授权，切换受控浏览器会话重试...")
+                    return await self._checkin_via_browser(
+                        config,
+                        biz_date,
+                        uid=browser_creds.uid,
+                        base_url=active_url,
+                        dry_run=dry_run,
+                        log=log,
+                        started=started,
+                    )
 
             if checkin_resp.status_code in (401, 403, 500) or checkin_resp.status_code >= 500:
                 return self._interpret_checkin_payload(

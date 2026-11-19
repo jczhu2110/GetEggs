@@ -398,8 +398,14 @@ export async function loadOverview(silent = false) {
         .map((p) => {
           const todayRec = p.today_record;
           const rec = p.latest_record;
-          const streak = todayRec?.streak_days ?? rec?.streak_days ?? "--";
-          const delta = todayRec?.delta ? `+${todayRec.delta}` : "0";
+          const streakValue = todayRec?.streak_days || rec?.streak_days;
+          const streak =
+            p.supports_streak === false ? "不适用" : streakValue || "--";
+          const delta = todayRec?.delta
+            ? `+${todayRec.delta}`
+            : todayRec?.status === "already_done"
+              ? "已签"
+              : "0";
           const msg =
             todayRec?.message ||
             (rec ? `最近记录 (${rec.biz_date})：${rec.message}` : "今日尚未执行签到");

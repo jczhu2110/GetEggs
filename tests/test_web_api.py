@@ -18,6 +18,7 @@ from geteggs.core.models import (
     ProviderConfig,
 )
 from geteggs.core.config import get_qoder_pat_path, today_biz_date
+from geteggs.core.lock import acquire_run_lock
 from geteggs.core.runner import CheckinRunner
 from geteggs.core.storage import Storage
 from geteggs.notifiers.base import BaseNotifier
@@ -94,6 +95,12 @@ class FakeTraeProvider(FakeWebProvider):
     display_name = "Fake Trae"
 
 
+class FixedBusinessDayWebProvider(FakeWebProvider):
+    id = "qoder"
+    display_name = "Fake Qoder"
+    fixed_business_day_start = "10:00"
+
+
 class BlockingWebProvider(FakeWebProvider):
     """Provider that keeps a run active until the test releases it."""
 
@@ -166,6 +173,7 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     body = overview.json()
     assert body["providers"][0]["provider_id"] == "workbuddy"
     assert body["providers"][0]["supports_browser_auth"] is True
+    assert body["providers"][0]["supports_streak"] is True
 
     # Notifier test endpoint succeeds.
     toast_resp = client.post("/api/notifiers/test")
@@ -195,6 +203,7 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     settings_provider = client.get("/api/settings").json()["providers"][0]
     assert settings_provider["checkin_credits"] == 250
     assert settings_provider["business_day_start"] == "10:00"
+    assert settings_provider["supports_streak"] is True
 
     reset_jitter = client.put(
         "/api/providers/workbuddy/config", json={"jitter_override": False}
@@ -261,6 +270,38 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert cleanup_body["ok"] is True
     assert cleanup_body["info"]["last_cleanup_at"]
     assert cleanup_body["backup"]
+
+
+def test_web_fixed_business_day_start_is_locked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _patch_schedule(monkeypatch)
+    storage = Storage(tmp_path / "fixed_day.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FixedBusinessDayWebProvider()],
+    )
+    client = TestClient(app)
+
+    provider_settings = client.get("/api/settings").json()["providers"][0]
+    assert provider_settings["fixed_business_day_start"] == "10:00"
+
+    rejected = client.put(
+        "/api/providers/qoder/config", json={"business_day_start": "09:00"}
+    )
+    assert rejected.status_code == 400
+    assert "固定" in rejected.json()["detail"]
+
+    accepted = client.put(
+        "/api/providers/qoder/config", json={"business_day_start": "10:00"}
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["provider"]["business_day_start"] == "10:00"
 
 
 def test_web_auth_browser_endpoint_delegates_to_provider(
@@ -507,6 +548,67 @@ def test_web_shutdown_rejects_active_run(tmp_path: Path) -> None:
 
     provider.release.set()
     time.sleep(0.3)
+
+
+def test_web_shutdown_rejects_external_run_lock(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "shutdown_lock.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FakeWebProvider()],
+    )
+    client = TestClient(app)
+
+    with acquire_run_lock(runner.lock_path):
+        blocked = client.post("/api/system/shutdown")
+
+    assert blocked.status_code == 409
+    assert "计划任务" in blocked.json()["detail"]
+
+
+def test_web_overview_uses_provider_business_date(tmp_path: Path) -> None:
+    class FixedBusinessDayProvider(FakeWebProvider):
+        def business_date(
+            self,
+            config: ProviderConfig,
+            tz_name: str = "Asia/Shanghai",
+            *,
+            now: Optional[object] = None,
+        ) -> str:
+            return "2026-11-18"
+
+    storage = Storage(tmp_path / "overview_business_day.db")
+    storage.save_checkin_result(
+        "seed-run",
+        CheckinResult(
+            provider_id="workbuddy",
+            display_name="Fake WorkBuddy",
+            status=CheckinStatus.SUCCESS,
+            message="上一业务日签到成功",
+            biz_date="2026-11-18",
+            snapshot=CreditSnapshot(delta=120, streak_days=3),
+        ),
+    )
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FixedBusinessDayProvider()],
+    )
+    client = TestClient(app)
+
+    body = client.get("/api/overview").json()
+
+    assert body["today_delta"] == 120
+    assert body["providers"][0]["today_record"]["biz_date"] == "2026-11-18"
+    assert body["providers"][0]["today_record"]["status"] == "success"
 
 
 def test_web_static_assets_and_settings_metadata(

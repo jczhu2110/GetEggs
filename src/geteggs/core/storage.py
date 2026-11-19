@@ -22,7 +22,8 @@ from geteggs.core.models import (
 )
 
 DEFAULT_DISABLED_PROVIDERS = {"qoder"}
-DEFAULT_BUSINESS_DAY_START = {"qoder": "10:00"}
+# Keep in sync with QoderProvider.fixed_business_day_start.
+FIXED_BUSINESS_DAY_START = {"qoder": "10:00"}
 
 SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -139,6 +140,17 @@ class Storage:
             self._drop_legacy_balance_column(conn)
             self._add_missing_provider_credit_column(conn)
             self._add_missing_business_day_column(conn)
+            self._normalize_fixed_business_day(conn)
+
+    @staticmethod
+    def _normalize_fixed_business_day(conn: sqlite3.Connection) -> None:
+        """Keep provider-locked business-day starts correct in older databases."""
+        for provider_id, start in FIXED_BUSINESS_DAY_START.items():
+            conn.execute(
+                "UPDATE provider_configs SET business_day_start = ? "
+                "WHERE provider_id = ? AND business_day_start <> ?",
+                (start, provider_id, start),
+            )
 
     @staticmethod
     def _add_missing_business_day_column(conn: sqlite3.Connection) -> None:
@@ -237,7 +249,7 @@ class Storage:
             return ProviderConfig(
                 provider_id=provider_id,
                 enabled=provider_id not in DEFAULT_DISABLED_PROVIDERS,
-                business_day_start=DEFAULT_BUSINESS_DAY_START.get(provider_id, "00:00"),
+                business_day_start=FIXED_BUSINESS_DAY_START.get(provider_id, "00:00"),
             )
         return ProviderConfig(
             provider_id=row["provider_id"],
@@ -388,7 +400,7 @@ class Storage:
         return dict(row) if row else None
 
     def get_latest_snapshot_record(self, provider_id: str) -> Optional[dict[str, Any]]:
-        """Return the latest record carrying a streak snapshot."""
+        """Return the latest record carrying a positive streak snapshot."""
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -396,6 +408,7 @@ class Storage:
                 WHERE provider_id = ?
                   AND dry_run = 0
                   AND streak_days IS NOT NULL
+                  AND streak_days > 0
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -428,11 +441,13 @@ class Storage:
 
         completed = [r["status"] for r in rows if r["status"] in ("success", "already_done")]
         latest = rows[-1]
-        message = latest["message"]
+        latest_success = next((r for r in reversed(rows) if r["status"] == "success"), None)
+        message = (latest_success or latest)["message"]
         if completed and latest["status"] not in ("success", "already_done"):
             message = f"今日已完成签到；最近一次重跑异常：{latest['message']}"
         streak_days = next(
-            (r["streak_days"] for r in reversed(rows) if r["streak_days"] is not None), None
+            (r["streak_days"] for r in reversed(rows) if (r["streak_days"] or 0) > 0),
+            None,
         )
         expiring_soon = next(
             (r["expiring_soon"] for r in reversed(rows) if r["expiring_soon"] is not None),

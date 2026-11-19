@@ -255,11 +255,82 @@ def port_open(port: int) -> bool:
         sock.close()
 
 
+def _pid_alive(pid: object) -> bool:
+    """Return True when the recorded process still exists.
+
+    Legacy state files without a pid fall back to the port probe.
+    """
+    try:
+        value = int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return True
+    if value <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.argtypes = [
+                ctypes.c_ulong,
+                ctypes.c_int,
+                ctypes.c_ulong,
+            ]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.GetExitCodeProcess.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_ulong),
+            ]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel32.OpenProcess(0x1000, False, value)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return bool(ok) and code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError):
+            return True
+    try:
+        os.kill(value, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_process(proc: Optional[subprocess.Popen]) -> None:
+    """Best-effort cleanup for a server process that never became ready."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+        terminate = getattr(proc, "terminate", None)
+        if callable(terminate):
+            terminate()
+        wait = getattr(proc, "wait", None)
+        if callable(wait):
+            try:
+                wait(timeout=3)
+            except (subprocess.TimeoutExpired, TypeError):
+                kill = getattr(proc, "kill", None)
+                if callable(kill):
+                    kill()
+    except OSError:
+        pass
+
+
 def existing_ui_url() -> Optional[str]:
     """Return the running console URL, or None when no instance responds."""
     state = read_ui_state(timeout=0.05)
     endpoint = ui_endpoint(state)
-    if endpoint and port_open(endpoint[1]):
+    if (
+        endpoint
+        and _pid_alive(state.get("pid"))
+        and port_open(endpoint[1])
+    ):
         return endpoint[0]
     return None
 
@@ -363,6 +434,7 @@ def _fallback_start() -> None:
         notify_failure(f"启动 GetEggs Web 服务失败：{exc}")
         return
     if not wait_for_state(proc):
+        _terminate_process(proc)
         notify_failure(
             f"GetEggs Web 服务启动失败或超时，请查看日志："
             f"{get_data_dir() / 'geteggs-ui.log'}"
@@ -410,6 +482,7 @@ def main() -> None:
             else:
                 state.error = "GetEggs Web 服务已启动，但无法读取控制台地址。"
         else:
+            _terminate_process(proc)
             state.error = (
                 "GetEggs Web 服务启动失败或超时，请查看日志："
                 f"{get_data_dir() / 'geteggs-ui.log'}"

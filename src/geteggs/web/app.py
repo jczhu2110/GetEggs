@@ -200,6 +200,14 @@ def create_app(
             schedule_cache["expires_at"] = now + 45.0
         return schedule_cache["value"]
 
+    def runner_lock_busy() -> bool:
+        """Return True when a check-in run (including scheduled ones) holds the lock."""
+        try:
+            with acquire_run_lock(app_runner.lock_path):
+                return False
+        except RunLockBusyError:
+            return True
+
     app = FastAPI(
         title="GetEggs Local Console",
         version=__version__,
@@ -278,7 +286,10 @@ def create_app(
 
         for provider in app_providers:
             cfg = app_storage.get_provider_config(provider.id)
-            today_rec = app_storage.get_today_summary(provider.id, biz_date)
+            # Align the card with the provider's own business day (Qoder resets
+            # at 10:00), so early-morning runs show the previous business day.
+            provider_biz_date = provider.business_date(cfg, settings.timezone)
+            today_rec = app_storage.get_today_summary(provider.id, provider_biz_date)
             latest_rec = app_storage.get_latest_snapshot_record(
                 provider.id
             ) or app_storage.get_latest_record(provider.id)
@@ -296,6 +307,8 @@ def create_app(
                     "extra": cfg.extra,
                     "client_installed": provider.detect_client_exe(cfg) is not None,
                     "supports_browser_auth": provider.supports_browser_auth,
+                    "supports_streak": provider.supports_streak,
+                    "fixed_business_day_start": provider.fixed_business_day_start,
                     "today_record": today_rec,
                     "latest_record": latest_rec,
                 }
@@ -501,6 +514,8 @@ def create_app(
                     "display_name": p.display_name,
                     "description": p.description,
                     "supports_browser_auth": p.supports_browser_auth,
+                    "supports_streak": p.supports_streak,
+                    "fixed_business_day_start": p.fixed_business_day_start,
                     **cfg.model_dump(),
                 }
             )
@@ -520,7 +535,7 @@ def create_app(
         provider_id: str, req: ProviderConfigUpdateRequest
     ) -> dict[str, Any]:
         try:
-            resolve_provider(provider_id)
+            provider = resolve_provider(provider_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -530,7 +545,19 @@ def create_app(
         if req.earliest_time is not None:
             cfg.earliest_time = req.earliest_time.strip()
         if req.business_day_start is not None:
-            cfg.business_day_start = req.business_day_start.strip()
+            requested_start = req.business_day_start.strip()
+            if (
+                provider.fixed_business_day_start
+                and requested_start != provider.fixed_business_day_start
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{provider.display_name} 的业务日起始时间固定为 "
+                        f"{provider.fixed_business_day_start}，不可修改。"
+                    ),
+                )
+            cfg.business_day_start = requested_start
         if req.checkin_credits is not None:
             cfg.checkin_credits = req.checkin_credits
 
@@ -735,10 +762,13 @@ def create_app(
 
     @app.post("/api/system/shutdown", dependencies=[Depends(require_auth)])
     async def api_shutdown() -> dict[str, Any]:
-        if any(not state.finished for state in active_runs.values()):
+        busy = any(not state.finished for state in active_runs.values())
+        if not busy:
+            busy = await run_in_threadpool(runner_lock_busy)
+        if busy:
             raise HTTPException(
                 status_code=409,
-                detail="已有签到任务正在执行，请等待完成后再关闭 Web 服务。",
+                detail="已有签到任务正在执行（含计划任务），请等待完成后再关闭 Web 服务。",
             )
         cleanup = getattr(app.state, "ui_state_cleanup", None)
         if callable(cleanup):

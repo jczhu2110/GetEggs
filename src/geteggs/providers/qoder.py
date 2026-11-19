@@ -28,6 +28,7 @@ QODER_CN_BASE_URL = "https://openapi.qoder.com.cn"
 CAMPAIGNS_PATH = "/sash/api/v1/me/campaigns"
 DEFAULT_EXCHANGE_PATH = "/api/v1/jobToken/exchange"
 PAT_ENV_NAMES = ("QODERCN_PERSONAL_ACCESS_TOKEN", "QODER_PERSONAL_ACCESS_TOKEN")
+MAX_JOB_TOKEN_TTL_SECONDS = 86_400.0
 
 
 class QoderProvider(BaseProvider):
@@ -41,6 +42,8 @@ class QoderProvider(BaseProvider):
     display_name = "Qoder"
     description = "Qoder CN 每日 100 Credits 自动领取（PAT）"
     supports_browser_auth = False
+    supports_streak = False
+    fixed_business_day_start = "10:00"
 
     def __init__(self, transport: Optional[httpx.AsyncBaseTransport] = None) -> None:
         self._transport = transport
@@ -77,8 +80,12 @@ class QoderProvider(BaseProvider):
         except (TypeError, ValueError):
             ttl = 3600.0
         if ttl <= 0:
-            ttl = 3600.0
-        ttl = max(60.0, ttl - 60.0)
+            # 已过期的令牌不值得缓存，下一次请求会重新兑换。
+            return
+        ttl = min(ttl, MAX_JOB_TOKEN_TTL_SECONDS)
+        if ttl <= 60.0:
+            return
+        ttl -= 60.0
         if len(self._token_cache) >= 4:
             self._token_cache.clear()
         self._token_cache[self._token_cache_key(config, pat)] = (
@@ -154,7 +161,8 @@ class QoderProvider(BaseProvider):
                 if not access_token:
                     return result(
                         False,
-                        "Qoder CN PAT 在线校验失败，请确认 PAT 有效且未过期。",
+                        "Qoder CN PAT 在线校验失败或访问令牌兑换失败，"
+                        "请确认 PAT 有效且未过期。",
                         verified=False,
                     )
                 if response.status_code in (401, 403):
@@ -181,6 +189,13 @@ class QoderProvider(BaseProvider):
                     )
 
                 campaigns = self._campaigns_from(payload)
+                if not self._has_campaigns_collection(payload):
+                    return result(
+                        False,
+                        "PAT 在线校验通过，但活动响应缺少 campaigns 字段，接口可能已变更。",
+                        verified=True,
+                        schema_ok=False,
+                    )
                 active = [
                     campaign
                     for campaign in campaigns
@@ -294,6 +309,16 @@ class QoderProvider(BaseProvider):
                     )
 
                 campaigns = self._campaigns_from(payload)
+                if not self._has_campaigns_collection(payload):
+                    emit("warning", "Qoder CN 活动响应缺少 campaigns 字段，接口可能已变更。")
+                    return self._result(
+                        CheckinStatus.SCHEMA_CHANGED,
+                        "Qoder CN 活动响应结构异常（缺少 campaigns 字段），接口可能已变更。",
+                        biz_date,
+                        started=started,
+                        dry_run=dry_run,
+                        raw_error_type="QoderSchemaError",
+                    )
                 active = [
                     campaign
                     for campaign in campaigns
@@ -410,8 +435,9 @@ class QoderProvider(BaseProvider):
                     )
 
                 emit("info", f"已领取 Qoder CN 每日 {amount} Credits。")
+                validity_days = self._benefit_validity_days(claimable)
                 expiring_at = (
-                    datetime.now(timezone.utc) + timedelta(days=30)
+                    datetime.now(timezone.utc) + timedelta(days=validity_days)
                 ).isoformat()
                 return self._result(
                     CheckinStatus.SUCCESS,
@@ -566,7 +592,10 @@ class QoderProvider(BaseProvider):
         cached = self._cached_job_token(config, pat)
         if cached:
             response, payload = await self._fetch_campaigns(client, config, cached)
-            if response.status_code not in (401, 403):
+            # Rate limiting is not a token problem; reuse the answer. Other
+            # failures (expired token, changed endpoint, upstream 5xx) fall
+            # back to the PAT/exchange path.
+            if response.is_success or response.status_code == 429:
                 return response, payload, cached
             self._forget_job_token(config, pat)
 
@@ -588,7 +617,7 @@ class QoderProvider(BaseProvider):
         config: ProviderConfig,
         pat: str,
         emit: LogCallback,
-    ) -> tuple[Optional[str], int]:
+    ) -> tuple[Optional[str], Optional[float]]:
         path = str(config.extra.get("pat_exchange_path") or DEFAULT_EXCHANGE_PATH)
         response, payload = await self._request(
             client,
@@ -600,7 +629,7 @@ class QoderProvider(BaseProvider):
         )
         if not response.is_success:
             emit("warning", f"Qoder CN PAT 兑换访问令牌失败（HTTP {response.status_code}）。")
-            return None, 0
+            return None, None
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         token = (
             payload.get("token")
@@ -609,15 +638,31 @@ class QoderProvider(BaseProvider):
             or data.get("token")
         )
         if isinstance(token, str) and token.strip():
-            raw_expires = payload.get("expires_in") or data.get("expires_in")
-            try:
-                expires_in = int(raw_expires)
-            except (TypeError, ValueError):
-                expires_in = 0
+            ttl = self._job_token_ttl_seconds(
+                payload.get("expires_at") or data.get("expires_at"),
+                payload.get("expires_in") or data.get("expires_in"),
+            )
             emit("info", "Qoder CN 访问令牌兑换成功。")
-            return token.strip(), expires_in
+            return token.strip(), ttl
         emit("warning", "Qoder CN 访问令牌兑换响应缺少 token。")
-        return None, 0
+        return None, None
+
+    @classmethod
+    def _job_token_ttl_seconds(
+        cls, expires_at: Any, expires_in: Any
+    ) -> Optional[float]:
+        """Normalize the exchange response expiry to seconds."""
+        expiry = cls._parse_time(expires_at)
+        if expiry is not None:
+            return (expiry - datetime.now(timezone.utc)).total_seconds()
+        try:
+            ttl = float(expires_in)
+        except (TypeError, ValueError):
+            return None
+        if ttl > 10_000_000:
+            # Qoder returns milliseconds (e.g. 86400000 for 24 hours).
+            ttl /= 1000.0
+        return ttl
 
     @staticmethod
     def _campaigns_from(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -631,6 +676,18 @@ class QoderProvider(BaseProvider):
         if not isinstance(candidates, list):
             return []
         return [item for item in candidates if isinstance(item, dict)]
+
+    @staticmethod
+    def _has_campaigns_collection(payload: dict[str, Any]) -> bool:
+        """Return True when the response explicitly carries a campaigns list."""
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return isinstance(payload.get("campaigns"), list) or isinstance(
+                data.get("campaigns"), list
+            )
+        if isinstance(data, list):
+            return True
+        return isinstance(payload.get("campaigns"), list)
 
     @classmethod
     def _active_now(cls, campaign: dict[str, Any]) -> bool:
@@ -676,10 +733,37 @@ class QoderProvider(BaseProvider):
         return min(max(default_credits, 0), MAX_CHECKIN_CREDITS)
 
     @staticmethod
+    def _benefit_validity_days(
+        campaign: dict[str, Any], default_days: int = 30
+    ) -> int:
+        benefit = campaign.get("benefit")
+        validity = benefit.get("validity") if isinstance(benefit, dict) else None
+        if isinstance(validity, dict):
+            mode = str(validity.get("mode") or "").upper()
+            days = validity.get("days")
+            if (
+                mode in ("", "RELATIVE_DAYS")
+                and isinstance(days, int)
+                and not isinstance(days, bool)
+                and 1 <= days <= 3650
+            ):
+                return days
+        return default_days
+
+    @staticmethod
     def _claim_status(payload: dict[str, Any]) -> str:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        status = payload.get("status") or data.get("status")
-        return str(status or "").upper()
+        statuses = (
+            payload.get("status"),
+            data.get("status"),
+            payload.get("claimStatus"),
+            data.get("claimStatus"),
+        )
+        for value in statuses:
+            text = str(value or "").upper()
+            if text == "CLAIMED":
+                return "CLAIMED"
+        return next((str(value).upper() for value in statuses if value), "")
 
     def _result(
         self,

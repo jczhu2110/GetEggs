@@ -114,7 +114,7 @@ def status() -> None:
     settings = storage.get_settings()
     biz_date = today_biz_date(settings.timezone)
 
-    table = Table(title=f"GetEggs 今日状态 ({biz_date})")
+    table = Table(title=f"GetEggs 今日状态 ({biz_date}，按工具业务日)")
     table.add_column("工具", style="bold")
     table.add_column("启用")
     table.add_column("今日状态")
@@ -124,14 +124,27 @@ def status() -> None:
 
     for p in list_providers():
         cfg = storage.get_provider_config(p.id)
-        today_rec = storage.get_today_summary(p.id, biz_date)
+        provider_biz_date = p.business_date(cfg, settings.timezone)
+        today_rec = storage.get_today_summary(p.id, provider_biz_date)
         latest = storage.get_latest_snapshot_record(p.id) or storage.get_latest_record(p.id)
+        if today_rec and today_rec["delta"]:
+            delta_text = f"+{today_rec['delta']}"
+        elif today_rec and today_rec["status"] == "already_done":
+            delta_text = "已签"
+        else:
+            delta_text = "0"
+        if not p.supports_streak:
+            streak_text = "不适用"
+        elif latest and latest["streak_days"]:
+            streak_text = str(latest["streak_days"])
+        else:
+            streak_text = "--"
         table.add_row(
             p.display_name,
             "是" if cfg.enabled else "否",
             today_rec["status"] if today_rec else "pending",
-            f"+{today_rec['delta']}" if today_rec and today_rec["delta"] else "0",
-            str(latest["streak_days"]) if latest and latest["streak_days"] is not None else "--",
+            delta_text,
+            streak_text,
             (today_rec or latest or {}).get("message", "尚无记录"),
         )
     console.print(table)

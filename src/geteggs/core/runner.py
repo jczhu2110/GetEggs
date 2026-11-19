@@ -30,6 +30,7 @@ from geteggs.providers.base import BaseProvider
 from geteggs.providers.registry import get_provider, list_providers
 
 EventSink = Callable[[LogEvent], None]
+PROVIDER_TIMEOUT_SECONDS = 300.0
 
 
 class CheckinRunner:
@@ -40,10 +41,12 @@ class CheckinRunner:
         storage: Optional[Storage] = None,
         notifier: Optional[BaseNotifier] = None,
         lock_path: Optional[Path] = None,
+        provider_timeout_seconds: float = PROVIDER_TIMEOUT_SECONDS,
     ) -> None:
         self.storage = storage or Storage()
         self.notifier = notifier or WindowsToastNotifier()
         self.lock_path = lock_path or get_lock_path()
+        self.provider_timeout_seconds = provider_timeout_seconds
 
     @staticmethod
     def _is_before_earliest(earliest_hhmm: str, tz_name: str) -> bool:
@@ -74,7 +77,9 @@ class CheckinRunner:
             for cfg in configs
             if cfg.enabled
         )
-        return max(25, min(300, 10 + total_jitter))
+        # Keep the limit above the worst-case jitter budget; the ceiling only
+        # guards against absurd configurations.
+        return max(25, min(1440, 10 + total_jitter))
 
     def _maybe_run_maintenance(
         self, settings: GlobalSettings, emit: Callable[[str, str], None]
@@ -242,6 +247,7 @@ class CheckinRunner:
             try:
                 for provider in targets:
                     provider_started = time.perf_counter()
+                    provider_biz_date = biz_date
                     try:
                         cfg = self.storage.get_provider_config(provider.id)
                         provider_biz_date = provider.business_date(
@@ -317,12 +323,33 @@ class CheckinRunner:
                         def _provider_log(level: str, msg: str, pid: str = provider.id) -> None:
                             emit(level, msg, pid)
 
-                        result = await provider.checkin(
-                            cfg,
-                            provider_biz_date,
-                            dry_run=dry_run,
-                            log=_provider_log,
-                        )
+                        try:
+                            result = await asyncio.wait_for(
+                                provider.checkin(
+                                    cfg,
+                                    provider_biz_date,
+                                    dry_run=dry_run,
+                                    log=_provider_log,
+                                ),
+                                timeout=self.provider_timeout_seconds,
+                            )
+                        except asyncio.TimeoutError:
+                            result = CheckinResult(
+                                provider_id=provider.id,
+                                display_name=provider.display_name,
+                                status=CheckinStatus.FAILED,
+                                message=(
+                                    f"{provider.display_name} 执行超时"
+                                    f"（超过 {self.provider_timeout_seconds:g} 秒），"
+                                    "已跳过本次签到。"
+                                ),
+                                biz_date=provider_biz_date,
+                                duration_ms=int(
+                                    (time.perf_counter() - provider_started) * 1000
+                                ),
+                                dry_run=dry_run,
+                                raw_error_type="ProviderTimeout",
+                            )
                         self.storage.save_checkin_result(actual_run_id, result)
                         results.append(result)
 
@@ -345,7 +372,7 @@ class CheckinRunner:
                             display_name=display_name,
                             status=CheckinStatus.FAILED,
                             message=f"{display_name} 适配器执行异常：{exc}",
-                            biz_date=biz_date,
+                            biz_date=provider_biz_date,
                             duration_ms=duration_ms,
                             dry_run=dry_run,
                             raw_error_type=type(exc).__name__,

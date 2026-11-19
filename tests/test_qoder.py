@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -49,6 +50,10 @@ def _campaigns_response(campaigns: list[dict[str, Any]]) -> httpx.Response:
     return httpx.Response(200, json={"data": {"campaigns": campaigns}})
 
 
+def test_qoder_reports_no_streak_support() -> None:
+    assert QoderProvider().supports_streak is False
+
+
 def test_qoder_already_claimed(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_pat(monkeypatch)
 
@@ -89,6 +94,52 @@ def test_qoder_claims_daily_credits(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.snapshot.delta == 100
     assert result.snapshot.expiring_soon == 100
     assert result.snapshot.expiring_at
+
+
+def test_qoder_accepts_claim_status_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_pat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _campaigns_response([_campaign("CLAIMABLE")])
+        assert request.method == "POST"
+        return httpx.Response(200, json={"status": "OK", "claimStatus": "CLAIMED"})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
+
+    assert result.status == CheckinStatus.SUCCESS
+    assert result.snapshot is not None
+    assert result.snapshot.delta == 100
+
+
+def test_qoder_uses_campaign_validity_days(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_pat(monkeypatch)
+    campaign = _campaign("CLAIMABLE")
+    campaign["benefit"] = {
+        "amount": 100,
+        "validity": {"mode": "RELATIVE_DAYS", "days": 7},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _campaigns_response([campaign])
+        return httpx.Response(200, json={"status": "CLAIMED"})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
+
+    assert result.status == CheckinStatus.SUCCESS
+    assert result.snapshot is not None
+    assert result.snapshot.expiring_at is not None
+    expiry = datetime.fromisoformat(result.snapshot.expiring_at)
+    remaining = expiry - datetime.now(timezone.utc)
+    assert timedelta(days=6, hours=23) < remaining <= timedelta(days=7, minutes=1)
+
+
+def test_qoder_invalid_validity_days_falls_back_to_30() -> None:
+    campaign = {"benefit": {"validity": {"mode": "RELATIVE_DAYS", "days": 0}}}
+    assert QoderProvider._benefit_validity_days(campaign) == 30
 
 
 def test_qoder_uses_configured_credits_when_benefit_missing(
@@ -181,6 +232,36 @@ def test_qoder_no_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
     result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
 
     assert result.status == CheckinStatus.UNAVAILABLE
+
+
+def test_qoder_missing_campaigns_field_is_schema_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {}})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
+
+    assert result.status == CheckinStatus.SCHEMA_CHANGED
+    assert "campaigns" in result.message
+
+
+def test_qoder_doctor_reports_schema_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_pat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {}})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.doctor(_cfg()))
+
+    assert result.healthy is False
+    assert result.details.get("verified") is True
+    assert result.details.get("schema_ok") is False
+    assert "campaigns" in result.message
 
 
 def test_qoder_exchanges_pat_when_direct_call_is_unauthorized(
@@ -360,6 +441,134 @@ def test_qoder_reuses_cached_job_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert stats["exchange"] == 1
     assert stats["pat"] == 1
     assert stats["token"] == 3
+
+
+def test_qoder_cached_token_ttl_normalizes_milliseconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization")
+        if request.url.path == "/api/v1/jobToken/exchange":
+            return httpx.Response(
+                200, json={"token": "jt-ms", "expires_in": 86400000}
+            )
+        if request.url.path.endswith("/sash/api/v1/me/campaigns"):
+            if auth == f"Bearer {PAT}":
+                return httpx.Response(401, json={})
+            return _campaigns_response([_campaign("CLAIMED")])
+        return httpx.Response(404, json={})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
+
+    cached = list(provider._token_cache.values())
+    assert len(cached) == 1
+    ttl = cached[0][1] - time.monotonic()
+    assert 0 < ttl <= 86_400
+
+
+def test_qoder_cached_token_ttl_prefers_expires_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=2)
+    ).isoformat()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization")
+        if request.url.path == "/api/v1/jobToken/exchange":
+            return httpx.Response(
+                200,
+                json={
+                    "token": "jt-exp",
+                    "expires_in": 86400000,
+                    "expires_at": expires_at,
+                },
+            )
+        if request.url.path.endswith("/sash/api/v1/me/campaigns"):
+            if auth == f"Bearer {PAT}":
+                return httpx.Response(401, json={})
+            return _campaigns_response([_campaign("CLAIMED")])
+        return httpx.Response(404, json={})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
+
+    ttl = list(provider._token_cache.values())[0][1] - time.monotonic()
+    assert 6_900 < ttl <= 7_200
+
+
+def test_qoder_expired_job_token_is_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+    expires_at = (
+        datetime.now(timezone.utc) - timedelta(hours=1)
+    ).isoformat()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization")
+        if request.url.path == "/api/v1/jobToken/exchange":
+            return httpx.Response(
+                200,
+                json={
+                    "token": "jt-expired",
+                    "expires_in": 86400000,
+                    "expires_at": expires_at,
+                },
+            )
+        if request.url.path.endswith("/sash/api/v1/me/campaigns"):
+            if auth == f"Bearer {PAT}":
+                return httpx.Response(401, json={})
+            return _campaigns_response([_campaign("CLAIMED")])
+        return httpx.Response(404, json={})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
+
+    assert provider._token_cache == {}
+
+
+def test_qoder_refreshes_cached_token_after_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+    stats = {"exchange": 0, "token": 0}
+    token_calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization")
+        if request.url.path == "/api/v1/jobToken/exchange":
+            stats["exchange"] += 1
+            return httpx.Response(
+                200, json={"token": "jt-cached", "expires_in": 86400000}
+            )
+        if request.url.path.endswith("/sash/api/v1/me/campaigns"):
+            if auth == f"Bearer {PAT}":
+                return httpx.Response(401, json={})
+            if auth == "Bearer jt-cached":
+                stats["token"] += 1
+                token_calls["count"] += 1
+                if token_calls["count"] == 2:
+                    return httpx.Response(500, json={})
+                return _campaigns_response([_campaign("CLAIMED")])
+        return httpx.Response(404, json={})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+
+    assert (
+        asyncio.run(provider.checkin(_cfg(), BIZ_DATE)).status
+        == CheckinStatus.ALREADY_DONE
+    )
+    assert (
+        asyncio.run(provider.checkin(_cfg(), BIZ_DATE)).status
+        == CheckinStatus.ALREADY_DONE
+    )
+
+    assert stats == {"exchange": 2, "token": 3}
 
 
 def test_qoder_reads_pat_file(

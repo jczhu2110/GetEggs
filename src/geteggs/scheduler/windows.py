@@ -141,6 +141,7 @@ def get_schedule_status() -> dict[str, Any]:
         return {
             "supported": True,
             "installed": False,
+            "elevated": _is_elevated(),
             "task_name": TASK_NAME,
             "message": "尚未安装系统计划任务。",
         }
@@ -169,12 +170,23 @@ $info = Get-ScheduledTaskInfo -TaskName '{TASK_NAME}'
 }} | ConvertTo-Json -Compress
 """.strip()
 
-    code, out, err = _run_ps(ps)
+    try:
+        code, out, err = _run_ps(ps)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "supported": True,
+            "installed": False,
+            "query_failed": True,
+            "elevated": _is_elevated(),
+            "task_name": TASK_NAME,
+            "message": f"查询计划任务失败：{exc}",
+        }
     if code != 0:
         return {
             "supported": True,
             "installed": False,
             "query_failed": True,
+            "elevated": _is_elevated(),
             "task_name": TASK_NAME,
             "message": f"查询计划任务失败：{err or out}",
         }
@@ -188,6 +200,7 @@ $info = Get-ScheduledTaskInfo -TaskName '{TASK_NAME}'
             "supported": True,
             "installed": False,
             "query_failed": True,
+            "elevated": _is_elevated(),
             "task_name": TASK_NAME,
             "message": f"查询计划任务失败：{data['error']}",
         }
@@ -206,6 +219,7 @@ $info = Get-ScheduledTaskInfo -TaskName '{TASK_NAME}'
     return {
         "supported": True,
         "installed": installed,
+        "elevated": _is_elevated(),
         "task_name": TASK_NAME,
         "state": state,
         "last_run_time": data.get("last_run_time"),
@@ -248,6 +262,10 @@ exit $p.ExitCode
         try:
             code, out, err = _run_ps(ps, timeout=120)
         except subprocess.TimeoutExpired:
+            # The elevated child cannot be killed from here; it may still have
+            # completed registration after the timeout.
+            if get_schedule_status().get("installed"):
+                return True, "管理员授权等待超时，但检测到计划任务已安装成功。"
             return False, "等待管理员授权超时，计划任务未安装。"
         payload: dict[str, Any] = {}
         try:
@@ -324,12 +342,16 @@ Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Trigger $trigger
 Write-Output 'OK'
 """.strip()
 
-    code, out, err = _run_ps(ps)
+    try:
+        code, out, err = _run_ps(ps)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"注册计划任务失败：{exc}"
     if code == 0:
+        logon_note = " + 登录漏签补跑" if catchup_on_logon else ""
         return (
             True,
             f"已成功注册 Windows 计划任务 {TASK_NAME}"
-            f"（每日 {hhmm} + 登录漏签补跑，最长执行 {timeout} 分钟）。",
+            f"（每日 {hhmm}{logon_note}，最长执行 {timeout} 分钟）。",
         )
     return False, f"注册计划任务失败：{err or out}"
 
@@ -346,7 +368,10 @@ if ($t) {{
 }}
 Write-Output 'OK'
 """.strip()
-    code, out, err = _run_ps(ps)
+    try:
+        code, out, err = _run_ps(ps)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"移除计划任务失败：{exc}"
     if code == 0:
         return True, f"已移除计划任务 {TASK_NAME}。"
     return False, f"移除计划任务失败：{err or out}"

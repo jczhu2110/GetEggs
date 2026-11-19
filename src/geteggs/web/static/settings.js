@@ -294,7 +294,7 @@ async function saveGlobalSettings(successMessage) {
           previous.auto_catchup_on_logon !== payload.auto_catchup_on_logon ||
           previous.jitter_minutes !== payload.jitter_minutes)
     );
-    if (scheduleChanged && lastScheduleInfo?.installed) {
+    if (scheduleChanged && canAutoSyncSchedule()) {
       try {
         await syncScheduleIfInstalled();
         showBanner("全局设置已保存，计划任务已按新配置同步。");
@@ -303,6 +303,12 @@ async function saveGlobalSettings(successMessage) {
         showBanner(`设置已保存，但计划任务同步失败：${err.message}`, true);
         return false;
       }
+    }
+    if (scheduleChanged && lastScheduleInfo?.installed) {
+      showBanner(
+        "设置已保存；当前没有管理员权限，计划任务未自动同步，请点击「安装 / 更新计划任务」。"
+      );
+      return true;
     }
     if (scheduleChanged && lastScheduleInfo?.query_failed) {
       showBanner(
@@ -338,11 +344,21 @@ function buildProviderAdvancedForm(provider) {
   const pidEsc = escapeHtml(pid);
   const extra = provider.extra || {};
   const earliest = escapeHtml(provider.earliest_time || "00:00");
-  const businessStart = escapeHtml(provider.business_day_start || "00:00");
+  const fixedBusinessStart = provider.fixed_business_day_start || "";
+  const businessStart = escapeHtml(
+    fixedBusinessStart || provider.business_day_start || "00:00"
+  );
+  const businessStartHint = fixedBusinessStart
+    ? `固定为 ${escapeHtml(fixedBusinessStart)}，由活动周期决定`
+    : "跨过该时间才计入新一天";
   const jitterVal = extra.jitter_override ? escapeHtml(String(provider.jitter_minutes ?? 0)) : "";
   const creditsVal = escapeHtml(
     String(provider.checkin_credits ?? DEFAULT_CHECKIN_CREDITS)
   );
+  const creditsHint =
+    pid === "qoder"
+      ? "Qoder 以活动返回金额为准，此项仅作兜底"
+      : "接口未返回奖励时按此计入";
 
   const extraInputs = getProviderExtraFields(pid)
     .map(
@@ -359,12 +375,12 @@ function buildProviderAdvancedForm(provider) {
     <form class="subgrid-form" data-provider-form="${pidEsc}">
       ${extraInputs}
       <label class="field">
-        <span>签到积分（接口未返回奖励时按此计入，默认 ${DEFAULT_CHECKIN_CREDITS}）</span>
+        <span>签到积分（${creditsHint}，默认 ${DEFAULT_CHECKIN_CREDITS}）</span>
         <input name="checkin_credits" type="number" min="0" max="${MAX_CHECKIN_CREDITS}" step="1" class="input" value="${creditsVal}" />
       </label>
       <label class="field">
-        <span>业务日起始时间（跨过该时间才计入新一天，Qoder 为 10:00）</span>
-        <input name="business_day_start" type="time" class="input" value="${businessStart}" />
+        <span>业务日起始时间（${businessStartHint}）</span>
+        <input name="business_day_start" type="time" class="input" value="${businessStart}" ${fixedBusinessStart ? "disabled" : ""} />
       </label>
       <div class="two-col-fields">
         <label class="field">
@@ -680,7 +696,8 @@ function resetProviderForm(providerId) {
   const creditsInput = form.querySelector("[name='checkin_credits']");
   if (earliestInput) earliestInput.value = provider.earliest_time || "00:00";
   if (businessStartInput) {
-    businessStartInput.value = provider.business_day_start || "00:00";
+    businessStartInput.value =
+      provider.fixed_business_day_start || provider.business_day_start || "00:00";
   }
   if (jitterInput) {
     jitterInput.value = extra.jitter_override ? String(provider.jitter_minutes ?? 0) : "";
@@ -742,13 +759,17 @@ async function submitProviderForm(form) {
     const afterJitter = res.provider?.extra?.jitter_override
       ? Number(res.provider.jitter_minutes || 0)
       : Number(lastSavedGlobal?.jitter_minutes ?? 15);
-    if (beforeJitter !== afterJitter && lastScheduleInfo?.installed) {
+    if (beforeJitter !== afterJitter && canAutoSyncSchedule()) {
       try {
         await syncScheduleIfInstalled();
         showBanner(`${name} 配置已保存，计划任务执行时限已同步`);
       } catch (err) {
         showBanner(`${name} 配置已保存，但计划任务时限同步失败：${err.message}`, true);
       }
+    } else if (beforeJitter !== afterJitter && lastScheduleInfo?.installed) {
+      showBanner(
+        `${name} 配置已保存；当前没有管理员权限，计划任务执行时限未同步，请点击「安装 / 更新计划任务」。`
+      );
     } else {
       showBanner(`${name} 配置已保存`);
     }
@@ -790,6 +811,10 @@ async function syncScheduleIfInstalled() {
   renderScheduleBox(res.schedule);
   callbacks.onOverviewRefresh();
   return true;
+}
+
+function canAutoSyncSchedule() {
+  return Boolean(lastScheduleInfo?.installed && lastScheduleInfo?.elevated);
 }
 
 function renderScheduleBox(sch) {
@@ -1154,7 +1179,7 @@ export function initSettings(userCallbacks = {}) {
         const idx = settingsProviders.findIndex((p) => p.provider_id === providerId);
         if (idx >= 0) settingsProviders[idx].enabled = enabled;
         card?.classList.toggle("is-enabled", enabled);
-        if (lastScheduleInfo?.installed) {
+        if (lastScheduleInfo?.installed && canAutoSyncSchedule()) {
           try {
             await syncScheduleIfInstalled();
             showBanner(
@@ -1166,6 +1191,10 @@ export function initSettings(userCallbacks = {}) {
               true
             );
           }
+        } else if (lastScheduleInfo?.installed) {
+          showBanner(
+            `已${enabled ? "启用" : "停用"} ${name} 自动调度；当前没有管理员权限，计划任务执行时限未同步，请点击「安装 / 更新计划任务」。`
+          );
         } else {
           showBanner(`已${enabled ? "启用" : "停用"} ${name} 自动调度`);
         }

@@ -38,6 +38,18 @@ function shiftMonth(monthStr, deltaMonths) {
   return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
 }
 
+function providerSupportsStreak(providerId) {
+  const provider = appState.providers.find(
+    (item) => item.provider_id === providerId
+  );
+  return provider ? provider.supports_streak !== false : true;
+}
+
+function streakText(record) {
+  if (!providerSupportsStreak(record.provider_id)) return "不适用";
+  return record.streak_days || "--";
+}
+
 function historyRowHtml(r) {
   return `
     <tr>
@@ -45,7 +57,7 @@ function historyRowHtml(r) {
       <td>${escapeHtml(r.display_name)}</td>
       <td>${statusPill(r.status)}</td>
       <td>${r.delta > 0 ? `+${r.delta}` : "0"}</td>
-      <td>${r.streak_days ?? "--"}</td>
+      <td>${escapeHtml(streakText(r))}</td>
       <td>${escapeHtml(r.message)}</td>
     </tr>
   `;
@@ -261,7 +273,7 @@ async function toggleRunDetail(runId, triggerBtn) {
               <td>${escapeHtml(providerDisplayName(r.provider_id, r.display_name))}</td>
               <td>${statusPill(r.status)}</td>
               <td>${r.delta > 0 ? `+${r.delta}` : "0"}</td>
-              <td>${r.streak_days ?? "--"}</td>
+              <td>${escapeHtml(streakText(r))}</td>
               <td>${r.duration_ms ?? 0} ms</td>
               <td>${escapeHtml(r.message)}</td>
             </tr>

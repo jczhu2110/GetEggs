@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -179,6 +180,66 @@ def test_install_schedule_uses_computed_timeout(monkeypatch) -> None:
     assert ok is True
     assert "-Minutes 40" in captured["script"]
     assert "40 分钟" in message
+    assert "登录漏签补跑" in message
+
+    ok_no_catchup, message_no_catchup = windows.install_schedule(
+        "10:15", catchup_on_logon=False, timeout_minutes=40, elevate=False
+    )
+    assert ok_no_catchup is True
+    assert "登录漏签补跑" not in message_no_catchup
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_schedule_status_reports_query_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_task_missing_fast", lambda: None)
+
+    def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
+        raise subprocess.TimeoutExpired("powershell", timeout)
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+
+    info = windows.get_schedule_status()
+
+    assert info["supported"] is True
+    assert info["installed"] is False
+    assert info["query_failed"] is True
+    assert "查询计划任务失败" in info["message"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_install_schedule_reports_query_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_probe_package_import", lambda *args: (True, ""))
+
+    def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
+        raise subprocess.TimeoutExpired("powershell", timeout)
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+
+    ok, message = windows.install_schedule("10:15", elevate=False)
+
+    assert ok is False
+    assert "注册计划任务失败" in message
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_install_schedule_timeout_checks_existing_task(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_is_elevated", lambda: False)
+    monkeypatch.setattr(windows, "_probe_package_import", lambda *args: (True, ""))
+    monkeypatch.setattr(
+        windows,
+        "get_schedule_status",
+        lambda: {"installed": True, "state": "Ready"},
+    )
+
+    def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
+        raise subprocess.TimeoutExpired("powershell", timeout)
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+
+    ok, message = windows.install_schedule("10:15")
+
+    assert ok is True
+    assert "已安装成功" in message
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
@@ -335,7 +396,8 @@ def test_open_command_opens_existing_page(tmp_path: Path, monkeypatch) -> None:
         path = get_ui_state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"pid": 1, "port": port, "url": url}), encoding="utf-8"
+            json.dumps({"pid": os.getpid(), "port": port, "url": url}),
+            encoding="utf-8",
         )
 
         opened: list[str] = []
@@ -346,6 +408,29 @@ def test_open_command_opens_existing_page(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert opened == [url]
+
+
+def test_existing_ui_url_rejects_dead_pid(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = int(listener.getsockname()[1])
+        path = get_ui_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "pid": -1,
+                    "port": port,
+                    "url": f"http://127.0.0.1:{port}/auth?token=stale",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert launcher._pid_alive(-1) is False
+        assert launcher.existing_ui_url() is None
 
 
 def test_ui_server_command_no_browser_when_splash() -> None:

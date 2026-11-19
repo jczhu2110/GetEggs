@@ -97,6 +97,31 @@ class RaisingProvider(FakeProvider):
         raise RuntimeError("adapter exploded")
 
 
+class SlowProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__(provider_id="slow", display_name="SlowTool")
+
+    async def checkin(
+        self,
+        config: ProviderConfig,
+        biz_date: str,
+        *,
+        dry_run: bool = False,
+        log: Optional[LogCallback] = None,
+    ) -> CheckinResult:
+        self.calls += 1
+        await asyncio.sleep(10)
+        return CheckinResult(
+            provider_id=self.id,
+            display_name=self.display_name,
+            status=CheckinStatus.SUCCESS,
+            message="done",
+            biz_date=biz_date,
+            snapshot=CreditSnapshot(delta=1),
+            dry_run=dry_run,
+        )
+
+
 class FixedBusinessDayProvider(FakeProvider):
     def __init__(self, business_day: str) -> None:
         super().__init__(provider_id="qoder", display_name="Qoder")
@@ -295,6 +320,59 @@ def test_runner_isolates_provider_exception_and_continues(tmp_path: Path) -> Non
     assert any(event["level"] == "error" for event in events)
 
 
+def test_runner_times_out_provider_and_continues(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "test.db")
+    notifier = RecordingNotifier()
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=notifier,
+        lock_path=tmp_path / "run.lock",
+        provider_timeout_seconds=0.05,
+    )
+    slow = SlowProvider()
+    good = FakeProvider(provider_id="good", display_name="GoodTool")
+
+    summary = asyncio.run(runner.run(providers_override=[slow, good]))
+
+    assert len(summary.results) == 2
+    assert summary.results[0].status == CheckinStatus.FAILED
+    assert summary.results[0].raw_error_type == "ProviderTimeout"
+    assert "超时" in summary.results[0].message
+    assert summary.results[1].status == CheckinStatus.SUCCESS
+    assert slow.calls == 1
+    assert good.calls == 1
+
+    # 超时后运行锁必须已释放。
+    with acquire_run_lock(runner.lock_path):
+        pass
+
+
+def test_runner_failure_uses_provider_business_date(tmp_path: Path) -> None:
+    class BrokenWithBusinessDay(RaisingProvider):
+        def business_date(
+            self,
+            config: ProviderConfig,
+            tz_name: str = "Asia/Shanghai",
+            *,
+            now: Optional[datetime] = None,
+        ) -> str:
+            return "2026-11-18"
+
+    storage = Storage(tmp_path / "test.db")
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=RecordingNotifier(),
+        lock_path=tmp_path / "run.lock",
+    )
+
+    summary = asyncio.run(runner.run(providers_override=[BrokenWithBusinessDay()]))
+
+    assert summary.results[0].status == CheckinStatus.FAILED
+    assert summary.results[0].biz_date == "2026-11-18"
+    records = storage.get_history(limit=10)["records"]
+    assert records[0]["biz_date"] == "2026-11-18"
+
+
 def test_runner_notifies_both_success_and_failure(tmp_path: Path) -> None:
     storage = Storage(tmp_path / "test.db")
     notifier = RecordingNotifier()
@@ -367,6 +445,46 @@ def test_storage_today_summary_keeps_success_after_later_failure(tmp_path: Path)
     assert len(page["records"]) == 1
     assert page["records"][0]["status"] == "success"
     assert page["offset"] == 1
+
+
+def test_storage_today_summary_prefers_positive_streak_and_success_message(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "test.db")
+    biz_date = "2026-11-19"
+    storage.save_checkin_result(
+        "run-1",
+        CheckinResult(
+            provider_id="workbuddy",
+            display_name="WorkBuddy",
+            status=CheckinStatus.SUCCESS,
+            message="WorkBuddy 今日签到成功，+100 积分，已连续 33 天。",
+            biz_date=biz_date,
+            snapshot=CreditSnapshot(delta=100, streak_days=33),
+        ),
+    )
+    storage.save_checkin_result(
+        "run-2",
+        CheckinResult(
+            provider_id="workbuddy",
+            display_name="WorkBuddy",
+            status=CheckinStatus.ALREADY_DONE,
+            message="今日已完成签到。",
+            biz_date=biz_date,
+            snapshot=CreditSnapshot(delta=0, streak_days=0),
+        ),
+    )
+
+    summary = storage.get_today_summary("workbuddy", biz_date)
+    assert summary is not None
+    assert summary["status"] == "success"
+    assert summary["delta"] == 100
+    assert summary["streak_days"] == 33
+    assert "已连续 33 天" in summary["message"]
+
+    latest_snapshot = storage.get_latest_snapshot_record("workbuddy")
+    assert latest_snapshot is not None
+    assert latest_snapshot["streak_days"] == 33
 
 
 def test_storage_drops_legacy_balance_column_and_preserves_rows(
@@ -454,9 +572,23 @@ def test_provider_config_business_day_start_persists(tmp_path: Path) -> None:
     assert qoder_cfg.business_day_start == "10:00"
     assert storage.get_provider_config("workbuddy").business_day_start == "00:00"
 
-    qoder_cfg.business_day_start = "11:30"
+    workbuddy_cfg = storage.get_provider_config("workbuddy")
+    workbuddy_cfg.business_day_start = "11:30"
+    storage.save_provider_config(workbuddy_cfg)
+    assert storage.get_provider_config("workbuddy").business_day_start == "11:30"
+    assert storage.get_provider_config("qoder").business_day_start == "10:00"
+
+
+def test_storage_normalizes_fixed_qoder_business_day(tmp_path: Path) -> None:
+    db_path = tmp_path / "fixed_business_day.db"
+    storage = Storage(db_path)
+    qoder_cfg = storage.get_provider_config("qoder")
+    qoder_cfg.business_day_start = "00:00"
     storage.save_provider_config(qoder_cfg)
-    assert storage.get_provider_config("qoder").business_day_start == "11:30"
+    assert storage.get_provider_config("qoder").business_day_start == "00:00"
+
+    reopened = Storage(db_path)
+    assert reopened.get_provider_config("qoder").business_day_start == "10:00"
 
 
 def test_storage_migrates_business_day_start_for_qoder(tmp_path: Path) -> None:
@@ -528,7 +660,7 @@ def test_task_timeout_tracks_enabled_jitter_budget() -> None:
         CheckinRunner.estimate_task_timeout_minutes(
             settings, [override, override, override]
         )
-        == 300
+        == 370
     )
 
 
