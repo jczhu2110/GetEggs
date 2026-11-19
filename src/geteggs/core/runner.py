@@ -64,6 +64,18 @@ class CheckinRunner:
             return max(0, cfg.jitter_minutes)
         return max(0, settings.jitter_minutes)
 
+    @staticmethod
+    def estimate_task_timeout_minutes(
+        settings: GlobalSettings, configs: list[ProviderConfig]
+    ) -> int:
+        """Bound scheduled runtime by the sequential per-provider jitter budget."""
+        total_jitter = sum(
+            CheckinRunner._effective_jitter_minutes(cfg, settings)
+            for cfg in configs
+            if cfg.enabled
+        )
+        return max(25, min(300, 10 + total_jitter))
+
     def _maybe_run_maintenance(
         self, settings: GlobalSettings, emit: Callable[[str, str], None]
     ) -> None:
@@ -105,7 +117,11 @@ class CheckinRunner:
             return
 
         success_items = [r for r in results if r.status == CheckinStatus.SUCCESS]
-        already_items = [r for r in results if r.status == CheckinStatus.ALREADY_DONE]
+        already_items = [
+            r
+            for r in results
+            if r.status == CheckinStatus.ALREADY_DONE and r.biz_date == biz_date
+        ]
         action_items = [r for r in results if r.status.requires_user_action]
         failed_items = [r for r in results if r.status == CheckinStatus.FAILED]
 
@@ -149,7 +165,11 @@ class CheckinRunner:
             for r in success_items:
                 delta_str = f" +{r.snapshot.delta}" if r.snapshot and r.snapshot.delta > 0 else ""
                 lines.append(f"{r.display_name} 签到成功{delta_str}")
-            provider_key = ",".join(sorted({r.provider_id for r in success_items}))
+            # 业务日可能不同于批次日期（例如补领上一周期），纳入去重键避免
+            # 吞掉同一天后续新业务日的成功通知。
+            provider_key = ",".join(
+                sorted({f"{r.provider_id}@{r.biz_date}" for r in success_items})
+            )
             _send_once(
                 f"daily_success:{biz_date}:{provider_key}",
                 "GetEggs 今日签到完成",
@@ -224,6 +244,9 @@ class CheckinRunner:
                     provider_started = time.perf_counter()
                     try:
                         cfg = self.storage.get_provider_config(provider.id)
+                        provider_biz_date = provider.business_date(
+                            cfg, settings.timezone
+                        )
                         if not cfg.enabled and not provider_ids:
                             emit(
                                 "info",
@@ -244,11 +267,13 @@ class CheckinRunner:
                             )
                             continue
 
-                        existing = self.storage.get_today_completed_record(provider.id, biz_date)
+                        existing = self.storage.get_today_completed_record(
+                            provider.id, provider_biz_date
+                        )
                         if existing and missed_only:
                             emit(
                                 "info",
-                                f"{provider.display_name} 今日（{biz_date}）已有完成记录，跳过补跑。",
+                                f"{provider.display_name} 本业务日（{provider_biz_date}）已有完成记录，跳过补跑。",
                                 provider.id,
                             )
                             results.append(
@@ -256,8 +281,8 @@ class CheckinRunner:
                                     provider_id=provider.id,
                                     display_name=provider.display_name,
                                     status=CheckinStatus.ALREADY_DONE,
-                                    message="今日已完成签到（本地账本缓存命中）。",
-                                    biz_date=biz_date,
+                                    message="本业务日已完成签到（本地账本缓存命中）。",
+                                    biz_date=provider_biz_date,
                                     snapshot=CreditSnapshot(
                                         delta=0,
                                         streak_days=existing.get("streak_days"),
@@ -279,6 +304,10 @@ class CheckinRunner:
                                     )
                                     await asyncio.sleep(delay_sec)
 
+                        # 抖动可能跨过业务日重置点，执行前按当前时间重新计算。
+                        provider_biz_date = provider.business_date(
+                            cfg, settings.timezone
+                        )
                         emit(
                             "info",
                             f"开始执行 {provider.display_name} 签到...",
@@ -290,7 +319,7 @@ class CheckinRunner:
 
                         result = await provider.checkin(
                             cfg,
-                            biz_date,
+                            provider_biz_date,
                             dry_run=dry_run,
                             log=_provider_log,
                         )
@@ -327,10 +356,7 @@ class CheckinRunner:
 
                 self._notify_for_results(results, biz_date, notify=notify, dry_run=dry_run)
                 self.storage.record_run_finish(actual_run_id, "completed")
-                if not dry_run and trigger_type in (
-                    TriggerType.SCHEDULED,
-                    TriggerType.MISSED_CATCHUP,
-                ):
+                if not dry_run:
                     self._maybe_run_maintenance(settings, emit)
             except Exception:
                 self.storage.record_run_finish(actual_run_id, "error")

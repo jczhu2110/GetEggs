@@ -10,7 +10,7 @@ from typing import Optional
 
 import pytest
 
-from geteggs.core.config import today_biz_date
+from geteggs.core.config import business_date, today_biz_date
 from geteggs.core.lock import RunLockBusyError, acquire_run_lock
 from geteggs.core.models import (
     DEFAULT_CHECKIN_CREDITS,
@@ -97,6 +97,36 @@ class RaisingProvider(FakeProvider):
         raise RuntimeError("adapter exploded")
 
 
+class FixedBusinessDayProvider(FakeProvider):
+    def __init__(self, business_day: str) -> None:
+        super().__init__(provider_id="qoder", display_name="Qoder")
+        self._business_day = business_day
+
+    def business_date(
+        self,
+        config: ProviderConfig,
+        tz_name: str = "Asia/Shanghai",
+        *,
+        now: Optional[datetime] = None,
+    ) -> str:
+        return self._business_day
+
+
+class SequenceBusinessDayProvider(FakeProvider):
+    def __init__(self, business_days: list[str]) -> None:
+        super().__init__()
+        self._business_days = business_days
+
+    def business_date(
+        self,
+        config: ProviderConfig,
+        tz_name: str = "Asia/Shanghai",
+        *,
+        now: Optional[datetime] = None,
+    ) -> str:
+        return self._business_days[min(self.calls, len(self._business_days) - 1)]
+
+
 class RecordingNotifier(BaseNotifier):
     channel_id = "recording"
 
@@ -144,6 +174,81 @@ def test_runner_missed_only_skips_already_completed_today(tmp_path: Path) -> Non
     assert second.results[0].status == CheckinStatus.ALREADY_DONE
     assert len(notifier.sent) == 1
     assert storage.get_maintenance_state().get("last_cleanup_at")
+
+
+def test_runner_missed_only_uses_provider_business_date(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "test.db")
+    storage.save_provider_config(
+        ProviderConfig(provider_id="qoder", enabled=True, business_day_start="10:00")
+    )
+    storage.save_checkin_result(
+        "seed-run",
+        CheckinResult(
+            provider_id="qoder",
+            display_name="Qoder",
+            status=CheckinStatus.SUCCESS,
+            message="上一业务日已领取",
+            biz_date="2026-11-18",
+            snapshot=CreditSnapshot(delta=100),
+        ),
+    )
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=RecordingNotifier(),
+        lock_path=tmp_path / "run.lock",
+    )
+
+    before_reset = FixedBusinessDayProvider("2026-11-18")
+    skipped = asyncio.run(
+        runner.run(
+            trigger_type=TriggerType.MISSED_CATCHUP,
+            missed_only=True,
+            providers_override=[before_reset],
+        )
+    )
+    assert before_reset.calls == 0
+    assert skipped.results[0].status == CheckinStatus.ALREADY_DONE
+    assert skipped.results[0].biz_date == "2026-11-18"
+
+    after_reset = FixedBusinessDayProvider("2026-11-19")
+    claimed = asyncio.run(
+        runner.run(
+            trigger_type=TriggerType.MISSED_CATCHUP,
+            missed_only=True,
+            providers_override=[after_reset],
+        )
+    )
+    assert after_reset.calls == 1
+    assert claimed.results[0].biz_date == "2026-11-19"
+
+
+def test_business_date_resets_at_configured_start() -> None:
+    tz = timezone(timedelta(hours=8))
+    before = datetime(2026, 11, 19, 9, 59, tzinfo=tz)
+    at_start = datetime(2026, 11, 19, 10, 0, tzinfo=tz)
+
+    assert business_date("10:00", "Asia/Shanghai", before) == "2026-11-18"
+    assert business_date("10:00", "Asia/Shanghai", at_start) == "2026-11-19"
+    assert business_date("00:00", "Asia/Shanghai", before) == "2026-11-19"
+
+
+def test_success_notifications_are_not_lost_when_business_date_changes(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "test.db")
+    notifier = RecordingNotifier()
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=notifier,
+        lock_path=tmp_path / "run.lock",
+    )
+    provider = SequenceBusinessDayProvider(["2026-11-18", "2026-11-19"])
+
+    asyncio.run(runner.run(providers_override=[provider]))
+    asyncio.run(runner.run(providers_override=[provider]))
+
+    assert provider.calls == 2
+    assert len(notifier.sent) == 2
 
 
 def test_runner_deduplicates_action_alert_same_day(tmp_path: Path) -> None:
@@ -343,6 +448,51 @@ def test_provider_config_checkin_credits_persists(tmp_path: Path) -> None:
     assert storage.get_provider_config("workbuddy").checkin_credits == 250
 
 
+def test_provider_config_business_day_start_persists(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "business_day.db")
+    qoder_cfg = storage.get_provider_config("qoder")
+    assert qoder_cfg.business_day_start == "10:00"
+    assert storage.get_provider_config("workbuddy").business_day_start == "00:00"
+
+    qoder_cfg.business_day_start = "11:30"
+    storage.save_provider_config(qoder_cfg)
+    assert storage.get_provider_config("qoder").business_day_start == "11:30"
+
+
+def test_storage_migrates_business_day_start_for_qoder(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_business_day.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE provider_configs (
+            provider_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            earliest_time TEXT NOT NULL DEFAULT '00:00',
+            jitter_minutes INTEGER NOT NULL DEFAULT 10,
+            extra_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO provider_configs (
+            provider_id, enabled, earliest_time, jitter_minutes, extra_json, updated_at
+        ) VALUES (
+            'qoder', 1, '00:00', 10, '{}', '2026-11-10T00:00:00+00:00'
+        );
+        INSERT INTO provider_configs (
+            provider_id, enabled, earliest_time, jitter_minutes, extra_json, updated_at
+        ) VALUES (
+            'workbuddy', 1, '00:00', 10, '{}', '2026-11-10T00:00:00+00:00'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage = Storage(db_path)
+
+    assert storage.get_provider_config("qoder").business_day_start == "10:00"
+    assert storage.get_provider_config("workbuddy").business_day_start == "00:00"
+
+
 def test_effective_jitter_uses_provider_override_when_set() -> None:
     settings = GlobalSettings(jitter_minutes=15)
     cfg = ProviderConfig(provider_id="fake")
@@ -351,6 +501,89 @@ def test_effective_jitter_uses_provider_override_when_set() -> None:
     cfg.jitter_minutes = 5
     cfg.extra["jitter_override"] = True
     assert CheckinRunner._effective_jitter_minutes(cfg, settings) == 5
+
+
+def test_task_timeout_tracks_enabled_jitter_budget() -> None:
+    settings = GlobalSettings(jitter_minutes=15)
+    enabled = ProviderConfig(provider_id="alpha")
+    second = ProviderConfig(provider_id="beta")
+    disabled = ProviderConfig(provider_id="gamma", enabled=False)
+
+    assert CheckinRunner.estimate_task_timeout_minutes(settings, [enabled]) == 25
+    assert (
+        CheckinRunner.estimate_task_timeout_minutes(settings, [enabled, second]) == 40
+    )
+    assert (
+        CheckinRunner.estimate_task_timeout_minutes(settings, [enabled, disabled])
+        == 25
+    )
+
+    override = ProviderConfig(
+        provider_id="delta",
+        jitter_minutes=120,
+        extra={"jitter_override": True},
+    )
+    assert CheckinRunner.estimate_task_timeout_minutes(settings, [override]) == 130
+    assert (
+        CheckinRunner.estimate_task_timeout_minutes(
+            settings, [override, override, override]
+        )
+        == 300
+    )
+
+
+def test_manual_run_persists_maintenance_state(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "manual-maintenance-state.db")
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=RecordingNotifier(),
+        lock_path=tmp_path / "run.lock",
+    )
+
+    asyncio.run(
+        runner.run(
+            providers_override=[FakeProvider()],
+            trigger_type=TriggerType.MANUAL_WEB,
+        )
+    )
+
+    assert storage.get_maintenance_state().get("last_cleanup_at")
+
+
+def test_manual_run_triggers_due_maintenance(tmp_path: Path, monkeypatch) -> None:
+    storage = Storage(tmp_path / "manual-maintenance.db")
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=RecordingNotifier(),
+        lock_path=tmp_path / "run.lock",
+    )
+    calls: list[tuple[bool, bool]] = []
+
+    monkeypatch.setattr(storage, "maintenance_due", lambda settings: (True, False))
+
+    def fake_maintenance(settings, *, vacuum=False, backup=True):
+        calls.append((vacuum, backup))
+        return {"deleted": {}, "backup": None}
+
+    monkeypatch.setattr(storage, "run_maintenance", fake_maintenance)
+
+    asyncio.run(
+        runner.run(
+            providers_override=[FakeProvider()],
+            trigger_type=TriggerType.MANUAL_WEB,
+        )
+    )
+    assert calls == [(False, True)]
+
+    calls.clear()
+    asyncio.run(
+        runner.run(
+            providers_override=[FakeProvider()],
+            trigger_type=TriggerType.MANUAL_WEB,
+            dry_run=True,
+        )
+    )
+    assert calls == []
 
 
 def test_storage_run_events_roundtrip(tmp_path: Path) -> None:

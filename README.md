@@ -2,17 +2,30 @@
 
 Local-First 的 AI Agent 工具每日自动签到与积分追踪助手（Python 核心引擎 + 零构建本地 Web 控制台）。
 
-当前阶段已完成：
-- **核心调度引擎**：单实例防重文件锁、随机抖动错峰、幂等前置预检、SQLite WAL 账本、失效告警去重熔断、Provider 级异常隔离与部分失败通知。
-- **首发适配器**：`WorkBuddy`（本地已登录前提下自动读取桌面端登录态 `workbuddy-desktop.info`，支持只读体检、令牌内存刷新、状态预检与每日签到；签到状态接口 404/5xx 时安全中止，不误提交）。
-- **通知渠道**：Windows 10/11 原生系统弹窗通知（`winotify` + PowerShell WinRT 回退），并记录通知审计。
-- **本地 Web 控制台**：浅色现代简约界面（FastAPI + 零外部 CDN 静态页），支持多工具勾选与批量签到/预检、总览看板、近 30 天趋势图、SSE 实时日志流、本月打卡日历、运行批次/通知历史、Provider 级抖动与最早时间、Windows 计划任务一键安装/卸载，严格仅绑定 `127.0.0.1` 并附带一次性启动令牌认证。
+当前覆盖：
+
+- **WorkBuddy**：读取桌面端登录态或受控浏览器会话，只读体检、状态预检与每日签到；签到接口 404/5xx 时安全中止，不误提交。
+- **Qoder CN**：使用 PAT 兑换短期访问令牌，查询每日活动并领取 Credits（预检时只读，不提交领取）；每日活动以 **10:00 为界**，业务日可自定义（Qoder 默认 `10:00`）。
+
+---
+
+## 核心能力
+
+- **多工具调度**：单实例运行锁、随机抖动错峰、幂等预检、Provider 级异常隔离、部分失败通知。
+- **业务日模型**：每个工具可配置“业务日起始时间”，跨过该时间才计入新一天；避免 Qoder 这类 10:00 重置的工具在凌晨被误记为当天已完成。
+- **积分账本**：SQLite WAL 本地账本、签到积分（默认 100，接口返回实际奖励时以实际值为准）、到期提醒、近 30 天趋势。
+- **通知渠道**：Windows 10/11 原生系统弹窗（`winotify` + PowerShell WinRT 回退），并记录通知审计。
+- **本地 Web 控制台**：浅色现代简约界面（FastAPI + 零外部 CDN 静态页），支持多工具勾选与批量签到/预检、总览看板、SSE 实时日志、打卡日历、运行批次/通知历史。
+- **工具级配置**：自动调度开关、签到积分、业务日起始时间、最早可执行时间、独立抖动、凭据与路径覆盖。
+- **Windows 计划任务**：Web 或 CLI 一键安装/卸载；非管理员运行时自动请求 UAC 提权；执行时限按抖动预算自动计算；登录时补跑漏签。
+- **无终端启动**：双击 `GetEggs.lnk` 后台启动并打开浏览器，先显示启动加载页，服务就绪后自动跳转；重复启动不会产生第二个实例。
+- **安全**：仅监听 `127.0.0.1`，一次性启动令牌 + HttpOnly 会话 Cookie；PAT 与浏览器会话使用 Windows DPAPI 加密，不写入数据库或日志。
 
 ---
 
 ## 环境准备（Windows）
 
-若系统尚未安装 `uv` 与 Python 3.12+，可先安装 `uv`：
+若系统尚未安装 `uv` 与 Python 3.12+：
 
 ```powershell
 winget install --id=astral-sh.uv -e
@@ -34,33 +47,43 @@ uv sync --extra dev
    uv run geteggs doctor
    ```
 
-2. **首次受控浏览器授权**（当新版 WorkBuddy 桌面端启用 `$wbEncrypted` 加密时，运行一次在 Edge 中登录授权即可）：
+2. **首次 WorkBuddy 受控浏览器授权**（桌面端启用 `$wbEncrypted` 加密时需要）：
    ```powershell
    uv run geteggs auth workbuddy
    ```
 
-3. **预检试跑（Dry-Run）与正式签到**：
+3. **打开本地 Web 控制台**（推荐直接双击 `GetEggs.lnk`）：
+   ```powershell
+   uv run geteggs open
+   ```
+   - 后台启动、不弹终端；服务就绪后自动打开浏览器；
+   - 仅监听 `127.0.0.1`，默认端口 `18765`，被占用时自动选择空闲端口；
+   - 已有控制台运行时会直接打开已有地址，不会重复启动；
+   - 若本机没有 `GetEggs.lnk`，执行上述命令启动，或自行创建指向 `pythonw -m geteggs open` 的快捷方式。
+
+4. **配置工具**：
+   - WorkBuddy：确认登录态正常并开启「自动调度」；
+   - Qoder：在「工具与设置」→ Qoder 卡片粘贴 PAT 并保存，再开启「自动调度」（Qoder 默认停用）。
+
+5. **预检与正式签到**：
    ```powershell
    uv run geteggs run --dry-run
    uv run geteggs run
    ```
 
-3. **测试 Windows 系统弹窗通知**：
+6. **测试 Windows 系统弹窗通知**：
    ```powershell
    uv run geteggs notify-test
    ```
 
-4. **打开本地 Web 控制台**：
-   ```powershell
-   uv run geteggs ui
-   ```
-   仅监听 `127.0.0.1`。默认端口被占用时会自动选择空闲端口；如果已有控制台在运行，再次执行会直接提示已有 URL，不会重复启动。
-
-5. **注册每天自动签到与登录漏签补跑（Windows 计划任务）**：
+7. **安装每天自动签到与登录漏签补跑**：
    ```powershell
    uv run geteggs schedule install --time 10:15
    ```
-   也可在 Web 控制台的「工具与设置」页一键安装或卸载。
+   也可在 Web 控制台「工具与设置」页一键安装或卸载；如当前非管理员，会请求一次 UAC 授权。
+   默认 `10:15` 位于 Qoder 的 10:00 业务日重置之后；若把计划时间改到 10:00 之前，Qoder 会按上一个业务日判断。
+
+更完整的界面说明与操作流程见 [USER_GUIDE.md](USER_GUIDE.md)。
 
 ---
 
@@ -75,5 +98,7 @@ uv run pytest
 ## 数据存储与安全说明
 
 - 所有签到流水、运行批次、通知审计与设置均存储在本地 `%LOCALAPPDATA%\GetEggs\geteggs.db`（可通过环境变量 `GETEGGS_HOME` 覆盖）。
-- 受控浏览器会话 `workbuddy_browser_state.json` 在 Windows 下使用当前用户的 DPAPI 加密存储；兼容历史明文文件，并在下次写入时自动迁移为加密格式。
-- 程序**不存储明文密码**，也**不回传原始 Token 到前端 Web 页面**；遇到登录态失效、加密封装凭证或人机验证时会自动停止重试并弹窗提示手动处理。
+- `qoder_pat.json` 与 `workbuddy_browser_state.json` 在 Windows 下使用当前用户的 DPAPI 加密存储；兼容历史明文文件，并在下次写入时自动迁移为加密格式。
+- `ui-state.json` 保存当前 Web 服务地址与一次性启动令牌，仅用于本机打开页面；服务重启后令牌会自动更新。
+- 程序**不存储明文密码**，也**不回传原始 Token 到前端 Web 页面**；遇到登录态失效、加密封装凭证或人机验证时会停止重试并提示手动处理。
+- Qoder CN 使用非官方活动接口，接口字段或策略可能变化；GetEggs 会把异常隔离为单个工具的结果，不影响其他工具与历史数据。

@@ -1,7 +1,7 @@
 [project]
 name = "geteggs"
 version = "0.1.0"
-description = "Local-first daily auto check-in and credit tracker for AI Agent tools (WorkBuddy, Trae, Qoder, etc.)"
+description = "Local-first daily auto check-in and credit tracker for AI Agent tools (WorkBuddy, Qoder CN)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -8,18 +8,32 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+  <!-- Auxia-style Top Cobalt Announcement Ribbon -->
+  <div id="aux-ribbon" class="aux-ribbon" role="region" aria-label="控制台状态公告">
+    <div class="aux-ribbon-inner">
+      <button type="button" class="aux-ribbon-link" data-hero-action="dry-run" title="执行只读预检">
+        <span class="aux-sparkle" aria-hidden="true">✦</span>
+        <span class="mono-tag">GETEGGS AGENTIC ENGINE · LOCAL-FIRST 127.0.0.1</span>
+        <span class="aux-ribbon-cta">运行全量只读预检 →</span>
+      </button>
+      <button type="button" id="btn-dismiss-ribbon" class="aux-ribbon-close" aria-label="收起顶部公告" title="收起">×</button>
+    </div>
+  </div>
+
   <div class="shell">
     <header class="topbar">
       <div class="brand">
         <div class="brand-badge" aria-hidden="true">
-          <svg viewBox="0 0 28 28" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M14 3.5c-4.4 0-8 6.3-8 12.1A8 8 0 0 0 14 24a8 8 0 0 0 8-8.4c0-5.8-3.6-12.1-8-12.1Z"/>
-            <path d="M10.4 15.2c.6 1.8 2 2.9 3.6 2.9" opacity="0.65"/>
-            <circle cx="17.5" cy="9.5" r="1.1" fill="currentColor" stroke="none"/>
-          </svg>
+            <svg viewBox="0 0 28 28" width="22" height="22" fill="none">
+              <path d="M5.5 7.5A2 2 0 0 1 7.5 5.5h13a2 2 0 0 1 2 2v1.9c-5.4 1.3-10.7 4.7-14.8 10.1-.6.8-1.4 2-2.2 3.1V7.5Z" fill="currentColor"/>
+              <path d="M22.5 11.8v8.7a2 2 0 0 1-2 2H8.9c1.9-3.1 4.6-6 8.1-8.2 1.8-1.1 3.7-2 5.5-2.5Z" fill="currentColor" opacity="0.72"/>
+            </svg>
         </div>
-        <div>
-          <h1>GetEggs</h1>
+        <div class="brand-copy">
+          <div class="brand-title-row">
+            <h1>geteggs</h1>
+            <span class="brand-env-pill">AGENT STUDIO</span>
+          </div>
           <p class="subtitle">AI Agent 每日自动签到与积分手账</p>
         </div>
       </div>
@@ -32,9 +46,14 @@
       </nav>
 
       <div class="topbar-actions">
+        <span class="topbar-locale" title="严格仅监听本机回环地址">
+          <span class="status-dot ok" aria-hidden="true"></span>
+          <span>127.0.0.1</span>
+        </span>
+        <span class="topbar-sep" aria-hidden="true"></span>
         <button id="btn-run-all" class="btn btn-primary">
-          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 3.2v9.6l8.2-4.8L4 3.2Z"/>
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4.2 3.2v9.6l8.2-4.8-8.2-4.8Z"/>
           </svg>
           <span>一键签到</span>
         </button>
@@ -46,34 +65,134 @@
       <section id="tab-overview" class="tab-panel active" role="tabpanel" aria-labelledby="tab-btn-overview">
         <div id="overview-alert-strip" class="alert-strip" role="region" aria-label="待处理提醒" hidden></div>
 
+        <!-- Auxia-Inspired Hero Pipeline & Editorial Header -->
+        <section class="aux-hero" aria-label="自动签到流水线概览">
+          <div class="aux-pipeline-stage">
+            <!-- Continuous Stepped Orthogonal Cobalt Line -->
+            <svg class="aux-pipeline-svg" viewBox="0 0 1080 120" preserveAspectRatio="none" aria-hidden="true">
+              <path
+                d="M 48 26 H 254 Q 266 26 266 38 V 52 Q 266 64 278 64 H 905"
+                fill="none"
+                stroke="#2546f5"
+                stroke-width="1.35"
+              />
+            </svg>
+
+            <div class="aux-pipeline-grid">
+              <!-- Node 1: Ask / Prompt Bubble -->
+              <div class="aux-node aux-node-prompt">
+                <span class="aux-stage-pill active">
+                  <span aria-hidden="true">✦</span>
+                  <span>01 ASK AGENT</span>
+                </span>
+                <div class="aux-prompt-card">
+                  <p>检查本机 AI 工具会话与凭据，按幂等策略自动完成今日签到并入账。</p>
+                  <button type="button" class="aux-prompt-send" data-hero-action="run-all" title="立即执行一键签到" aria-label="立即执行一键签到">↑</button>
+                </div>
+              </div>
+
+              <!-- Node 2: Agent Workflow -->
+              <div class="aux-node aux-node-workflow">
+                <span class="aux-stage-pill">
+                  <span aria-hidden="true">✦</span>
+                  <span>02 WORKFLOW</span>
+                </span>
+                <ul id="hero-workflow-list" class="aux-step-list">
+                  <li class="is-done"><span class="step-mark">✓</span><span>READ-ONLY DOCTOR</span></li>
+                  <li class="is-done"><span class="step-mark">✓</span><span>IDEMPOTENT GUARD</span></li>
+                  <li id="hero-wf-run" class="is-pending"><span class="step-mark">○</span><span>EXECUTE CHECK-INS</span></li>
+                  <li id="hero-wf-ledger" class="is-pending"><span class="step-mark">○</span><span>COMMIT SQLITE WAL</span></li>
+                </ul>
+              </div>
+
+              <!-- Node 3: Decisioning -->
+              <div class="aux-node aux-node-decision">
+                <span class="aux-stage-pill">
+                  <span aria-hidden="true">✦</span>
+                  <span>03 DECISIONING</span>
+                </span>
+                <ul class="aux-rule-list">
+                  <li><span class="rule-star">✦</span><span id="hero-decision-tools">TOOLS · SYNCING</span></li>
+                  <li><span class="rule-star">✦</span><span id="hero-decision-schedule">SCHEDULER · CHECKING</span></li>
+                  <li><span class="rule-star">✦</span><span>DPAPI · ISOLATED AUTH</span></li>
+                </ul>
+              </div>
+
+              <!-- Node 4: Dark Rich Variant Card -->
+              <div class="aux-node aux-node-variant">
+                <span class="aux-stage-pill">
+                  <span aria-hidden="true">✦</span>
+                  <span>04 DAILY VARIANT</span>
+                </span>
+                <div class="aux-variant-card">
+                  <div class="aux-variant-glow" aria-hidden="true"></div>
+                  <div class="aux-variant-body">
+                    <span class="aux-variant-tag">TODAY SNAPSHOT</span>
+                    <strong id="hero-variant-title">待同步今日战果</strong>
+                    <p id="hero-variant-sub">点击下方预检可只读验证登录态与签到接口。</p>
+                    <button type="button" class="aux-variant-btn" data-hero-action="dry-run">全部只读预检</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="aux-hero-footer">
+            <div class="aux-hero-headline-wrap">
+              <span class="aux-eyebrow">AGENTIC CHECK-IN ORCHESTRATOR</span>
+              <h2 class="aux-hero-title">每日签到，<br />自动乘数化。</h2>
+            </div>
+            <div class="aux-hero-copy-wrap">
+              <p class="aux-hero-desc">
+                GetEggs 在本机串联多工具登录态体检、错峰防重与增量积分入账，让每一次每日签到稳定落袋。
+              </p>
+              <div class="aux-hero-actions">
+                <button type="button" class="btn btn-primary" data-hero-action="run-all">立即一键签到</button>
+                <button type="button" class="btn btn-quiet" data-goto-tab="history">查看执行账本 →</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Dual-Surface Bento KPIs (Agent Studio Dark + Decisioning Cobalt Dot-Grid) -->
         <div class="metrics-grid">
-          <article class="metric-card">
+          <article class="metric-card metric-card-dark">
             <div class="metric-top">
-              <span class="metric-label">今日总收益</span>
+              <span class="metric-label">TODAY'S YIELD · 今日总收益</span>
               <span class="metric-chip" id="metric-completion-chip">--</span>
             </div>
             <strong id="metric-today-delta" class="metric-value accent">+0</strong>
+            <div class="metric-dark-foot">
+              <span>● IDEMPOTENT LEDGER</span>
+              <span>REAL-TIME SSE</span>
+            </div>
           </article>
 
-          <article class="metric-card clickable" role="button" tabindex="0" data-goto-tab="settings" data-focus-section="schedule-panel" title="前往「工具与设置」管理计划任务">
-            <div class="metric-top">
-              <span class="metric-label">Windows 计划任务</span>
-              <span class="metric-chip" id="metric-schedule-chip">--</span>
+          <article class="metric-card metric-card-cobalt clickable" role="button" tabindex="0" data-goto-tab="settings" data-focus-section="schedule-panel" title="前往「工具与设置」管理计划任务">
+            <div class="metric-cobalt-top">
+              <div class="metric-top">
+                <span class="metric-label">AUTOMATION · Windows 计划任务</span>
+                <span class="metric-chip" id="metric-schedule-chip">--</span>
+              </div>
+              <strong id="metric-schedule" class="metric-value small">--</strong>
             </div>
-            <strong id="metric-schedule" class="metric-value small">--</strong>
-            <p class="metric-sub" id="metric-schedule-sub">点击前往设置计划任务 →</p>
+            <div class="metric-cobalt-foot">
+              <p class="metric-sub" id="metric-schedule-sub">点击前往设置计划任务 →</p>
+              <span class="metric-cobalt-pill">管理调度 →</span>
+            </div>
           </article>
         </div>
 
         <div class="section-header">
           <div class="section-title-group">
+            <span class="section-index">01 // PROVIDERS</span>
             <h2>已接入工具</h2>
             <span id="overview-updated-at" class="muted-meta">等待同步...</span>
           </div>
           <div class="inline-actions">
-            <button id="btn-dry-run-all" type="button" class="btn btn-quiet btn-sm" title="只读预检全部已启用工具，不提交签到">全部预检</button>
+            <button id="btn-dry-run-all" type="button" class="btn btn-ghost btn-sm" title="只读预检全部已启用工具，不提交签到">全部预检</button>
             <button id="btn-toggle-select-mode" type="button" class="btn btn-quiet btn-sm" aria-pressed="false" hidden>批量选择</button>
-            <button id="btn-refresh-overview" type="button" class="btn btn-quiet btn-icon" title="刷新看板数据" aria-label="刷新看板数据">
+            <button id="btn-refresh-overview" type="button" class="btn btn-ghost btn-icon" title="刷新看板数据" aria-label="刷新看板数据">
               <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M13.5 8a5.5 5.5 0 1 1-1.35-3.6"/>
                 <path d="M13.5 2.5v2.9h-2.9"/>
@@ -102,6 +221,7 @@
         <div class="panel compact-trend-panel">
           <div class="section-header">
             <div class="section-title-group">
+              <span class="section-index">02 // TELEMETRY</span>
               <h2>近 14 天领取走势</h2>
               <span id="trend-14d-total" class="muted-meta">合计 +0</span>
             </div>
@@ -112,12 +232,78 @@
             <div id="trend-mini-tooltip" class="chart-tooltip" role="status" aria-hidden="true"></div>
           </div>
         </div>
+
+        <!-- Auxia-Inspired Dark Event Matrix & Enterprise Local-First Trust Band -->
+        <section class="aux-dark-band stack-gap" aria-label="本地安全架构与实时决策流">
+          <div class="aux-dark-head">
+            <h2 class="aux-split-title">
+              <span class="tone-muted">Built for consistency.</span><br />
+              <span class="tone-bright">Local-first by design.</span>
+            </h2>
+            <p class="aux-dark-summary">
+              所有执行流水、任务调度与会话凭据均在你的本机闭环运行。单实例文件锁与幂等前置校验确保多工具并发隔离、零重复提交。
+            </p>
+          </div>
+
+          <div class="aux-matrix-box">
+            <div class="aux-matrix-head">
+              <span>TRIGGER · LOCAL TELEMETRY</span>
+              <span>AUTOMATED DECISIONS</span>
+            </div>
+            <div id="aux-decision-matrix" class="aux-matrix-rows">
+              <div class="aux-matrix-row">
+                <span class="aux-matrix-event">PREFLIGHT · CREDENTIAL CHECK</span>
+                <span class="aux-matrix-line" aria-hidden="true"></span>
+                <span class="aux-matrix-pill">✦ READ-ONLY DOCTOR</span>
+              </div>
+              <div class="aux-matrix-row">
+                <span class="aux-matrix-event">DAILY WINDOW · JITTER SCHEDULER</span>
+                <span class="aux-matrix-line" aria-hidden="true"></span>
+                <span class="aux-matrix-pill">✦ IDEMPOTENT CHECK-IN</span>
+              </div>
+              <div class="aux-matrix-row">
+                <span class="aux-matrix-event">LEDGER COMMIT · CREDIT SNAPSHOT</span>
+                <span class="aux-matrix-line" aria-hidden="true"></span>
+                <span class="aux-matrix-pill">✦ SQLITE WAL RECORD</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="aux-trust-grid">
+            <div class="aux-trust-col">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3l7 3v5.5c0 4.5-3 8.3-7 9.5-4-1.2-7-5-7-9.5V6l7-3Z"/>
+                <path d="M9.2 12.2l2 2 3.8-4"/>
+              </svg>
+              <h3>SQLite WAL 本地账本</h3>
+              <p>所有签到流水、执行批次与通知审计均持久化于本机数据库，清理前自动创建完整备份。</p>
+            </div>
+            <div class="aux-trust-col">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="11" width="16" height="9" rx="2"/>
+                <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+                <circle cx="12" cy="15.5" r="1"/>
+              </svg>
+              <h3>DPAPI 加密凭据隔离</h3>
+              <p>浏览器会话与 PAT 均使用 Windows 用户态 DPAPI 加密落盘，绝不向前端回传任何明文 Token。</p>
+            </div>
+            <div class="aux-trust-col">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="9"/>
+                <path d="M8 12h8M12 8v8"/>
+              </svg>
+              <h3>127.0.0.1 严苛同源</h3>
+              <p>Web 服务仅绑定本机回环地址，启动一次性令牌校验配合 Origin 拦截，零外部遥测上报。</p>
+            </div>
+          </div>
+        </section>
       </section>
 
       <!-- Tab 2: History -->
       <section id="tab-history" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-history">
         <div class="section-header">
           <div class="section-title-group">
+            <span class="section-index">LEDGER // MONTHLY</span>
             <h2>月度打卡与流水</h2>
             <span id="history-date-filter-chip" class="filter-chip" hidden>
               <span id="history-date-filter-text"></span>
@@ -178,17 +364,45 @@
           </div>
         </div>
 
-        <div class="panel stack-gap">
-          <div class="section-header">
-            <div class="section-title-group">
-              <h2>近 30 天积分领取趋势</h2>
-              <span class="muted-meta">按业务自然日聚合</span>
+        <div class="panel stack-gap aux-cobalt-card aux-cobalt-trend-card">
+          <div class="aux-cobalt-top">
+            <div class="section-header">
+              <div class="section-title-group">
+                <span class="section-index aux-index-on-blue">30-DAY WINDOW</span>
+                <h2>近 30 天积分领取趋势</h2>
+                <span class="muted-meta aux-meta-on-blue">按业务自然日聚合</span>
+              </div>
+              <div class="inline-actions">
+                <span id="trend-total-pill" class="btn btn-aux-white btn-sm aux-pill-static">30 日合计 +0</span>
+                <button type="button" class="btn btn-aux-dark btn-sm" data-goto-tab="overview">返回总览看板</button>
+              </div>
             </div>
-            <span id="trend-total-pill" class="pill pill-muted">30 日合计 +0</span>
+            <div class="trend-chart-wrap">
+              <div id="trend-chart" class="trend-chart"></div>
+              <div id="trend-tooltip" class="chart-tooltip" role="status" aria-hidden="true"></div>
+            </div>
           </div>
-          <div class="trend-chart-wrap">
-            <div id="trend-chart" class="trend-chart"></div>
-            <div id="trend-tooltip" class="chart-tooltip" role="status" aria-hidden="true"></div>
+          <div class="aux-cobalt-bottom">
+            <div class="aux-cobalt-bottom-grid">
+              <div class="aux-cobalt-display-wrap">
+                <span class="aux-cobalt-kicker">30-DAY CUMULATIVE YIELD</span>
+                <strong id="trend-30d-hero" class="aux-cobalt-hero-num">+0</strong>
+              </div>
+              <div class="aux-cobalt-cols">
+                <div class="aux-cobalt-col">
+                  <span>ACTIVE DAYS</span>
+                  <strong id="trend-30d-active-days">0 / 30</strong>
+                </div>
+                <div class="aux-cobalt-col">
+                  <span>PEAK DAILY</span>
+                  <strong id="trend-30d-peak">+0</strong>
+                </div>
+                <div class="aux-cobalt-col">
+                  <span>LEDGER</span>
+                  <strong>SQLite WAL</strong>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -198,7 +412,7 @@
               <button type="button" class="subtab-btn active" role="tab" aria-selected="true" data-history-subtab="runs">最近执行记录</button>
               <button type="button" class="subtab-btn" role="tab" aria-selected="false" data-history-subtab="notifications" tabindex="-1">通知发送审计</button>
             </div>
-            <button id="btn-refresh-audit" type="button" class="btn btn-quiet btn-icon" title="刷新列表" aria-label="刷新当前列表">
+            <button id="btn-refresh-audit" type="button" class="btn btn-ghost btn-icon" title="刷新列表" aria-label="刷新当前列表">
               <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M13.5 8a5.5 5.5 0 1 1-1.35-3.6"/>
                 <path d="M13.5 2.5v2.9h-2.9"/>
@@ -249,6 +463,7 @@
         <div class="panel">
           <div class="section-header">
             <div class="section-title-group">
+              <span class="section-index">AGENT PLAYBOOKS</span>
               <h2>工具管理与体检</h2>
               <span id="doctor-last-checked" class="muted-meta">进入本页自动检测 · 全程只读</span>
             </div>
@@ -270,6 +485,7 @@
         <section id="schedule-panel" class="panel form-card stack-gap">
           <div class="section-header">
             <div class="section-title-group">
+              <span class="section-index">TASK SCHEDULER</span>
               <h2>每日自动签到</h2>
               <span id="schedule-status-pill" class="pill pill-muted">读取中</span>
             </div>
@@ -294,13 +510,38 @@
               </label>
             </div>
 
-            <div class="schedule-task-box">
-              <div id="schedule-detail-box" class="info-box compact-box">--</div>
-              <div class="form-actions compact-actions">
-                <button id="btn-install-schedule" type="button" class="btn btn-primary btn-sm">安装 / 更新计划任务</button>
-                <button id="btn-uninstall-schedule" type="button" class="btn btn-danger btn-sm">卸载计划任务</button>
+            <div class="schedule-task-box aux-cobalt-card aux-cobalt-schedule-card">
+              <div class="aux-cobalt-top">
+                <div class="aux-schedule-card-head">
+                  <span class="aux-cobalt-kicker">WINDOWS TASK SCHEDULER</span>
+                  <h3>后台静默计划任务</h3>
+                </div>
+                <div id="schedule-detail-box" class="info-box compact-box aux-schedule-detail">--</div>
+                <div class="form-actions compact-actions">
+                  <button id="btn-install-schedule" type="button" class="btn btn-aux-white btn-sm">安装 / 更新计划任务</button>
+                  <button id="btn-uninstall-schedule" type="button" class="btn btn-aux-dark btn-aux-dark-danger btn-sm">卸载计划任务</button>
+                </div>
               </div>
-              <p class="muted-meta">注册后关闭本网页仍会按计划静默签到。</p>
+              <div class="aux-cobalt-bottom">
+                <div class="aux-schedule-hero-row">
+                  <strong id="schedule-hero-clock" class="aux-cobalt-hero-num aux-cobalt-hero-sm">10:15</strong>
+                  <p class="aux-schedule-note">注册后关闭本网页仍会按计划静默签到。</p>
+                </div>
+                <div class="aux-cobalt-cols aux-cobalt-cols-tight">
+                  <div class="aux-cobalt-col">
+                    <span>JITTER</span>
+                    <strong id="schedule-hero-jitter">±15 MIN</strong>
+                  </div>
+                  <div class="aux-cobalt-col">
+                    <span>CATCH-UP</span>
+                    <strong id="schedule-hero-catchup">ON LOGON</strong>
+                  </div>
+                  <div class="aux-cobalt-col">
+                    <span>EXECUTION</span>
+                    <strong>SILENT</strong>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -308,7 +549,10 @@
         <div class="settings-grid stack-gap">
           <div class="panel form-card">
             <div class="section-header">
-              <h2>通知提醒</h2>
+              <div class="section-title-group">
+                <span class="section-index">NOTIFIER</span>
+                <h2>通知提醒</h2>
+              </div>
               <button type="button" id="btn-test-toast" class="btn btn-ghost btn-sm">发送测试弹窗</button>
             </div>
             <label class="checkbox-field">
@@ -323,7 +567,10 @@
 
           <div class="panel form-card">
             <div class="section-header">
-              <h2>本地数据与服务</h2>
+              <div class="section-title-group">
+                <span class="section-index">STORAGE</span>
+                <h2>本地数据与服务</h2>
+              </div>
               <button type="button" id="btn-run-maintenance" class="btn btn-ghost btn-sm">立即清理旧数据</button>
             </div>
             <div id="maintenance-info" class="info-box compact-box">--</div>
@@ -410,7 +657,7 @@
     <pre id="live-drawer-log" class="live-drawer-log"></pre>
   </aside>
 
-  <!-- Custom Notebook-Styled Confirmation Dialog -->
+  <!-- Custom Confirmation Dialog -->
   <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
     <form method="dialog" class="confirm-card">
       <h2 id="confirm-title" class="confirm-title">确认操作</h2>

@@ -22,6 +22,7 @@ from geteggs.core.models import (
 )
 
 DEFAULT_DISABLED_PROVIDERS = {"qoder"}
+DEFAULT_BUSINESS_DAY_START = {"qoder": "10:00"}
 
 SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS provider_configs (
     provider_id TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 1,
     earliest_time TEXT NOT NULL DEFAULT '00:00',
+    business_day_start TEXT NOT NULL DEFAULT '00:00',
     jitter_minutes INTEGER NOT NULL DEFAULT 10,
     checkin_credits INTEGER NOT NULL DEFAULT {DEFAULT_CHECKIN_CREDITS},
     extra_json TEXT NOT NULL DEFAULT '{{}}',
@@ -136,6 +138,33 @@ class Storage:
             conn.executescript(SCHEMA_SQL)
             self._drop_legacy_balance_column(conn)
             self._add_missing_provider_credit_column(conn)
+            self._add_missing_business_day_column(conn)
+
+    @staticmethod
+    def _add_missing_business_day_column(conn: sqlite3.Connection) -> None:
+        """Add the configurable business-day start time to older databases."""
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(provider_configs)")
+        }
+        if "business_day_start" in columns:
+            return
+        added = False
+        try:
+            conn.execute(
+                "ALTER TABLE provider_configs "
+                "ADD COLUMN business_day_start TEXT NOT NULL DEFAULT '00:00'"
+            )
+            added = True
+        except sqlite3.OperationalError as exc:
+            # Another process may have completed the migration between the check and ALTER.
+            if "duplicate column" not in str(exc).lower():
+                raise
+        if added:
+            # Qoder CN 的每日活动以 10:00 重置，首次迁移时写入正确默认值。
+            conn.execute(
+                "UPDATE provider_configs SET business_day_start = '10:00' "
+                "WHERE provider_id = 'qoder'"
+            )
 
     @staticmethod
     def _add_missing_provider_credit_column(conn: sqlite3.Connection) -> None:
@@ -208,11 +237,13 @@ class Storage:
             return ProviderConfig(
                 provider_id=provider_id,
                 enabled=provider_id not in DEFAULT_DISABLED_PROVIDERS,
+                business_day_start=DEFAULT_BUSINESS_DAY_START.get(provider_id, "00:00"),
             )
         return ProviderConfig(
             provider_id=row["provider_id"],
             enabled=bool(row["enabled"]),
             earliest_time=row["earliest_time"],
+            business_day_start=row["business_day_start"],
             jitter_minutes=row["jitter_minutes"],
             checkin_credits=row["checkin_credits"],
             extra=json.loads(row["extra_json"] or "{}"),
@@ -224,13 +255,14 @@ class Storage:
             conn.execute(
                 """
                 INSERT INTO provider_configs (
-                    provider_id, enabled, earliest_time, jitter_minutes,
-                    checkin_credits, extra_json, updated_at
+                    provider_id, enabled, earliest_time, business_day_start,
+                    jitter_minutes, checkin_credits, extra_json, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider_id) DO UPDATE SET
                     enabled = excluded.enabled,
                     earliest_time = excluded.earliest_time,
+                    business_day_start = excluded.business_day_start,
                     jitter_minutes = excluded.jitter_minutes,
                     checkin_credits = excluded.checkin_credits,
                     extra_json = excluded.extra_json,
@@ -240,6 +272,7 @@ class Storage:
                     cfg.provider_id,
                     int(cfg.enabled),
                     cfg.earliest_time,
+                    cfg.business_day_start,
                     cfg.jitter_minutes,
                     cfg.checkin_credits,
                     json.dumps(cfg.extra, ensure_ascii=False),
@@ -304,7 +337,7 @@ class Storage:
     def get_today_completed_record(
         self, provider_id: str, biz_date: str
     ) -> Optional[dict[str, Any]]:
-        """Return today's latest successful/already_done non-dry-run record if present."""
+        """Return the latest completed non-dry-run record for a business day."""
         with self._connect() as conn:
             row = conn.execute(
                 """

@@ -113,6 +113,8 @@ $$("[data-goto-tab]").forEach((el) => {
     activateTab(tab);
     if (tab === "settings" && section) {
       focusSection(section);
+    } else if (el.closest(".aux-cobalt-card")) {
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   };
   el.addEventListener("click", go);
@@ -122,6 +124,23 @@ $$("[data-goto-tab]").forEach((el) => {
       go();
     }
   });
+});
+
+$$("[data-hero-action]").forEach((el) => {
+  el.addEventListener("click", () => {
+    const action = el.dataset.heroAction;
+    if (action === "run-all") {
+      $("#btn-run-all")?.click();
+    } else if (action === "dry-run") {
+      activateTab("overview");
+      $("#btn-dry-run-all")?.click();
+    }
+  });
+});
+
+$("#btn-dismiss-ribbon")?.addEventListener("click", () => {
+  const ribbon = $("#aux-ribbon");
+  if (ribbon) ribbon.hidden = true;
 });
 
 document.addEventListener("click", (ev) => {

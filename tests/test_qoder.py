@@ -267,6 +267,101 @@ def test_qoder_missing_pat(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "QODERCN_PERSONAL_ACCESS_TOKEN" in result.message
 
 
+def test_qoder_doctor_verifies_pat_online(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_pat(monkeypatch)
+    calls = {"exchange": 0, "claim": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/jobToken/exchange":
+            calls["exchange"] += 1
+            return httpx.Response(
+                200, json={"token": "jt-doctor", "expires_in": 86400000}
+            )
+        if request.url.path.endswith("/claim"):
+            calls["claim"] += 1
+            return httpx.Response(200, json={"status": "CLAIMED"})
+        if request.headers.get("authorization") == f"Bearer {PAT}":
+            return httpx.Response(401, json={})
+        return _campaigns_response([_campaign("CLAIMABLE")])
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.doctor(_cfg()))
+
+    assert result.healthy is True
+    assert result.details.get("verified") is True
+    assert result.details.get("claimable") is True
+    assert "在线校验通过" in result.message
+    assert calls == {"exchange": 1, "claim": 0}
+
+
+def test_qoder_doctor_reports_invalid_pat(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_pat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.doctor(_cfg()))
+
+    assert result.healthy is False
+    assert result.details.get("verified") is False
+    assert "在线校验失败" in result.message
+
+
+def test_qoder_doctor_tolerates_network_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_pat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("", request=request)
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    result = asyncio.run(provider.doctor(_cfg()))
+
+    assert result.healthy is True
+    assert result.details.get("verified") is False
+    assert "暂时无法在线校验" in result.message
+    assert "ConnectError" in result.message
+    assert not result.message.endswith("：")
+
+
+def test_qoder_reuses_cached_job_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_pat(monkeypatch)
+    stats = {"pat": 0, "token": 0, "exchange": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization")
+        if request.url.path == "/api/v1/jobToken/exchange":
+            stats["exchange"] += 1
+            return httpx.Response(
+                200, json={"token": "jt-cached", "expires_in": 86400000}
+            )
+        if request.url.path.endswith("/sash/api/v1/me/campaigns"):
+            if auth == f"Bearer {PAT}":
+                stats["pat"] += 1
+                return httpx.Response(401, json={})
+            if auth == "Bearer jt-cached":
+                stats["token"] += 1
+                return _campaigns_response([_campaign("CLAIMED")])
+        return httpx.Response(404, json={})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+
+    assert (
+        asyncio.run(provider.checkin(_cfg(), BIZ_DATE)).status
+        == CheckinStatus.ALREADY_DONE
+    )
+    assert (
+        asyncio.run(provider.checkin(_cfg(), BIZ_DATE)).status
+        == CheckinStatus.ALREADY_DONE
+    )
+    doctor_result = asyncio.run(provider.doctor(_cfg()))
+
+    assert doctor_result.details.get("verified") is True
+    assert stats["exchange"] == 1
+    assert stats["pat"] == 1
+    assert stats["token"] == 3
+
+
 def test_qoder_reads_pat_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -326,13 +421,18 @@ def test_qoder_parses_epoch_campaign_timestamps() -> None:
 
 def test_qoder_doctor_does_not_leak_pat(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_pat(monkeypatch)
-    provider = QoderProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _campaigns_response([_campaign("CLAIMED")])
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
     result = asyncio.run(provider.doctor(_cfg()))
 
     assert result.healthy is True
     assert result.auth_file_found is True
     assert PAT not in result.message
     assert PAT not in (result.auth_file_path or "")
+    assert PAT not in json.dumps(result.model_dump(), ensure_ascii=False)
 
 
 def test_qoder_claim_not_confirmed(monkeypatch: pytest.MonkeyPatch) -> None:

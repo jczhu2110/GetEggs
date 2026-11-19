@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -92,6 +94,29 @@ class FakeTraeProvider(FakeWebProvider):
     display_name = "Fake Trae"
 
 
+class BlockingWebProvider(FakeWebProvider):
+    """Provider that keeps a run active until the test releases it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    async def checkin(
+        self,
+        config: ProviderConfig,
+        biz_date: str,
+        *,
+        dry_run: bool = False,
+        log: Optional[LogCallback] = None,
+    ) -> CheckinResult:
+        self.started.set()
+        await asyncio.to_thread(self.release.wait, 5)
+        return await super().checkin(
+            config, biz_date, dry_run=dry_run, log=log
+        )
+
+
 def _patch_schedule(monkeypatch) -> None:
     monkeypatch.setattr(
         "geteggs.web.app.get_schedule_status",
@@ -156,6 +181,7 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
             "browser_state_path": "C:/custom/browser_state.json",
             "jitter_minutes": 5,
             "checkin_credits": 250,
+            "business_day_start": "10:00",
         },
     )
     assert upd.status_code == 200
@@ -164,9 +190,11 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert provider_extra["browser_state_path"] == "C:/custom/browser_state.json"
     assert provider_extra["jitter_override"] is True
     assert upd.json()["provider"]["checkin_credits"] == 250
+    assert upd.json()["provider"]["business_day_start"] == "10:00"
     assert "checkin_credits" not in client.get("/api/overview").json()["providers"][0]
     settings_provider = client.get("/api/settings").json()["providers"][0]
     assert settings_provider["checkin_credits"] == 250
+    assert settings_provider["business_day_start"] == "10:00"
 
     reset_jitter = client.put(
         "/api/providers/workbuddy/config", json={"jitter_override": False}
@@ -192,6 +220,12 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert (
         client.put(
             "/api/providers/workbuddy/config", json={"checkin_credits": -1}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/providers/workbuddy/config", json={"business_day_start": "25:00"}
         ).status_code
         == 422
     )
@@ -445,6 +479,34 @@ def test_web_run_accepts_multiple_provider_ids(tmp_path: Path) -> None:
     }
     assert first.checkin_calls == 1
     assert second.checkin_calls == 1
+
+
+def test_web_shutdown_rejects_active_run(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "shutdown.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    provider = BlockingWebProvider()
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[provider],
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/runs", json={"provider_id": "workbuddy", "dry_run": True}
+    )
+    assert response.status_code == 200
+    assert provider.started.wait(2)
+
+    blocked = client.post("/api/system/shutdown")
+    assert blocked.status_code == 409
+    assert "正在执行" in blocked.json()["detail"]
+
+    provider.release.set()
+    time.sleep(0.3)
 
 
 def test_web_static_assets_and_settings_metadata(

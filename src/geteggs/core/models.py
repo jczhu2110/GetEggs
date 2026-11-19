@@ -119,11 +119,17 @@ class ProviderConfig(BaseModel):
     provider_id: str
     enabled: bool = True
     earliest_time: str = "00:00"
+    business_day_start: str = "00:00"
     jitter_minutes: int = 10
     checkin_credits: int = Field(
         default=DEFAULT_CHECKIN_CREDITS, ge=0, le=MAX_CHECKIN_CREDITS
     )
     extra: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("business_day_start")
+    @classmethod
+    def _validate_business_day_start(cls, value: str) -> str:
+        return validate_hhmm(value)
 
 
 class GlobalSettings(BaseModel):

@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import subprocess
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, Callable, Optional
 
+from geteggs.core.config import business_date as resolve_business_date
 from geteggs.core.models import (
     CheckinResult,
     DoctorResult,
@@ -64,6 +66,16 @@ class BaseProvider(ABC):
         log: Optional[LogCallback] = None,
     ) -> CheckinResult:
         """Perform an idempotent check-in for `biz_date`."""
+
+    def business_date(
+        self,
+        config: ProviderConfig,
+        tz_name: str = "Asia/Shanghai",
+        *,
+        now: Optional[datetime] = None,
+    ) -> str:
+        """Return the current business date using the provider's daily reset time."""
+        return resolve_business_date(config.business_day_start, tz_name, now)
 
     def launch_client(self, config: ProviderConfig) -> tuple[bool, str]:
         """Launch the official desktop client for manual login or interaction."""

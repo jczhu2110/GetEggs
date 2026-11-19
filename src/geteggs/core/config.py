@@ -63,3 +63,26 @@ def get_timezone(tz_name: str = "Asia/Shanghai") -> timezone | ZoneInfo:
 def today_biz_date(tz_name: str = "Asia/Shanghai") -> str:
     """Return current YYYY-MM-DD date in the configured business timezone."""
     return datetime.now(get_timezone(tz_name)).strftime("%Y-%m-%d")
+
+
+def business_date(
+    start_hhmm: str = "00:00",
+    tz_name: str = "Asia/Shanghai",
+    now: datetime | None = None,
+) -> str:
+    """Return the business date for a daily window that starts at `start_hhmm`.
+
+    Times before the start belong to the previous business day, which matches
+    providers whose daily activity resets in the morning (for example Qoder CN
+    resets at 10:00).
+    """
+    moment = (now or datetime.now(timezone.utc)).astimezone(get_timezone(tz_name))
+    try:
+        hour, minute = (int(part) for part in (start_hhmm or "00:00").split(":", 1))
+    except ValueError:
+        hour, minute = 0, 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        hour, minute = 0, 0
+    if (moment.hour, moment.minute) < (hour, minute):
+        moment -= timedelta(days=1)
+    return moment.strftime("%Y-%m-%d")

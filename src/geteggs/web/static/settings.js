@@ -124,7 +124,9 @@ let settingsFetched = false;
 let settingsLoadPromise = null;
 let doctorFetched = false;
 let scheduleBusy = false;
+let globalSaveBusy = false;
 let lastSavedGlobal = null;
+let lastScheduleInfo = null;
 let settingsProviders = [];
 const doctorByProvider = new Map();
 const doctorChecking = new Set();
@@ -162,6 +164,23 @@ function setSettingsButtonsEnabled(enabled) {
 
 /* ---- Global Settings & Sticky Save Bar ---- */
 
+function syncScheduleHeroPreview() {
+  const clock = $("#schedule-hero-clock");
+  const jitter = $("#schedule-hero-jitter");
+  const catchup = $("#schedule-hero-catchup");
+  if (clock) {
+    clock.textContent = $("#set-schedule-time")?.value || "10:15";
+  }
+  if (jitter) {
+    const raw = $("#set-jitter-minutes")?.value;
+    const mins = raw === "" || raw === undefined ? 15 : Number(raw);
+    jitter.textContent = Number.isFinite(mins) ? `±${mins} MIN` : "-- MIN";
+  }
+  if (catchup) {
+    catchup.textContent = $("#set-catchup-logon")?.checked ? "ON LOGON" : "DISABLED";
+  }
+}
+
 function populateGlobalForm(g) {
   if (!g) return;
   $("#set-schedule-time").value = g.schedule_time || "10:15";
@@ -175,6 +194,7 @@ function populateGlobalForm(g) {
   $("#set-run-retention").value = g.run_retention_days ?? 180;
   $("#set-ledger-retention").value = g.ledger_retention_days ?? 365;
   $("#set-vacuum-interval").value = g.vacuum_interval_days ?? 30;
+  syncScheduleHeroPreview();
   syncPresetHighlight();
   updateSaveBarVisibility();
 }
@@ -254,7 +274,12 @@ function syncPresetHighlight(forced = null) {
 }
 
 async function saveGlobalSettings(successMessage) {
+  if (globalSaveBusy) return false;
+  globalSaveBusy = true;
+  const saveButton = $("#btn-save-global-settings");
+  if (saveButton) saveButton.disabled = true;
   try {
+    const previous = lastSavedGlobal;
     const payload = collectGlobalSettings();
     const saved = await apiFetch("/api/settings", {
       method: "PUT",
@@ -262,11 +287,39 @@ async function saveGlobalSettings(successMessage) {
     });
     lastSavedGlobal = saved.global || payload;
     updateSaveBarVisibility();
+
+    const scheduleChanged = Boolean(
+      previous &&
+        (previous.schedule_time !== payload.schedule_time ||
+          previous.auto_catchup_on_logon !== payload.auto_catchup_on_logon ||
+          previous.jitter_minutes !== payload.jitter_minutes)
+    );
+    if (scheduleChanged && lastScheduleInfo?.installed) {
+      try {
+        await syncScheduleIfInstalled();
+        showBanner("全局设置已保存，计划任务已按新配置同步。");
+        return true;
+      } catch (err) {
+        showBanner(`设置已保存，但计划任务同步失败：${err.message}`, true);
+        return false;
+      }
+    }
+    if (scheduleChanged && lastScheduleInfo?.query_failed) {
+      showBanner(
+        "设置已保存；计划任务状态查询失败，请稍后手动点击「安装 / 更新计划任务」同步。",
+        true
+      );
+      return true;
+    }
+
     showBanner(successMessage);
     return true;
   } catch (err) {
     showBanner(err.message, true);
     return false;
+  } finally {
+    globalSaveBusy = false;
+    if (saveButton) saveButton.disabled = false;
   }
 }
 
@@ -285,6 +338,7 @@ function buildProviderAdvancedForm(provider) {
   const pidEsc = escapeHtml(pid);
   const extra = provider.extra || {};
   const earliest = escapeHtml(provider.earliest_time || "00:00");
+  const businessStart = escapeHtml(provider.business_day_start || "00:00");
   const jitterVal = extra.jitter_override ? escapeHtml(String(provider.jitter_minutes ?? 0)) : "";
   const creditsVal = escapeHtml(
     String(provider.checkin_credits ?? DEFAULT_CHECKIN_CREDITS)
@@ -307,6 +361,10 @@ function buildProviderAdvancedForm(provider) {
       <label class="field">
         <span>签到积分（接口未返回奖励时按此计入，默认 ${DEFAULT_CHECKIN_CREDITS}）</span>
         <input name="checkin_credits" type="number" min="0" max="${MAX_CHECKIN_CREDITS}" step="1" class="input" value="${creditsVal}" />
+      </label>
+      <label class="field">
+        <span>业务日起始时间（跨过该时间才计入新一天，Qoder 为 10:00）</span>
+        <input name="business_day_start" type="time" class="input" value="${businessStart}" />
       </label>
       <div class="two-col-fields">
         <label class="field">
@@ -617,9 +675,13 @@ function resetProviderForm(providerId) {
     if (input) input.value = extra[field.name] || "";
   }
   const earliestInput = form.querySelector("[name='earliest_time']");
+  const businessStartInput = form.querySelector("[name='business_day_start']");
   const jitterInput = form.querySelector("[name='jitter_minutes']");
   const creditsInput = form.querySelector("[name='checkin_credits']");
   if (earliestInput) earliestInput.value = provider.earliest_time || "00:00";
+  if (businessStartInput) {
+    businessStartInput.value = provider.business_day_start || "00:00";
+  }
   if (jitterInput) {
     jitterInput.value = extra.jitter_override ? String(provider.jitter_minutes ?? 0) : "";
   }
@@ -644,6 +706,8 @@ async function submitProviderForm(form) {
     }
     const earliest = form.querySelector("[name='earliest_time']")?.value;
     if (earliest) payload.earliest_time = earliest;
+    const businessStart = form.querySelector("[name='business_day_start']")?.value;
+    if (businessStart) payload.business_day_start = businessStart;
     const creditsValue = (form.querySelector("[name='checkin_credits']")?.value ?? "").trim();
     const checkinCredits =
       creditsValue === "" ? DEFAULT_CHECKIN_CREDITS : Number(creditsValue);
@@ -660,6 +724,11 @@ async function submitProviderForm(form) {
       payload.jitter_override = false;
     }
 
+    const previous = settingsProviders.find((p) => p.provider_id === pid);
+    const beforeJitter = previous?.extra?.jitter_override
+      ? Number(previous.jitter_minutes || 0)
+      : Number(lastSavedGlobal?.jitter_minutes ?? 15);
+
     const res = await apiFetch(`/api/providers/${encodeURIComponent(pid)}/config`, {
       method: "PUT",
       body: JSON.stringify(payload),
@@ -670,7 +739,19 @@ async function submitProviderForm(form) {
     }
     markProviderFormDirty(pid, false);
     const name = settingsProviders[idx]?.display_name || pid;
-    showBanner(`${name} 配置已保存`);
+    const afterJitter = res.provider?.extra?.jitter_override
+      ? Number(res.provider.jitter_minutes || 0)
+      : Number(lastSavedGlobal?.jitter_minutes ?? 15);
+    if (beforeJitter !== afterJitter && lastScheduleInfo?.installed) {
+      try {
+        await syncScheduleIfInstalled();
+        showBanner(`${name} 配置已保存，计划任务执行时限已同步`);
+      } catch (err) {
+        showBanner(`${name} 配置已保存，但计划任务时限同步失败：${err.message}`, true);
+      }
+    } else {
+      showBanner(`${name} 配置已保存`);
+    }
     callbacks.onOverviewRefresh(true);
   } catch (err) {
     showBanner(err.message, true);
@@ -694,28 +775,53 @@ async function loadQoderPatStatus() {
   }
 }
 
+function formatTaskResult(code) {
+  if (code === null || code === undefined || code === "") return "--";
+  const value = Number(code);
+  if (value === 0) return "成功";
+  if (value === 267011) return "尚未运行";
+  if (value === 267009) return "正在运行";
+  return `异常（代码 ${code}）`;
+}
+
+async function syncScheduleIfInstalled() {
+  if (!lastScheduleInfo?.installed) return false;
+  const res = await apiFetch("/api/schedule/install", { method: "POST" });
+  renderScheduleBox(res.schedule);
+  callbacks.onOverviewRefresh();
+  return true;
+}
+
 function renderScheduleBox(sch) {
+  lastScheduleInfo = sch || null;
   const box = $("#schedule-detail-box");
   const pill = $("#schedule-status-pill");
   if (pill && sch) {
     if (!sch.supported) {
       pill.textContent = "不支持";
       pill.className = "pill pill-muted";
+    } else if (sch.query_failed) {
+      pill.textContent = "查询失败";
+      pill.className = "pill pill-err";
     } else if (sch.installed) {
-      pill.textContent = `已安装 (${sch.state || "Ready"})`;
-      pill.className = "pill pill-ok";
+      const state = String(sch.state || "Ready");
+      const healthy = ["ready", "running", "queued"].includes(
+        state.toLowerCase()
+      );
+      pill.textContent = `已安装 (${state})`;
+      pill.className = `pill ${healthy ? "pill-ok" : "pill-warn"}`;
     } else {
       pill.textContent = "未安装";
       pill.className = "pill pill-warn";
     }
   }
   if (!box || !sch) return;
-  if (!sch.supported) {
-    box.textContent = sch.message;
+  if (!sch.supported || sch.query_failed) {
+    box.textContent = sch.message || "计划任务状态查询失败，请稍后重试。";
     return;
   }
   box.innerHTML = sch.installed
-    ? `上次运行：${escapeHtml(formatDateTime(sch.last_run_time))}<br/>下次计划：${escapeHtml(formatDateTime(sch.next_run_time))}`
+    ? `上次运行：${escapeHtml(formatDateTime(sch.last_run_time))}<br/>下次计划：${escapeHtml(formatDateTime(sch.next_run_time))}<br/>上次结果：${escapeHtml(formatTaskResult(sch.last_task_result))}`
     : `尚未注册系统计划任务，点击下方按钮即可按左侧时间自动注册（含登录后补漏）。`;
 }
 
@@ -900,13 +1006,14 @@ export function initSettings(userCallbacks = {}) {
     if (RETENTION_INPUT_IDS.has(ev.target.id)) {
       syncPresetHighlight();
     }
+    syncScheduleHeroPreview();
     updateSaveBarVisibility();
   };
   $("#tab-settings")?.addEventListener("input", onGlobalChange);
   $("#tab-settings")?.addEventListener("change", onGlobalChange);
 
   $("#btn-save-global-settings")?.addEventListener("click", async () => {
-    await saveGlobalSettings("全局设置已保存；若已安装计划任务，可按需点击「安装 / 更新计划任务」同步时间。");
+    await saveGlobalSettings("全局设置已保存");
   });
   $("#btn-discard-global-settings")?.addEventListener("click", () => {
     if (!lastSavedGlobal) return;
@@ -1047,7 +1154,21 @@ export function initSettings(userCallbacks = {}) {
         const idx = settingsProviders.findIndex((p) => p.provider_id === providerId);
         if (idx >= 0) settingsProviders[idx].enabled = enabled;
         card?.classList.toggle("is-enabled", enabled);
-        showBanner(`已${enabled ? "启用" : "停用"} ${name} 自动调度`);
+        if (lastScheduleInfo?.installed) {
+          try {
+            await syncScheduleIfInstalled();
+            showBanner(
+              `已${enabled ? "启用" : "停用"} ${name} 自动调度，计划任务执行时限已同步`
+            );
+          } catch (err) {
+            showBanner(
+              `已${enabled ? "启用" : "停用"} ${name}，但计划任务时限同步失败：${err.message}`,
+              true
+            );
+          }
+        } else {
+          showBanner(`已${enabled ? "启用" : "停用"} ${name} 自动调度`);
+        }
         callbacks.onOverviewRefresh(true);
       } catch (err) {
         toggle.checked = !enabled;

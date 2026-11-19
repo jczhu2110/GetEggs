@@ -55,7 +55,9 @@ function renderBarTrend({
       const x = padX + i * barW + (barW - rectW) / 2;
       const y = padTop + chartH - barH;
       const isToday = i === series.length - 1;
-      const fill = val > 0 ? (isToday ? "var(--accent-hover)" : "var(--accent)") : "var(--border)";
+      const fill = val > 0
+        ? (isToday ? "var(--chart-bar-today, var(--accent))" : "var(--chart-bar, var(--accent-bar))")
+        : "var(--chart-empty, var(--border))";
       const delay = Math.min(i * 6, 150);
       return `
         <rect
@@ -83,13 +85,13 @@ function renderBarTrend({
 
   container.innerHTML = `
     <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" role="img" aria-label="${escapeHtml(ariaLabel)}">
-      <line x1="${padX}" y1="${padTop}" x2="${w - padX}" y2="${padTop}" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 4" />
-      <line x1="${padX}" y1="${midY}" x2="${w - padX}" y2="${midY}" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 4" />
-      <line x1="${padX}" y1="${padTop + chartH}" x2="${w - padX}" y2="${padTop + chartH}" stroke="var(--border-strong)" stroke-width="1" />
+      <line x1="${padX}" y1="${padTop}" x2="${w - padX}" y2="${padTop}" stroke="var(--chart-grid, var(--border))" stroke-width="1" stroke-dasharray="3 4" />
+      <line x1="${padX}" y1="${midY}" x2="${w - padX}" y2="${midY}" stroke="var(--chart-grid, var(--border))" stroke-width="1" stroke-dasharray="3 4" />
+      <line x1="${padX}" y1="${padTop + chartH}" x2="${w - padX}" y2="${padTop + chartH}" stroke="var(--chart-axis-line, var(--border-strong))" stroke-width="1" />
       ${bars}
-      <text x="${padX}" y="${h - 4}" fill="var(--muted)" font-size="11">${firstDate}</text>
-      <text x="${w / 2}" y="${h - 4}" text-anchor="middle" fill="var(--muted)" font-size="11">${midDate}</text>
-      <text x="${w - padX}" y="${h - 4}" text-anchor="end" fill="var(--muted)" font-size="11">${lastDate}</text>
+      <text x="${padX}" y="${h - 4}" fill="var(--chart-axis, var(--muted))" font-size="10.5" font-family="var(--mono)">${firstDate}</text>
+      <text x="${w / 2}" y="${h - 4}" text-anchor="middle" fill="var(--chart-axis, var(--muted))" font-size="10.5" font-family="var(--mono)">${midDate}</text>
+      <text x="${w - padX}" y="${h - 4}" text-anchor="end" fill="var(--chart-axis, var(--muted))" font-size="10.5" font-family="var(--mono)">${lastDate}</text>
     </svg>
   `;
 
@@ -149,4 +151,16 @@ export function renderFullTrendChart(series, fromCache = false) {
     ariaLabel: "近30天积分趋势",
     fromCache,
   });
+
+  const list = Array.isArray(series) ? series : [];
+  const sum = list.reduce((acc, s) => acc + (Number(s.delta) || 0), 0);
+  const activeDays = list.filter((s) => (Number(s.delta) || 0) > 0).length;
+  const peak = list.reduce((best, s) => Math.max(best, Number(s.delta) || 0), 0);
+
+  const heroEl = $("#trend-30d-hero");
+  const activeEl = $("#trend-30d-active-days");
+  const peakEl = $("#trend-30d-peak");
+  if (heroEl) heroEl.textContent = `+${sum.toLocaleString("en-US")}`;
+  if (activeEl) activeEl.textContent = `${activeDays} / ${list.length || 30}`;
+  if (peakEl) peakEl.textContent = `+${peak}`;
 }

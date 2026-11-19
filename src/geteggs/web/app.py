@@ -53,6 +53,7 @@ class TriggerRunRequest(BaseModel):
 class ProviderConfigUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     earliest_time: Optional[str] = None
+    business_day_start: Optional[str] = None
     jitter_minutes: Optional[int] = None
     checkin_credits: Optional[int] = None
     jitter_override: Optional[bool] = None
@@ -64,6 +65,13 @@ class ProviderConfigUpdateRequest(BaseModel):
     @field_validator("earliest_time")
     @classmethod
     def _validate_earliest_time(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        return validate_hhmm(value)
+
+    @field_validator("business_day_start")
+    @classmethod
+    def _validate_business_day_start(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return value
         return validate_hhmm(value)
@@ -521,6 +529,8 @@ def create_app(
             cfg.enabled = req.enabled
         if req.earliest_time is not None:
             cfg.earliest_time = req.earliest_time.strip()
+        if req.business_day_start is not None:
+            cfg.business_day_start = req.business_day_start.strip()
         if req.checkin_credits is not None:
             cfg.checkin_credits = req.checkin_credits
 
@@ -689,11 +699,16 @@ def create_app(
     @app.post("/api/schedule/install", dependencies=[Depends(require_auth)])
     async def api_schedule_install() -> dict[str, Any]:
         settings = app_storage.get_settings()
+        configs = [app_storage.get_provider_config(p.id) for p in app_providers]
+        timeout_minutes = CheckinRunner.estimate_task_timeout_minutes(
+            settings, configs
+        )
         try:
             ok, msg = await run_in_threadpool(
                 install_schedule,
                 settings.schedule_time,
                 catchup_on_logon=settings.auto_catchup_on_logon,
+                timeout_minutes=timeout_minutes,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -720,6 +735,11 @@ def create_app(
 
     @app.post("/api/system/shutdown", dependencies=[Depends(require_auth)])
     async def api_shutdown() -> dict[str, Any]:
+        if any(not state.finished for state in active_runs.values()):
+            raise HTTPException(
+                status_code=409,
+                detail="已有签到任务正在执行，请等待完成后再关闭 Web 服务。",
+            )
         cleanup = getattr(app.state, "ui_state_cleanup", None)
         if callable(cleanup):
             cleanup()

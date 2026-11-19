@@ -9,6 +9,7 @@ import socket
 import threading
 import time
 import webbrowser
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -164,7 +165,7 @@ def maintenance(
 @app.command()
 def run(
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="仅执行指定插件 ID"),
-    missed_only: bool = typer.Option(False, "--missed-only", help="仅补跑今日尚未成功的工具"),
+    missed_only: bool = typer.Option(False, "--missed-only", help="仅补跑本业务日尚未成功的工具"),
     jitter: bool = typer.Option(False, "--jitter", help="执行前启用随机延迟抖动（适合定时任务）"),
     no_notify: bool = typer.Option(False, "--no-notify", help="本次不发送系统弹窗通知"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预检模式：只校验登录态与状态，不提交签到"),
@@ -353,6 +354,12 @@ def schedule_status_cmd() -> None:
 @schedule_app.command("install")
 def schedule_install_cmd(
     time: Optional[str] = typer.Option(None, "--time", "-t", help="每日触发时间 HH:MM（默认读取配置）"),
+    no_elevate: bool = typer.Option(
+        False, "--no-elevate", hidden=True, help="内部使用：跳过管理员提权包装"
+    ),
+    result_file: Optional[Path] = typer.Option(
+        None, "--result-file", hidden=True, help="内部使用：写入安装结果 JSON"
+    ),
 ) -> None:
     """安装或更新 Windows 每日定时 + 开机漏签补跑任务。"""
     storage = Storage()
@@ -362,10 +369,29 @@ def schedule_install_cmd(
         settings.schedule_time = target_time
         storage.save_settings(settings)
 
-    ok, msg = install_schedule(
-        target_time,
-        catchup_on_logon=settings.auto_catchup_on_logon,
-    )
+    configs = [storage.get_provider_config(p.id) for p in list_providers()]
+    try:
+        ok, msg = install_schedule(
+            target_time,
+            catchup_on_logon=settings.auto_catchup_on_logon,
+            timeout_minutes=CheckinRunner.estimate_task_timeout_minutes(
+                settings, configs
+            ),
+            elevate=not no_elevate,
+        )
+    except Exception as exc:  # noqa: BLE001
+        ok, msg = False, f"注册计划任务失败：{exc}"
+
+    if result_file:
+        try:
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            result_file.write_text(
+                json.dumps({"ok": ok, "message": msg}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
     if ok:
         console.print(f"[green]{msg}[/green]")
     else:

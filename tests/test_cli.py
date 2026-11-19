@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import socket
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
+import pytest
 from typer.testing import CliRunner
 
 from geteggs import cli, launcher
@@ -87,12 +90,16 @@ def test_task_missing_fast_uses_schtasks(monkeypatch) -> None:
     commands: list[list[str]] = []
 
     class Proc:
-        def __init__(self, returncode: int) -> None:
+        def __init__(
+            self, returncode: int, stdout: str = "", stderr: str = ""
+        ) -> None:
             self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
 
     def fake_run(cmd, **kwargs):
         commands.append(cmd)
-        return Proc(1)
+        return Proc(1, stdout="ERROR: The system cannot find the file specified.")
 
     monkeypatch.setattr(windows.subprocess, "run", fake_run)
     assert windows._task_missing_fast() is True
@@ -100,6 +107,139 @@ def test_task_missing_fast_uses_schtasks(monkeypatch) -> None:
 
     monkeypatch.setattr(windows.subprocess, "run", lambda cmd, **kwargs: Proc(0))
     assert windows._task_missing_fast() is False
+
+
+def test_task_missing_fast_returns_none_for_ambiguous_errors(monkeypatch) -> None:
+    class Proc:
+        returncode = 1
+        stdout = "Access is denied."
+        stderr = ""
+
+    monkeypatch.setattr(windows.subprocess, "run", lambda cmd, **kwargs: Proc())
+    assert windows._task_missing_fast() is None
+
+
+def test_task_missing_fast_decodes_chinese_console_output(monkeypatch) -> None:
+    class Proc:
+        returncode = 1
+        stdout = b""
+        stderr = "错误: 系统找不到指定的文件。".encode("gb18030")
+
+    monkeypatch.setattr(windows.subprocess, "run", lambda cmd, **kwargs: Proc())
+    assert windows._task_missing_fast() is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_schedule_status_reports_query_failure(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_task_missing_fast", lambda: None)
+    monkeypatch.setattr(
+        windows, "_run_ps", lambda script: (0, '{"error":"Access is denied."}', "")
+    )
+
+    info = windows.get_schedule_status()
+
+    assert info["supported"] is True
+    assert info["installed"] is False
+    assert info["query_failed"] is True
+    assert "Access is denied." in info["message"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_schedule_status_distinguishes_missing_and_abnormal_result(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_task_missing_fast", lambda: True)
+    missing = windows.get_schedule_status()
+    assert missing["installed"] is False
+    assert not missing.get("query_failed")
+
+    payload = '{"installed": true, "state": "Ready", "last_task_result": 1}'
+    monkeypatch.setattr(windows, "_task_missing_fast", lambda: False)
+    monkeypatch.setattr(windows, "_run_ps", lambda script: (0, payload, ""))
+    abnormal = windows.get_schedule_status()
+    assert abnormal["installed"] is True
+    assert not abnormal.get("query_failed")
+    assert "异常代码 1" in abnormal["message"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_install_schedule_uses_computed_timeout(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(windows, "_probe_package_import", lambda *args: (True, ""))
+
+    def fake_ps(script: str) -> tuple[int, str, str]:
+        captured["script"] = script
+        return 0, "OK", ""
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+
+    ok, message = windows.install_schedule(
+        "10:15", timeout_minutes=40, elevate=False
+    )
+
+    assert ok is True
+    assert "-Minutes 40" in captured["script"]
+    assert "40 分钟" in message
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_install_schedule_requests_elevation_when_not_admin(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_is_elevated", lambda: False)
+    monkeypatch.setattr(windows, "_probe_package_import", lambda *args: (True, ""))
+    captured: dict[str, str] = {}
+
+    def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
+        captured["script"] = script
+        match = re.search(r"--result-file','([^']+)'", script)
+        assert match, script
+        Path(match.group(1)).write_text(
+            json.dumps({"ok": True, "message": "提权安装成功"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return 0, "", ""
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+
+    ok, message = windows.install_schedule("10:15")
+
+    assert ok is True
+    assert message == "提权安装成功"
+    assert "-Verb RunAs" in captured["script"]
+    assert "--no-elevate" in captured["script"]
+    match = re.search(r"--result-file','([^']+)'", captured["script"])
+    assert match and not Path(match.group(1)).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_install_schedule_reports_uac_cancellation(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_is_elevated", lambda: False)
+    monkeypatch.setattr(windows, "_probe_package_import", lambda *args: (True, ""))
+    monkeypatch.setattr(
+        windows,
+        "_run_ps",
+        lambda script, timeout=15: (1, "", "操作已被用户取消。"),
+    )
+
+    ok, message = windows.install_schedule("10:15")
+
+    assert ok is False
+    assert "取消" in message
+
+
+def test_schedule_install_writes_result_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    result_path = tmp_path / "result.json"
+    monkeypatch.setattr(
+        "geteggs.cli.install_schedule", lambda *args, **kwargs: (False, "boom")
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["schedule", "install", "--no-elevate", "--result-file", str(result_path)],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload == {"ok": False, "message": "boom"}
 
 
 def test_ui_duplicate_reports_existing_url(tmp_path: Path, monkeypatch) -> None:

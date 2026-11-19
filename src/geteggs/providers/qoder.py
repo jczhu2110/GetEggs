@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import time
@@ -43,6 +44,50 @@ class QoderProvider(BaseProvider):
 
     def __init__(self, transport: Optional[httpx.AsyncBaseTransport] = None) -> None:
         self._transport = transport
+        self._token_cache: dict[tuple[str, str], tuple[str, float]] = {}
+
+    def _token_cache_key(
+        self, config: ProviderConfig, pat: str
+    ) -> tuple[str, str]:
+        digest = hashlib.sha256(pat.encode("utf-8")).hexdigest()
+        return self._base_url(config), digest
+
+    def _cached_job_token(
+        self, config: ProviderConfig, pat: str
+    ) -> Optional[str]:
+        key = self._token_cache_key(config, pat)
+        cached = self._token_cache.get(key)
+        if not cached:
+            return None
+        token, expires_at = cached
+        if expires_at <= time.monotonic():
+            self._token_cache.pop(key, None)
+            return None
+        return token
+
+    def _remember_job_token(
+        self,
+        config: ProviderConfig,
+        pat: str,
+        token: str,
+        expires_in: Any,
+    ) -> None:
+        try:
+            ttl = float(expires_in)
+        except (TypeError, ValueError):
+            ttl = 3600.0
+        if ttl <= 0:
+            ttl = 3600.0
+        ttl = max(60.0, ttl - 60.0)
+        if len(self._token_cache) >= 4:
+            self._token_cache.clear()
+        self._token_cache[self._token_cache_key(config, pat)] = (
+            token,
+            time.monotonic() + ttl,
+        )
+
+    def _forget_job_token(self, config: ProviderConfig, pat: str) -> None:
+        self._token_cache.pop(self._token_cache_key(config, pat), None)
 
     # ---- BaseProvider contract ----
 
@@ -76,38 +121,102 @@ class QoderProvider(BaseProvider):
     async def doctor(self, config: ProviderConfig) -> DoctorResult:
         token, source = self._resolve_pat(config)
         exe = self.detect_client_exe(config)
-        if not token:
+        details: dict[str, Any] = {"region": "cn", "auth_source": source or ""}
+
+        def result(healthy: bool, message: str, **extra: Any) -> DoctorResult:
             return DoctorResult(
                 provider_id=self.id,
                 display_name=self.display_name,
                 client_installed=bool(exe),
                 client_exe_path=exe,
-                auth_file_found=False,
-                auth_file_path=None,
-                auth_readable=False,
-                healthy=False,
-                message=(
-                    "未配置 Qoder CN PAT。请在网页 Qoder 设置中直接填写 PAT，"
-                    "或设置环境变量 QODERCN_PERSONAL_ACCESS_TOKEN。"
-                ),
-                details={"region": "cn"},
+                auth_file_found=bool(token),
+                auth_file_path=(source or "环境变量") if token else None,
+                auth_readable=bool(token),
+                healthy=healthy,
+                message=message,
+                details={**details, **extra},
             )
-        message = "Qoder CN PAT 已配置，可执行每日 Credits 领取。"
-        if not token.startswith(("pt-", "jt-")):
-            message = "已检测到凭证，但格式不是 pt- / jt- 开头，请确认是否为 Qoder CN PAT。"
-        return DoctorResult(
-            provider_id=self.id,
-            display_name=self.display_name,
-            client_installed=bool(exe),
-            client_exe_path=exe,
-            auth_file_found=True,
-            auth_file_path=source or "环境变量",
-            auth_readable=True,
-            account_label=None,
-            healthy=True,
-            message=message,
-            details={"region": "cn", "auth_source": source or ""},
-        )
+
+        if not token:
+            return result(
+                False,
+                "未配置 Qoder CN PAT。请在网页 Qoder 设置中直接填写 PAT，"
+                "或设置环境变量 QODERCN_PERSONAL_ACCESS_TOKEN。",
+            )
+
+        import httpx
+
+        try:
+            async with self.build_http_client(self._transport, timeout=10.0) as client:
+                response, payload, access_token = await self._fetch_campaigns_with_auth(
+                    client, config, token, lambda _level, _message: None
+                )
+                if not access_token:
+                    return result(
+                        False,
+                        "Qoder CN PAT 在线校验失败，请确认 PAT 有效且未过期。",
+                        verified=False,
+                    )
+                if response.status_code in (401, 403):
+                    self._forget_job_token(config, token)
+                    return result(
+                        False,
+                        f"Qoder CN PAT 在线校验失败（HTTP {response.status_code}），请更新 PAT。",
+                        verified=False,
+                        http_status=response.status_code,
+                    )
+                if response.status_code in (404, 410):
+                    return result(
+                        False,
+                        f"Qoder CN 签到接口返回 HTTP {response.status_code}，接口可能已变更。",
+                        verified=False,
+                        http_status=response.status_code,
+                    )
+                if not response.is_success:
+                    return result(
+                        True,
+                        f"PAT 已配置，但暂时无法在线校验（HTTP {response.status_code}）。",
+                        verified=False,
+                        http_status=response.status_code,
+                    )
+
+                campaigns = self._campaigns_from(payload)
+                active = [
+                    campaign
+                    for campaign in campaigns
+                    if str(campaign.get("actionType") or "").upper()
+                    == "CLAIM_BENEFIT"
+                    and self._active_now(campaign)
+                ]
+                claimable = any(
+                    str(campaign.get("claimStatus") or "").upper() == "CLAIMABLE"
+                    for campaign in active
+                )
+                claimed = any(
+                    str(campaign.get("claimStatus") or "").upper() == "CLAIMED"
+                    for campaign in active
+                )
+                if claimable:
+                    message = "PAT 在线校验通过，当前有可领取的 Qoder CN 每日 Credits。"
+                elif claimed:
+                    message = "PAT 在线校验通过，今日 Qoder Credits 已领取。"
+                else:
+                    message = "PAT 在线校验通过，当前没有可领取的 Qoder CN 每日 Credits 活动。"
+                return result(
+                    True,
+                    message,
+                    verified=True,
+                    active_campaigns=len(active),
+                    claimable=claimable,
+                    claimed=claimed,
+                )
+        except httpx.HTTPError as exc:
+            reason = str(exc) or type(exc).__name__
+            return result(
+                True,
+                f"PAT 已配置，但暂时无法在线校验：{reason}",
+                verified=False,
+            )
 
     async def checkin(
         self,
@@ -134,29 +243,20 @@ class QoderProvider(BaseProvider):
         emit("info", f"正在查询 Qoder CN 每日 Credits 活动（凭证来源：{source or '未知'}）...")
         try:
             async with self.build_http_client(self._transport) as client:
-                response, payload = await self._fetch_campaigns(client, config, pat)
-                access_token = pat
-
-                if response.status_code in (401, 403):
-                    emit("info", "Qoder CN PAT 直连未通过，正在兑换访问令牌...")
-                    exchanged = await self._exchange_pat(
-                        client, config, pat, emit
+                response, payload, access_token = await self._fetch_campaigns_with_auth(
+                    client, config, pat, emit
+                )
+                if not access_token:
+                    return self._result(
+                        CheckinStatus.AUTH_EXPIRED,
+                        "Qoder CN PAT 兑换访问令牌失败，请确认 PAT 有效且未过期后重试。",
+                        biz_date,
+                        started=started,
+                        dry_run=dry_run,
+                        raw_error_type="QoderAuthError",
                     )
-                    if not exchanged:
-                        return self._result(
-                            CheckinStatus.AUTH_EXPIRED,
-                            "Qoder CN PAT 兑换访问令牌失败，请确认 PAT 有效且未过期后重试。",
-                            biz_date,
-                            started=started,
-                            dry_run=dry_run,
-                            raw_error_type="QoderAuthError",
-                        )
-                    access_token = exchanged
-                    response, payload = await self._fetch_campaigns(
-                        client, config, access_token
-                    )
-
                 if response.status_code in (401, 403):
+                    self._forget_job_token(config, pat)
                     return self._result(
                         CheckinStatus.AUTH_EXPIRED,
                         "Qoder CN 登录凭证已失效，请更新 PAT。",
@@ -455,13 +555,40 @@ class QoderProvider(BaseProvider):
             params={"clientType": "10"},
         )
 
+    async def _fetch_campaigns_with_auth(
+        self,
+        client: httpx.AsyncClient,
+        config: ProviderConfig,
+        pat: str,
+        emit: LogCallback,
+    ) -> tuple[httpx.Response, dict[str, Any], str]:
+        """Query campaigns with a cached job token, the PAT, or a fresh exchange."""
+        cached = self._cached_job_token(config, pat)
+        if cached:
+            response, payload = await self._fetch_campaigns(client, config, cached)
+            if response.status_code not in (401, 403):
+                return response, payload, cached
+            self._forget_job_token(config, pat)
+
+        response, payload = await self._fetch_campaigns(client, config, pat)
+        if response.status_code not in (401, 403):
+            return response, payload, pat
+
+        emit("info", "Qoder CN PAT 直连未通过，正在兑换访问令牌...")
+        exchanged, expires_in = await self._exchange_pat(client, config, pat, emit)
+        if not exchanged:
+            return response, payload, ""
+        self._remember_job_token(config, pat, exchanged, expires_in)
+        response, payload = await self._fetch_campaigns(client, config, exchanged)
+        return response, payload, exchanged
+
     async def _exchange_pat(
         self,
         client: httpx.AsyncClient,
         config: ProviderConfig,
         pat: str,
         emit: LogCallback,
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], int]:
         path = str(config.extra.get("pat_exchange_path") or DEFAULT_EXCHANGE_PATH)
         response, payload = await self._request(
             client,
@@ -473,7 +600,7 @@ class QoderProvider(BaseProvider):
         )
         if not response.is_success:
             emit("warning", f"Qoder CN PAT 兑换访问令牌失败（HTTP {response.status_code}）。")
-            return None
+            return None, 0
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         token = (
             payload.get("token")
@@ -482,10 +609,15 @@ class QoderProvider(BaseProvider):
             or data.get("token")
         )
         if isinstance(token, str) and token.strip():
+            raw_expires = payload.get("expires_in") or data.get("expires_in")
+            try:
+                expires_in = int(raw_expires)
+            except (TypeError, ValueError):
+                expires_in = 0
             emit("info", "Qoder CN 访问令牌兑换成功。")
-            return token.strip()
+            return token.strip(), expires_in
         emit("warning", "Qoder CN 访问令牌兑换响应缺少 token。")
-        return None
+        return None, 0
 
     @staticmethod
     def _campaigns_from(payload: dict[str, Any]) -> list[dict[str, Any]]:

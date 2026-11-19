@@ -162,22 +162,161 @@ function finishRun(triggerButton, originalHtml) {
 }
 
 let scheduleMetricRequest = null;
+let latestScheduleSnapshot = null;
+
+function setHeroStepState(el, state) {
+  if (!el) return;
+  el.classList.remove("is-done", "is-pending", "is-running");
+  el.classList.add(`is-${state}`);
+  const mark = el.querySelector(".step-mark");
+  if (mark) {
+    mark.textContent = state === "done" ? "✓" : state === "running" ? "◌" : "○";
+  }
+}
+
+function updateAuxiaTelemetry(providers, schedule, todayDelta) {
+  const list = providers || [];
+  const enabled = list.filter((p) => p.enabled);
+  const doneCount = enabled.filter((p) =>
+    ["success", "already_done"].includes(p.today_record?.status)
+  ).length;
+  const maxStreak = list.reduce((best, p) => {
+    const val = Number(p.today_record?.streak_days ?? p.latest_record?.streak_days ?? 0);
+    return Number.isFinite(val) ? Math.max(best, val) : best;
+  }, 0);
+
+  const wfRun = $("#hero-wf-run");
+  const wfLedger = $("#hero-wf-ledger");
+  if (appState.activeRun) {
+    setHeroStepState(wfRun, "running");
+    setHeroStepState(wfLedger, "pending");
+  } else if (enabled.length > 0 && doneCount === enabled.length) {
+    setHeroStepState(wfRun, "done");
+    setHeroStepState(wfLedger, "done");
+  } else if (doneCount > 0) {
+    setHeroStepState(wfRun, "running");
+    setHeroStepState(wfLedger, "done");
+  } else {
+    setHeroStepState(wfRun, "pending");
+    setHeroStepState(wfLedger, "pending");
+  }
+
+  const toolsEl = $("#hero-decision-tools");
+  if (toolsEl) {
+    toolsEl.textContent = `TOOLS · ${enabled.length}/${list.length} ENABLED`;
+  }
+  const schEl = $("#hero-decision-schedule");
+  if (schEl) {
+    schEl.textContent = schedule
+      ? schedule.query_failed
+        ? "SCHEDULER · CHECK NEEDED"
+        : schedule.installed
+          ? `SCHEDULER · ${String(schedule.state || "READY").toUpperCase()}`
+          : "SCHEDULER · MANUAL MODE"
+      : "SCHEDULER · SYNCING";
+  }
+
+  const vTitle = $("#hero-variant-title");
+  const vSub = $("#hero-variant-sub");
+  if (vTitle && vSub) {
+    const deltaVal = Number(todayDelta) || 0;
+    if (enabled.length > 0 && doneCount === enabled.length) {
+      vTitle.textContent = `今日全部就绪 (+${deltaVal})`;
+      vSub.textContent = maxStreak > 0
+        ? `已完成 ${doneCount}/${enabled.length} 项工具 · 最高连签 ${maxStreak} 天`
+        : `已完成 ${doneCount}/${enabled.length} 项工具 · 账本已同步`;
+    } else if (enabled.length > 0) {
+      vTitle.textContent = `${doneCount} / ${enabled.length} 已完成`;
+      vSub.textContent = deltaVal > 0
+        ? `今日累计 +${deltaVal} 积分 · 仍有工具待签`
+        : "点击左侧发送或下方预检，自动核验会话并执行。";
+    } else {
+      vTitle.textContent = "等待启用工具";
+      vSub.textContent = "前往「工具与设置」开启每日自动调度。";
+    }
+  }
+
+  const matrix = $("#aux-decision-matrix");
+  if (matrix && list.length) {
+    const rows = list.slice(0, 4).map((p) => {
+      const status = runningProviderIds.has(p.provider_id)
+        ? "running"
+        : p.today_record?.status || "pending";
+      const code = escapeHtml(String(p.provider_id || "").toUpperCase());
+      let decision = "✦ QUEUED FOR CHECK-IN";
+      let pillClass = "";
+      if (status === "running") {
+        decision = "✦ EXECUTING AGENT";
+        pillClass = " is-active";
+      } else if (status === "success" || status === "already_done") {
+        const d = Number(p.today_record?.delta) || 0;
+        decision = d > 0 ? `✓ CREDITED +${d}` : "✓ IDEMPOTENT SKIP";
+        pillClass = " is-ok";
+      } else if (ACTION_NEEDED_STATUSES.has(status)) {
+        decision = "⚠ ACTION REQUIRED";
+        pillClass = " is-warn";
+      } else if (!p.enabled) {
+        decision = "○ SCHEDULE PAUSED";
+        pillClass = " is-muted";
+      }
+      return `
+        <div class="aux-matrix-row">
+          <span class="aux-matrix-event">${code} · ${p.enabled ? "AUTO-SCHEDULE" : "MANUAL ONLY"}</span>
+          <span class="aux-matrix-line" aria-hidden="true"></span>
+          <span class="aux-matrix-pill${pillClass}">${escapeHtml(decision)}</span>
+        </div>
+      `;
+    });
+    rows.push(`
+      <div class="aux-matrix-row">
+        <span class="aux-matrix-event">SQLITE WAL · DAILY SNAPSHOT</span>
+        <span class="aux-matrix-line" aria-hidden="true"></span>
+        <span class="aux-matrix-pill is-active">✦ LEDGER PROTECTED</span>
+      </div>
+    `);
+    matrix.innerHTML = rows.join("");
+  }
+}
 
 function applyScheduleMetrics(sch) {
+  latestScheduleSnapshot = sch;
+  const failed = Boolean(sch?.query_failed);
+  const state = String(sch?.state || "Ready");
+  const healthy = ["ready", "running", "queued"].includes(state.toLowerCase());
   const schVal = $("#metric-schedule");
   if (schVal) {
-    schVal.textContent = sch?.installed
-      ? `已启用 (${sch.state || "Ready"})`
+    if (failed) schVal.textContent = "查询失败";
+    else schVal.textContent = sch?.installed
+      ? `已启用 (${state})`
       : "未安装";
   }
   const schChip = $("#metric-schedule-chip");
-  if (schChip) schChip.textContent = sch?.installed ? "运行中" : "待配置";
+  if (schChip) {
+    if (failed) schChip.textContent = "待检查";
+    else schChip.textContent = sch?.installed
+      ? healthy
+        ? "运行中"
+        : "需关注"
+      : "待配置";
+  }
   const schSub = $("#metric-schedule-sub");
   if (schSub) {
-    schSub.textContent =
-      sch?.installed && sch.next_run_time
-        ? `下次运行：${formatDateTime(sch.next_run_time)}`
-        : "点击前往设置计划任务 →";
+    if (failed) {
+      schSub.textContent = "计划任务状态查询失败，请到设置页重试 →";
+    } else {
+      schSub.textContent =
+        sch?.installed && sch.next_run_time
+          ? `下次运行：${formatDateTime(sch.next_run_time)}`
+          : "点击前往设置计划任务 →";
+    }
+  }
+  const schDecision = $("#hero-decision-schedule");
+  if (schDecision) {
+    schDecision.textContent = failed
+      ? "SCHEDULER · CHECK NEEDED"
+      : sch?.installed
+        ? `SCHEDULER · ${state.toUpperCase()}`
+        : "SCHEDULER · MANUAL MODE";
   }
 }
 
@@ -305,7 +444,10 @@ export async function loadOverview(silent = false) {
                 </label>
                 <span class="provider-monogram" aria-hidden="true">${escapeHtml(providerInitial(p.display_name))}</span>
                 <div class="provider-head-copy">
-                  <h3 class="provider-title">${escapeHtml(p.display_name)}</h3>
+                  <div class="provider-title-line">
+                    <h3 class="provider-title">${escapeHtml(p.display_name)}</h3>
+                    <span class="provider-slug">${escapeHtml(String(p.provider_id || "").toUpperCase())}</span>
+                  </div>
                   ${disabledTag}
                 </div>
                 ${statusPill(displayStatus)}
@@ -376,6 +518,7 @@ export async function loadOverview(silent = false) {
     if (document.body.dataset.tab === "history") {
       renderFullTrendChart(appState.trend30d);
     }
+    updateAuxiaTelemetry(providers, data.schedule || latestScheduleSnapshot, data.today_delta ?? 0);
   } catch (err) {
     if (!silent) {
       showBanner(err.message, true);
@@ -454,6 +597,7 @@ async function triggerRun(providerIds = null, dryRun = false, triggerButton = nu
     : appState.providers.filter((p) => p.enabled).map((p) => p.provider_id);
   activeTargets.forEach((id) => runningProviderIds.add(id));
   setRunButtonsBusy(true);
+  updateAuxiaTelemetry(appState.providers, latestScheduleSnapshot, $("#metric-today-delta")?.dataset?.numVal ?? 0);
 
   const targetLabel = ids ? `${ids.length} 个工具` : "全部已启用工具";
   openLiveDrawer(dryRun ? `正在预检（${targetLabel}）` : `正在执行签到（${targetLabel}）`);
