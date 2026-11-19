@@ -79,7 +79,7 @@ class FakeWebProvider(BaseProvider):
             status=CheckinStatus.ALREADY_DONE,
             message="fake already done",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(balance=100, delta=0, streak_days=1),
+            snapshot=CreditSnapshot(delta=0, streak_days=1),
             dry_run=dry_run,
         )
 
@@ -155,6 +155,7 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
             "auth_file_path": "C:/custom/workbuddy-desktop.info",
             "browser_state_path": "C:/custom/browser_state.json",
             "jitter_minutes": 5,
+            "checkin_credits": 250,
         },
     )
     assert upd.status_code == 200
@@ -162,12 +163,17 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert provider_extra["auth_file_path"] == "C:/custom/workbuddy-desktop.info"
     assert provider_extra["browser_state_path"] == "C:/custom/browser_state.json"
     assert provider_extra["jitter_override"] is True
+    assert upd.json()["provider"]["checkin_credits"] == 250
+    assert "checkin_credits" not in client.get("/api/overview").json()["providers"][0]
+    settings_provider = client.get("/api/settings").json()["providers"][0]
+    assert settings_provider["checkin_credits"] == 250
 
     reset_jitter = client.put(
         "/api/providers/workbuddy/config", json={"jitter_override": False}
     )
     assert reset_jitter.status_code == 200
     assert "jitter_override" not in reset_jitter.json()["provider"]["extra"]
+    assert reset_jitter.json()["provider"]["checkin_credits"] == 250
 
     # Invalid inputs are rejected before touching the database.
     assert client.put("/api/settings", json={"schedule_time": "25:99"}).status_code == 422
@@ -180,6 +186,12 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert (
         client.put(
             "/api/providers/workbuddy/config", json={"earliest_time": "9:00"}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/providers/workbuddy/config", json={"checkin_credits": -1}
         ).status_code
         == 422
     )
@@ -261,7 +273,7 @@ def test_web_overview_keeps_success_after_later_failure(
             status=CheckinStatus.SUCCESS,
             message="签到成功",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(balance=1300, delta=100, streak_days=5),
+            snapshot=CreditSnapshot(delta=100, streak_days=5),
         ),
     )
     storage.save_checkin_result(
@@ -287,11 +299,52 @@ def test_web_overview_keeps_success_after_later_failure(
     overview = client.get("/api/overview").json()
 
     assert overview["today_delta"] == 100
-    assert overview["total_balance"] == 1300
+    assert "total_balance" not in overview
     card = overview["providers"][0]
     assert card["today_record"]["status"] == "success"
-    assert card["today_record"]["balance"] == 1300
+    assert "balance" not in card["today_record"]
     assert "最近一次重跑异常" in card["today_record"]["message"]
+
+
+def test_web_overview_does_not_block_on_schedule(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[int] = []
+
+    def fake_schedule() -> dict:
+        calls.append(1)
+        return {
+            "supported": True,
+            "installed": False,
+            "task_name": "GetEggs-DailyCheckin",
+            "message": "尚未安装系统计划任务。",
+        }
+
+    monkeypatch.setattr("geteggs.web.app.get_schedule_status", fake_schedule)
+    storage = Storage(tmp_path / "overview.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FakeWebProvider()],
+    )
+    client = TestClient(app)
+
+    body = client.get("/api/overview").json()
+    assert body["schedule"] is None
+    assert body["schedule_stale"] is False
+    assert calls == []
+
+    schedule = client.get("/api/schedule").json()
+    assert schedule["installed"] is False
+    assert calls == [1]
+
+    refreshed = client.get("/api/overview").json()
+    assert refreshed["schedule"]["installed"] is False
+    assert refreshed["schedule_stale"] is False
 
 
 def test_web_qoder_pat_save_status_clear(
@@ -392,3 +445,49 @@ def test_web_run_accepts_multiple_provider_ids(tmp_path: Path) -> None:
     }
     assert first.checkin_calls == 1
     assert second.checkin_calls == 1
+
+
+def test_web_static_assets_and_settings_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _patch_schedule(monkeypatch)
+    storage = Storage(tmp_path / "static_check.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FakeWebProvider()],
+    )
+    client = TestClient(app)
+
+    settings_resp = client.get("/api/settings")
+    assert settings_resp.status_code == 200
+    provider_cfg = settings_resp.json()["providers"][0]
+    assert provider_cfg["description"] == "Fake provider for web tests"
+    assert provider_cfg["supports_browser_auth"] is True
+
+    html_resp = client.get("/")
+    assert html_resp.status_code == 200
+    assert 'id="overview-alert-strip"' in html_resp.text
+    assert 'id="settings-save-bar"' in html_resp.text
+    assert 'id="confirm-dialog"' in html_resp.text
+    assert 'id="metric-balance-list"' not in html_resp.text
+    overview_js = client.get("/static/overview.js")
+    assert overview_js.status_code == 200
+    assert "当前余额" not in overview_js.text
+    assert "metric-balance-list" not in overview_js.text
+
+    for asset in (
+        "/static/styles.css",
+        "/static/app.js",
+        "/static/utils.js",
+        "/static/charts.js",
+        "/static/overview.js",
+        "/static/history.js",
+        "/static/settings.js",
+    ):
+        resp = client.get(asset)
+        assert resp.status_code == 200, f"failed to fetch {asset}"

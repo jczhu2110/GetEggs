@@ -11,9 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import httpx
-
 from geteggs.core.models import (
+    DEFAULT_CHECKIN_CREDITS,
+    MAX_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
     CreditSnapshot,
@@ -525,6 +525,8 @@ class WorkBuddyProvider(BaseProvider):
         base_url: str,
         log: Optional[LogCallback],
     ) -> bool:
+        import httpx
+
         if not creds.refresh_token:
             return False
         if log:
@@ -576,6 +578,8 @@ class WorkBuddyProvider(BaseProvider):
         log: Optional[LogCallback],
     ) -> tuple[str, Optional[dict[str, Any]], int]:
         """Try status endpoints across configured base URLs; return (chosen_base_url, json_payload, status_code)."""
+        import httpx
+
         last_status = 0
         last_url = base_urls[0]
         for base_url in base_urls:
@@ -615,18 +619,6 @@ class WorkBuddyProvider(BaseProvider):
                 "signed",
             )
         )
-        balance = _to_int(
-            extract_first(
-                payload,
-                "balance",
-                "totalCredits",
-                "total_credits",
-                "credits",
-                "remainingCredits",
-                "remaining_credits",
-                "availableCredits",
-            )
-        )
         streak = _to_int(
             extract_first(
                 payload,
@@ -664,7 +656,6 @@ class WorkBuddyProvider(BaseProvider):
                 expiring_at = raw_expiring_at.strip() or None
 
         return checked_in, CreditSnapshot(
-            balance=balance,
             streak_days=streak,
             expiring_soon=expiring_soon,
             expiring_at=expiring_at,
@@ -678,6 +669,7 @@ class WorkBuddyProvider(BaseProvider):
         biz_date: str,
         duration_ms: int,
         post_snapshot: Optional[CreditSnapshot] = None,
+        default_credits: int = DEFAULT_CHECKIN_CREDITS,
     ) -> CheckinResult:
         """Normalize raw JSON response from either direct API or controlled browser fetch."""
         if status_code in (401, 403):
@@ -749,39 +741,26 @@ class WorkBuddyProvider(BaseProvider):
                 raw_error_type=f"Code_{code}",
             )
 
-        delta = _to_int(
+        reward = _to_int(
             extract_first(
                 body,
                 "rewardCredits",
                 "reward_credits",
                 "earnedCredits",
+                "earned_credits",
                 "delta",
                 "points",
-                "credits",
                 "reward",
             )
-        ) or 0
-        balance = _to_int(
-            extract_first(
-                body,
-                "balance",
-                "totalCredits",
-                "total_credits",
-                "remainingCredits",
-                "availableCredits",
-            )
         )
+        delta = reward if reward is not None else default_credits
+        delta = min(max(delta, 0), MAX_CHECKIN_CREDITS)
         streak = _to_int(
             extract_first(body, "streakDays", "streak_days", "continuousDays")
         )
 
-        if post_snapshot is not None:
-            if balance is None:
-                balance = post_snapshot.balance
-            if streak is None:
-                streak = post_snapshot.streak_days
-            if delta == 0 and pre_snapshot.balance is not None and balance is not None:
-                delta = max(0, balance - pre_snapshot.balance)
+        if post_snapshot is not None and streak is None:
+            streak = post_snapshot.streak_days
 
         expiring_soon = (
             post_snapshot.expiring_soon
@@ -795,7 +774,6 @@ class WorkBuddyProvider(BaseProvider):
         )
 
         final_snap = CreditSnapshot(
-            balance=balance if balance is not None else pre_snapshot.balance,
             delta=delta,
             streak_days=streak if streak is not None else pre_snapshot.streak_days,
             expiring_soon=expiring_soon,
@@ -804,8 +782,6 @@ class WorkBuddyProvider(BaseProvider):
         detail_parts = ["WorkBuddy 今日签到成功"]
         if final_snap.delta > 0:
             detail_parts.append(f"+{final_snap.delta} 积分")
-        if final_snap.balance is not None:
-            detail_parts.append(f"当前余额 {final_snap.balance}")
         if final_snap.streak_days is not None:
             detail_parts.append(f"已连续 {final_snap.streak_days} 天")
 
@@ -998,6 +974,7 @@ class WorkBuddyProvider(BaseProvider):
             biz_date,
             elapsed_ms(),
             post_snapshot=post_snap,
+            default_credits=config.checkin_credits,
         )
 
     async def checkin(
@@ -1008,6 +985,8 @@ class WorkBuddyProvider(BaseProvider):
         dry_run: bool = False,
         log: Optional[LogCallback] = None,
     ) -> CheckinResult:
+        import httpx
+
         started = time.perf_counter()
 
         def elapsed_ms() -> int:
@@ -1244,7 +1223,12 @@ class WorkBuddyProvider(BaseProvider):
 
             if checkin_resp.status_code in (401, 403, 500) or checkin_resp.status_code >= 500:
                 return self._interpret_checkin_payload(
-                    None, checkin_resp.status_code, pre_snapshot, biz_date, elapsed_ms()
+                    None,
+                    checkin_resp.status_code,
+                    pre_snapshot,
+                    biz_date,
+                    elapsed_ms(),
+                    default_credits=config.checkin_credits,
                 )
 
             try:
@@ -1275,4 +1259,5 @@ class WorkBuddyProvider(BaseProvider):
                 biz_date,
                 elapsed_ms(),
                 post_snapshot=post_snap,
+                default_credits=config.checkin_credits,
             )

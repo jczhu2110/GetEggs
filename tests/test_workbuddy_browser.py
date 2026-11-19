@@ -245,11 +245,11 @@ def test_workbuddy_checkin_fast_path_from_storage_state_and_fallback_to_browser_
         return {
             "authenticated": True,
             "active_url": "https://www.codebuddy.cn",
-            "statusRes": {"status": 200, "data": {"code": 0, "data": {"checkedIn": False, "balance": 300}}},
+            "statusRes": {"status": 200, "data": {"code": 0, "data": {"checkedIn": False}}},
             "checkinRes": {"status": 200, "data": {"code": 0, "data": {"rewardCredits": 100}}},
             "postStatusRes": {
                 "status": 200,
-                "data": {"code": 0, "data": {"checkedIn": True, "balance": 400, "streakDays": 5}},
+                "data": {"code": 0, "data": {"checkedIn": True, "streakDays": 5}},
             },
         }
 
@@ -269,7 +269,60 @@ def test_workbuddy_checkin_fast_path_from_storage_state_and_fallback_to_browser_
     assert res.status == CheckinStatus.SUCCESS
     assert res.snapshot is not None
     assert res.snapshot.delta == 100
-    assert res.snapshot.balance == 400
+    assert res.snapshot.streak_days == 5
+
+
+def test_workbuddy_browser_uses_configured_credits_when_reward_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GETEGGS_WORKBUDDY_TOKEN", raising=False)
+    auth_file = _write_json(
+        tmp_path / "workbuddy-desktop.info",
+        {
+            "auth": {"$wbEncrypted": 1, "accessToken": {"$wbEncrypted": 1, "envelope": "enc"}},
+            "account": {"uid": "u_test"},
+        },
+    )
+    state_file = _write_json(
+        tmp_path / "browser_state.json",
+        {
+            "cookies": [{"name": "session", "value": "cookie_val", "domain": ".codebuddy.cn"}],
+            "origins": [{"origin": "https://www.codebuddy.cn", "localStorage": []}],
+        },
+    )
+
+    def expired_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"code": 401})
+
+    async def fake_browser_checkin(state_path: Path, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "authenticated": True,
+            "active_url": "https://www.codebuddy.cn",
+            "statusRes": {"status": 200, "data": {"code": 0, "data": {"checkedIn": False}}},
+            "checkinRes": {"status": 200, "data": {"code": 0, "data": {}}},
+            "postStatusRes": {
+                "status": 200,
+                "data": {"code": 0, "data": {"checkedIn": True, "streakDays": 5}},
+            },
+        }
+
+    provider = WorkBuddyProvider(
+        transport=httpx.MockTransport(expired_handler),
+        browser_checkin_fn=fake_browser_checkin,
+    )
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        checkin_credits=250,
+        extra={
+            "auth_file_path": str(auth_file),
+            "browser_state_path": str(state_file),
+        },
+    )
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
+
+    assert res.status == CheckinStatus.SUCCESS
+    assert res.snapshot is not None
+    assert res.snapshot.delta == 250
     assert res.snapshot.streak_days == 5
 
 

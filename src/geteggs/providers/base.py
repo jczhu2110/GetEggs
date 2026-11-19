@@ -7,8 +7,6 @@ import subprocess
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
-import httpx
-
 from geteggs.core.models import (
     CheckinResult,
     DoctorResult,
@@ -95,6 +93,8 @@ class BaseProvider(ABC):
         cookies: Optional[dict[str, str]] = None,
     ) -> httpx.AsyncClient:
         """Create a configured async HTTP client."""
+        import httpx
+
         return httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             follow_redirects=True,

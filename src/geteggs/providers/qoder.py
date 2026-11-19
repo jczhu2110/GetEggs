@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
-import httpx
-
 from geteggs.core.config import get_qoder_pat_path
 from geteggs.core.models import (
+    DEFAULT_CHECKIN_CREDITS,
+    MAX_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
     CreditSnapshot,
@@ -117,6 +117,8 @@ class QoderProvider(BaseProvider):
         dry_run: bool = False,
         log: Optional[LogCallback] = None,
     ) -> CheckinResult:
+        import httpx
+
         started = time.perf_counter()
         emit = log or (lambda _level, _message: None)
         pat, source = self._resolve_pat(config)
@@ -248,7 +250,7 @@ class QoderProvider(BaseProvider):
                         raw_error_type="QoderSchemaError",
                     )
 
-                amount = self._benefit_amount(claimable)
+                amount = self._benefit_amount(claimable, config.checkin_credits)
                 if dry_run:
                     emit("info", f"Dry-Run：检测到可领取 {amount} Credits，未提交领取。")
                     return self._result(
@@ -318,7 +320,6 @@ class QoderProvider(BaseProvider):
                     started=started,
                     dry_run=dry_run,
                     snapshot=CreditSnapshot(
-                        balance=None,
                         delta=amount,
                         expiring_soon=amount,
                         expiring_at=expiring_at,
@@ -531,13 +532,16 @@ class QoderProvider(BaseProvider):
         return datetime.fromtimestamp(seconds, tz=timezone.utc)
 
     @staticmethod
-    def _benefit_amount(campaign: dict[str, Any]) -> int:
+    def _benefit_amount(
+        campaign: dict[str, Any],
+        default_credits: int = DEFAULT_CHECKIN_CREDITS,
+    ) -> int:
         benefit = campaign.get("benefit")
         if isinstance(benefit, dict):
             amount = benefit.get("amount")
-            if isinstance(amount, int) and amount > 0:
-                return amount
-        return 100
+            if isinstance(amount, int) and not isinstance(amount, bool):
+                return min(max(amount, 0), MAX_CHECKIN_CREDITS)
+        return min(max(default_credits, 0), MAX_CHECKIN_CREDITS)
 
     @staticmethod
     def _claim_status(payload: dict[str, Any]) -> str:

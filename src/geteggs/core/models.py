@@ -10,6 +10,8 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field, field_validator
 
 _HHMM_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+DEFAULT_CHECKIN_CREDITS = 100
+MAX_CHECKIN_CREDITS = 1_000_000
 
 
 def utc_now_iso() -> str:
@@ -62,9 +64,8 @@ class TriggerType(str, Enum):
 
 
 class CreditSnapshot(BaseModel):
-    """Point-in-time balance and streak metrics captured from a provider."""
+    """Point-in-time credit delta, streak and expiry metrics captured from a provider."""
 
-    balance: Optional[int] = None
     delta: int = 0
     streak_days: Optional[int] = None
     expiring_soon: Optional[int] = None
@@ -119,6 +120,9 @@ class ProviderConfig(BaseModel):
     enabled: bool = True
     earliest_time: str = "00:00"
     jitter_minutes: int = 10
+    checkin_credits: int = Field(
+        default=DEFAULT_CHECKIN_CREDITS, ge=0, le=MAX_CHECKIN_CREDITS
+    )
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

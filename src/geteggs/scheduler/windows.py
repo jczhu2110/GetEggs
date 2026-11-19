@@ -73,6 +73,27 @@ def _run_ps(script: str) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+def _task_missing_fast() -> bool:
+    """Return True when ``schtasks`` reports that the task is absent.
+
+    Starting PowerShell merely to discover that no task exists costs close to a
+    second. ``schtasks`` answers the same question much faster; any probe
+    failure falls back to the full PowerShell query.
+    """
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "timeout": 10,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        proc = subprocess.run(["schtasks", "/query", "/tn", TASK_NAME], **kwargs)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode != 0
+
+
 def get_schedule_status() -> dict[str, Any]:
     """Query Windows Task Scheduler for the GetEggs task state."""
     if os.name != "nt":
@@ -81,6 +102,14 @@ def get_schedule_status() -> dict[str, Any]:
             "installed": False,
             "task_name": TASK_NAME,
             "message": "仅 Windows 环境支持系统计划任务集成。",
+        }
+
+    if _task_missing_fast():
+        return {
+            "supported": True,
+            "installed": False,
+            "task_name": TASK_NAME,
+            "message": "尚未安装系统计划任务。",
         }
 
     ps = f"""

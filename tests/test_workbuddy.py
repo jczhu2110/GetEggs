@@ -117,7 +117,7 @@ def test_workbuddy_checkin_idempotent_when_already_checked_in(tmp_path: Path) ->
                 200,
                 json={
                     "code": 0,
-                    "data": {"checkedIn": True, "balance": 1250, "streakDays": 7},
+                    "data": {"checkedIn": True, "streakDays": 7},
                 },
             )
         raise AssertionError(f"Unexpected call to {request.url.path}")
@@ -128,7 +128,6 @@ def test_workbuddy_checkin_idempotent_when_already_checked_in(tmp_path: Path) ->
 
     assert res.status == CheckinStatus.ALREADY_DONE
     assert res.snapshot is not None
-    assert res.snapshot.balance == 1250
     assert res.snapshot.streak_days == 7
     assert called_paths == ["/v2/billing/meter/checkin-status"]
 
@@ -148,7 +147,6 @@ def test_workbuddy_checkin_success_and_status_refresh(tmp_path: Path) -> None:
                     "code": 0,
                     "data": {
                         "checkedIn": state["checked"],
-                        "balance": 1300 if state["checked"] else 1200,
                         "streakDays": 8 if state["checked"] else 7,
                     },
                 },
@@ -165,8 +163,107 @@ def test_workbuddy_checkin_success_and_status_refresh(tmp_path: Path) -> None:
     assert res.status == CheckinStatus.SUCCESS
     assert res.snapshot is not None
     assert res.snapshot.delta == 100
-    assert res.snapshot.balance == 1300
     assert res.snapshot.streak_days == 8
+
+
+def test_workbuddy_uses_configured_credits_when_reward_missing(
+    tmp_path: Path,
+) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+    state = {"checked": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"checkedIn": state["checked"], "streakDays": 2}},
+            )
+        if request.url.path == "/v2/billing/meter/daily-checkin":
+            state["checked"] = True
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        checkin_credits=250,
+        extra={"auth_file_path": str(auth_file)},
+    )
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
+
+    assert res.status == CheckinStatus.SUCCESS
+    assert res.snapshot is not None
+    assert res.snapshot.delta == 250
+
+
+def test_workbuddy_explicit_zero_reward_does_not_use_configured_credits(
+    tmp_path: Path,
+) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+    state = {"checked": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"checkedIn": state["checked"]}},
+            )
+        if request.url.path == "/v2/billing/meter/daily-checkin":
+            state["checked"] = True
+            return httpx.Response(
+                200, json={"code": 0, "data": {"rewardCredits": 0}}
+            )
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        checkin_credits=250,
+        extra={"auth_file_path": str(auth_file)},
+    )
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
+
+    assert res.status == CheckinStatus.SUCCESS
+    assert res.snapshot is not None
+    assert res.snapshot.delta == 0
+
+
+def test_workbuddy_clamps_excessive_reward(tmp_path: Path) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+    state = {"checked": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"checkedIn": state["checked"]}},
+            )
+        if request.url.path == "/v2/billing/meter/daily-checkin":
+            state["checked"] = True
+            return httpx.Response(
+                200, json={"code": 0, "data": {"rewardCredits": 2_000_000}}
+            )
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        extra={"auth_file_path": str(auth_file)},
+    )
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
+
+    assert res.status == CheckinStatus.SUCCESS
+    assert res.snapshot is not None
+    assert res.snapshot.delta == 1_000_000
 
 
 def test_workbuddy_refreshes_token_on_401(tmp_path: Path) -> None:
@@ -183,20 +280,23 @@ def test_workbuddy_refreshes_token_on_401(tmp_path: Path) -> None:
             if request.headers.get("Authorization") == "Bearer old_tok":
                 return httpx.Response(401, json={"code": 401})
             assert request.headers.get("Authorization") == "Bearer new_tok"
-            return httpx.Response(200, json={"code": 0, "data": {"checkedIn": False, "balance": 500}})
+            return httpx.Response(200, json={"code": 0, "data": {"checkedIn": False}})
         if request.url.path == "/v2/billing/meter/daily-checkin":
             assert request.headers.get("Authorization") == "Bearer new_tok"
-            return httpx.Response(200, json={"code": 0, "data": {"rewardCredits": 50, "balance": 550}})
+            return httpx.Response(200, json={"code": 0, "data": {"rewardCredits": 50}})
         return httpx.Response(404)
 
     provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
-    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        checkin_credits=250,
+        extra={"auth_file_path": str(auth_file)},
+    )
     res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
 
     assert res.status == CheckinStatus.SUCCESS
     assert res.snapshot is not None
     assert res.snapshot.delta == 50
-    assert res.snapshot.balance == 550
 
 
 def test_workbuddy_marks_needs_manual_on_captcha_response(tmp_path: Path) -> None:
@@ -273,7 +373,6 @@ def test_workbuddy_parses_expiring_credits(tmp_path: Path) -> None:
                     "code": 0,
                     "data": {
                         "checkedIn": True,
-                        "balance": 900,
                         "expiringSoon": 30,
                         "expiringAt": 4102444800000,
                     },

@@ -11,6 +11,7 @@ from typing import Any, Iterator, Optional
 
 from geteggs.core.config import get_db_path, get_timezone, today_biz_date
 from geteggs.core.models import (
+    DEFAULT_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
     GlobalSettings,
@@ -22,7 +23,7 @@ from geteggs.core.models import (
 
 DEFAULT_DISABLED_PROVIDERS = {"qoder"}
 
-SCHEMA_SQL = """
+SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,
@@ -34,7 +35,8 @@ CREATE TABLE IF NOT EXISTS provider_configs (
     enabled INTEGER NOT NULL DEFAULT 1,
     earliest_time TEXT NOT NULL DEFAULT '00:00',
     jitter_minutes INTEGER NOT NULL DEFAULT 10,
-    extra_json TEXT NOT NULL DEFAULT '{}',
+    checkin_credits INTEGER NOT NULL DEFAULT {DEFAULT_CHECKIN_CREDITS},
+    extra_json TEXT NOT NULL DEFAULT '{{}}',
     updated_at TEXT NOT NULL
 );
 
@@ -54,7 +56,6 @@ CREATE TABLE IF NOT EXISTS checkin_records (
     biz_date TEXT NOT NULL,
     status TEXT NOT NULL,
     delta INTEGER NOT NULL DEFAULT 0,
-    balance INTEGER,
     streak_days INTEGER,
     expiring_soon INTEGER,
     expiring_at TEXT,
@@ -133,6 +134,41 @@ class Storage:
     def init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._drop_legacy_balance_column(conn)
+            self._add_missing_provider_credit_column(conn)
+
+    @staticmethod
+    def _add_missing_provider_credit_column(conn: sqlite3.Connection) -> None:
+        """Add the configurable check-in credit field to older databases."""
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(provider_configs)")
+        }
+        if "checkin_credits" in columns:
+            return
+        try:
+            conn.execute(
+                "ALTER TABLE provider_configs "
+                f"ADD COLUMN checkin_credits INTEGER NOT NULL DEFAULT {DEFAULT_CHECKIN_CREDITS}"
+            )
+        except sqlite3.OperationalError as exc:
+            # Another process may have completed the migration between the check and ALTER.
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+    @staticmethod
+    def _drop_legacy_balance_column(conn: sqlite3.Connection) -> None:
+        """Remove the retired balance column and its data from older databases."""
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(checkin_records)")
+        }
+        if "balance" not in columns:
+            return
+        try:
+            conn.execute("ALTER TABLE checkin_records DROP COLUMN balance")
+        except sqlite3.OperationalError as exc:
+            # Another process may have completed the migration between the check and ALTER.
+            if "no such column" not in str(exc).lower():
+                raise
 
     # ---- Global settings ----
 
@@ -178,6 +214,7 @@ class Storage:
             enabled=bool(row["enabled"]),
             earliest_time=row["earliest_time"],
             jitter_minutes=row["jitter_minutes"],
+            checkin_credits=row["checkin_credits"],
             extra=json.loads(row["extra_json"] or "{}"),
         )
 
@@ -187,13 +224,15 @@ class Storage:
             conn.execute(
                 """
                 INSERT INTO provider_configs (
-                    provider_id, enabled, earliest_time, jitter_minutes, extra_json, updated_at
+                    provider_id, enabled, earliest_time, jitter_minutes,
+                    checkin_credits, extra_json, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider_id) DO UPDATE SET
                     enabled = excluded.enabled,
                     earliest_time = excluded.earliest_time,
                     jitter_minutes = excluded.jitter_minutes,
+                    checkin_credits = excluded.checkin_credits,
                     extra_json = excluded.extra_json,
                     updated_at = excluded.updated_at
                 """,
@@ -202,6 +241,7 @@ class Storage:
                     int(cfg.enabled),
                     cfg.earliest_time,
                     cfg.jitter_minutes,
+                    cfg.checkin_credits,
                     json.dumps(cfg.extra, ensure_ascii=False),
                     now,
                 ),
@@ -238,10 +278,10 @@ class Storage:
                 """
                 INSERT INTO checkin_records (
                     run_id, provider_id, display_name, biz_date, status,
-                    delta, balance, streak_days, expiring_soon, expiring_at,
+                    delta, streak_days, expiring_soon, expiring_at,
                     message, raw_error_type, duration_ms, dry_run, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -250,7 +290,6 @@ class Storage:
                     result.biz_date,
                     result.status.value,
                     snap.delta if snap else 0,
-                    snap.balance if snap else None,
                     snap.streak_days if snap else None,
                     snap.expiring_soon if snap else None,
                     snap.expiring_at if snap else None,
@@ -315,30 +354,15 @@ class Storage:
             ).fetchone()
         return dict(row) if row else None
 
-    def get_latest_record_for_date(
-        self, provider_id: str, biz_date: str
-    ) -> Optional[dict[str, Any]]:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM checkin_records
-                WHERE provider_id = ? AND biz_date = ? AND dry_run = 0
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (provider_id, biz_date),
-            ).fetchone()
-        return dict(row) if row else None
-
     def get_latest_snapshot_record(self, provider_id: str) -> Optional[dict[str, Any]]:
-        """Return the latest record carrying a balance or streak snapshot."""
+        """Return the latest record carrying a streak snapshot."""
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM checkin_records
                 WHERE provider_id = ?
                   AND dry_run = 0
-                  AND (balance IS NOT NULL OR streak_days IS NOT NULL)
+                  AND streak_days IS NOT NULL
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -357,7 +381,7 @@ class Storage:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT status, delta, balance, streak_days, expiring_soon,
+                SELECT status, delta, streak_days, expiring_soon,
                        expiring_at, message, created_at
                 FROM checkin_records
                 WHERE provider_id = ? AND biz_date = ? AND dry_run = 0
@@ -374,9 +398,6 @@ class Storage:
         message = latest["message"]
         if completed and latest["status"] not in ("success", "already_done"):
             message = f"今日已完成签到；最近一次重跑异常：{latest['message']}"
-        balance = next(
-            (r["balance"] for r in reversed(rows) if r["balance"] is not None), None
-        )
         streak_days = next(
             (r["streak_days"] for r in reversed(rows) if r["streak_days"] is not None), None
         )
@@ -394,7 +415,6 @@ class Storage:
             "status": "success" if "success" in completed else (completed[0] if completed else latest["status"]),
             "ok": bool(completed),
             "delta": sum(int(r["delta"] or 0) for r in rows),
-            "balance": balance,
             "streak_days": streak_days,
             "expiring_soon": expiring_soon,
             "expiring_at": expiring_at,
@@ -515,10 +535,24 @@ class Storage:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT run_id, trigger_type, started_at, finished_at, status
-                FROM checkin_runs
-                ORDER BY started_at DESC
-                LIMIT ? OFFSET ?
+                SELECT r.run_id, r.trigger_type, r.started_at, r.finished_at, r.status,
+                       COUNT(c.id) AS record_count,
+                       COALESCE(SUM(
+                           CASE WHEN c.status IN ('success', 'already_done') THEN 1 ELSE 0 END
+                       ), 0) AS ok_count,
+                       COALESCE(SUM(
+                           CASE WHEN c.dry_run = 0 THEN COALESCE(c.delta, 0) ELSE 0 END
+                       ), 0) AS total_delta,
+                       COALESCE(MAX(c.dry_run), 0) AS dry_run
+                FROM (
+                    SELECT run_id, trigger_type, started_at, finished_at, status
+                    FROM checkin_runs
+                    ORDER BY started_at DESC
+                    LIMIT ? OFFSET ?
+                ) AS r
+                LEFT JOIN checkin_records AS c ON c.run_id = r.run_id
+                GROUP BY r.run_id
+                ORDER BY r.started_at DESC
                 """,
                 (limit, max(0, offset)),
             ).fetchall()
@@ -538,7 +572,7 @@ class Storage:
                 return None
             records = conn.execute(
                 """
-                SELECT provider_id, display_name, biz_date, status, delta, balance,
+                SELECT provider_id, display_name, biz_date, status, delta,
                        streak_days, expiring_soon, expiring_at, message,
                        raw_error_type, duration_ms, dry_run, created_at
                 FROM checkin_records

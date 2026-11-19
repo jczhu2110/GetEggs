@@ -22,6 +22,7 @@ from geteggs import __version__
 from geteggs.core.config import get_qoder_pat_path, today_biz_date
 from geteggs.core.lock import RunLockBusyError, acquire_run_lock
 from geteggs.core.models import (
+    MAX_CHECKIN_CREDITS,
     GlobalSettings,
     LogEvent,
     TriggerType,
@@ -53,6 +54,7 @@ class ProviderConfigUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     earliest_time: Optional[str] = None
     jitter_minutes: Optional[int] = None
+    checkin_credits: Optional[int] = None
     jitter_override: Optional[bool] = None
     auth_file_path: Optional[str] = None
     client_exe_path: Optional[str] = None
@@ -73,6 +75,15 @@ class ProviderConfigUpdateRequest(BaseModel):
             return value
         if not 0 <= value <= 120:
             raise ValueError("Provider 随机抖动窗口必须在 0-120 分钟之间。")
+        return value
+
+    @field_validator("checkin_credits")
+    @classmethod
+    def _validate_checkin_credits(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return value
+        if not 0 <= value <= MAX_CHECKIN_CREDITS:
+            raise ValueError(f"签到积分必须在 0-{MAX_CHECKIN_CREDITS} 之间。")
         return value
 
 
@@ -248,9 +259,14 @@ def create_app(
         settings = app_storage.get_settings()
         biz_date = today_biz_date(settings.timezone)
         cards: list[dict[str, Any]] = []
-        total_balance = 0
         today_delta = 0
-        schedule_info = await schedule_status_cached()
+        # Never block the first paint on a Task Scheduler query. The UI fetches
+        # /api/schedule asynchronously when no cached value is available yet.
+        schedule_info = schedule_cache["value"]
+        schedule_stale = bool(
+            schedule_info is not None
+            and time.monotonic() >= schedule_cache["expires_at"]
+        )
 
         for provider in app_providers:
             cfg = app_storage.get_provider_config(provider.id)
@@ -258,8 +274,6 @@ def create_app(
             latest_rec = app_storage.get_latest_snapshot_record(
                 provider.id
             ) or app_storage.get_latest_record(provider.id)
-            if latest_rec and latest_rec.get("balance") is not None:
-                total_balance += int(latest_rec["balance"])
             if today_rec and today_rec.get("delta"):
                 today_delta += int(today_rec["delta"])
 
@@ -282,11 +296,11 @@ def create_app(
         return {
             "version": __version__,
             "biz_date": biz_date,
-            "total_balance": total_balance,
             "today_delta": today_delta,
             "providers": cards,
             "trend_30d": app_storage.get_trend_30_days(settings.timezone),
             "schedule": schedule_info,
+            "schedule_stale": schedule_stale,
         }
 
     @app.post("/api/doctor", dependencies=[Depends(require_auth)])
@@ -477,6 +491,8 @@ def create_app(
                 {
                     "provider_id": p.id,
                     "display_name": p.display_name,
+                    "description": p.description,
+                    "supports_browser_auth": p.supports_browser_auth,
                     **cfg.model_dump(),
                 }
             )
@@ -505,6 +521,8 @@ def create_app(
             cfg.enabled = req.enabled
         if req.earliest_time is not None:
             cfg.earliest_time = req.earliest_time.strip()
+        if req.checkin_credits is not None:
+            cfg.checkin_credits = req.checkin_credits
 
         extra = dict(cfg.extra)
         if req.jitter_override is False:

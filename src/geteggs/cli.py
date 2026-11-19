@@ -16,7 +16,7 @@ import uvicorn
 from rich.console import Console
 from rich.table import Table
 
-from geteggs import __version__
+from geteggs import __version__, launcher
 from geteggs.core.config import (
     get_lock_path,
     get_ui_lock_path,
@@ -48,9 +48,17 @@ console = Console()
 
 
 def _pick_port(preferred: int) -> int:
+    """Return a bindable port without connecting to closed loopback ports."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex(("127.0.0.1", preferred)) != 0:
+        if os.name == "nt":
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if exclusive is not None:
+                s.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        try:
+            s.bind(("127.0.0.1", preferred))
             return preferred
+        except OSError:
+            pass
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
@@ -110,7 +118,6 @@ def status() -> None:
     table.add_column("启用")
     table.add_column("今日状态")
     table.add_column("今日新增")
-    table.add_column("余额")
     table.add_column("连签天数")
     table.add_column("说明")
 
@@ -123,7 +130,6 @@ def status() -> None:
             "是" if cfg.enabled else "否",
             today_rec["status"] if today_rec else "pending",
             f"+{today_rec['delta']}" if today_rec and today_rec["delta"] else "0",
-            str(latest["balance"]) if latest and latest["balance"] is not None else "--",
             str(latest["streak_days"]) if latest and latest["streak_days"] is not None else "--",
             (today_rec or latest or {}).get("message", "尚无记录"),
         )
@@ -230,22 +236,30 @@ def notify_test() -> None:
         raise typer.Exit(code=1)
 
 
-def _read_ui_state(timeout: float = 1.0) -> dict:
-    deadline = time.monotonic() + timeout
-    path = get_ui_state_path()
-    while True:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = None
-        if isinstance(data, dict):
-            return data
-        if time.monotonic() >= deadline:
-            return {}
+_read_ui_state = launcher.read_ui_state
+
+
+def _open_browser_when_ready(url: str, port: int) -> None:
+    """Open the browser once the local server starts accepting connections."""
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if launcher.port_open(port):
+            if not launcher.open_url(url):
+                launcher.notify_failure(
+                    "GetEggs 已启动，但浏览器打开失败，请检查默认浏览器设置。"
+                )
+            return
         time.sleep(0.05)
+    launcher.notify_failure("GetEggs Web 服务已启动，但等待端口就绪超时。")
 
 
-def _run_ui(port: int, no_browser: bool, no_auth: bool) -> None:
+def _run_ui(
+    port: int,
+    no_browser: bool,
+    no_auth: bool,
+    quiet: bool = False,
+    open_when_ready: bool = False,
+) -> None:
     chosen_port = _pick_port(port)
     web_app = create_app(auth_enabled=not no_auth)
     auth_mgr = web_app.state.auth_manager
@@ -270,8 +284,11 @@ def _run_ui(port: int, no_browser: bool, no_auth: bool) -> None:
         encoding="utf-8",
     )
 
-    console.print(f"[green]GetEggs 本地控制台已启动：[/green]{url}")
-    console.print("[dim]仅监听 127.0.0.1。按 Ctrl+C 可关闭服务（不影响已注册的计划任务）。[/dim]")
+    if quiet:
+        console.print(f"[dim]GetEggs 本地控制台已启动（端口 {chosen_port}）。[/dim]")
+    else:
+        console.print(f"[green]GetEggs 本地控制台已启动：[/green]{url}")
+        console.print("[dim]仅监听 127.0.0.1。按 Ctrl+C 可关闭服务（不影响已注册的计划任务）。[/dim]")
 
     def _cleanup_state() -> None:
         try:
@@ -281,7 +298,13 @@ def _run_ui(port: int, no_browser: bool, no_auth: bool) -> None:
 
     web_app.state.ui_state_cleanup = _cleanup_state
     try:
-        if not no_browser:
+        if open_when_ready:
+            threading.Thread(
+                target=_open_browser_when_ready,
+                args=(url, chosen_port),
+                daemon=True,
+            ).start()
+        elif not no_browser:
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
         uvicorn.run(web_app, host="127.0.0.1", port=chosen_port, log_level="warning")
     finally:
@@ -293,19 +316,31 @@ def ui(
     port: int = typer.Option(18765, "--port", help="本地监听端口（仅绑定 127.0.0.1）"),
     no_browser: bool = typer.Option(False, "--no-browser", help="启动服务但不自动打开浏览器"),
     no_auth: bool = typer.Option(False, "--no-auth", help="关闭本地会话令牌（仅建议调试时使用）"),
+    quiet: bool = typer.Option(False, "--quiet", help="静默启动（由 open 命令使用）"),
+    open_when_ready: bool = typer.Option(
+        False, "--open-when-ready", help="服务就绪后再打开浏览器（由启动器使用）"
+    ),
 ) -> None:
     """启动本地 Web 控制台并打开浏览器。"""
     try:
         with acquire_run_lock(get_ui_lock_path()):
-            _run_ui(port, no_browser, no_auth)
+            _run_ui(port, no_browser, no_auth, quiet, open_when_ready)
     except RunLockBusyError:
         state = _read_ui_state()
         existing_url = state.get("url")
-        if isinstance(existing_url, str) and existing_url:
+        if isinstance(existing_url, str) and existing_url and not quiet:
             console.print(f"[yellow]GetEggs Web 控制台已在运行：[/yellow]{existing_url}")
+        elif quiet:
+            console.print("[yellow]GetEggs Web 控制台已在运行。[/yellow]")
         else:
             console.print("[yellow]GetEggs Web 控制台已在运行，请使用已有终端中的 URL。[/yellow]")
         raise typer.Exit(code=0)
+
+
+@app.command("open")
+def open_console() -> None:
+    """打开 GetEggs Web 控制台；未运行时在后台启动，不显示终端窗口。"""
+    launcher.main()
 
 
 @schedule_app.command("status")

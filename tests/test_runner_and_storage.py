@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,7 @@ import pytest
 from geteggs.core.config import today_biz_date
 from geteggs.core.lock import RunLockBusyError, acquire_run_lock
 from geteggs.core.models import (
+    DEFAULT_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
     CreditSnapshot,
@@ -74,7 +76,7 @@ class FakeProvider(BaseProvider):
             status=self._status,
             message="done" if self._status.is_done_for_today else "need login",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(balance=1000, delta=self._delta, streak_days=3),
+            snapshot=CreditSnapshot(delta=self._delta, streak_days=3),
             dry_run=dry_run,
         )
 
@@ -222,7 +224,6 @@ def test_storage_today_summary_keeps_success_after_later_failure(tmp_path: Path)
             message="签到成功",
             biz_date=biz_date,
             snapshot=CreditSnapshot(
-                balance=1300,
                 delta=100,
                 streak_days=7,
                 expiring_soon=20,
@@ -246,7 +247,7 @@ def test_storage_today_summary_keeps_success_after_later_failure(tmp_path: Path)
     assert summary["status"] == "success"
     assert summary["ok"] is True
     assert summary["delta"] == 100
-    assert summary["balance"] == 1300
+    assert "balance" not in summary
     assert summary["streak_days"] == 7
     assert summary["expiring_soon"] == 20
     assert summary["last_status"] == "failed"
@@ -254,12 +255,92 @@ def test_storage_today_summary_keeps_success_after_later_failure(tmp_path: Path)
 
     latest_snapshot = storage.get_latest_snapshot_record("fake")
     assert latest_snapshot is not None
-    assert latest_snapshot["balance"] == 1300
+    assert "balance" not in latest_snapshot
+    assert latest_snapshot["streak_days"] == 7
 
     page = storage.get_history(limit=1, offset=1)
     assert len(page["records"]) == 1
     assert page["records"][0]["status"] == "success"
     assert page["offset"] == 1
+
+
+def test_storage_drops_legacy_balance_column_and_preserves_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy_balance.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE checkin_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            biz_date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            delta INTEGER NOT NULL DEFAULT 0,
+            balance INTEGER,
+            streak_days INTEGER,
+            expiring_soon INTEGER,
+            expiring_at TEXT,
+            message TEXT NOT NULL,
+            raw_error_type TEXT,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            dry_run INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO checkin_records (
+            run_id, provider_id, display_name, biz_date, status,
+            delta, balance, streak_days, message, created_at
+        ) VALUES (
+            'run-legacy', 'workbuddy', 'WorkBuddy', '2026-11-10', 'success',
+            100, 1300, 7, '旧记录', '2026-11-10T00:00:00+00:00'
+        );
+        CREATE TABLE provider_configs (
+            provider_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            earliest_time TEXT NOT NULL DEFAULT '00:00',
+            jitter_minutes INTEGER NOT NULL DEFAULT 10,
+            extra_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO provider_configs (
+            provider_id, enabled, earliest_time, jitter_minutes, extra_json, updated_at
+        ) VALUES (
+            'workbuddy', 1, '00:00', 10, '{}', '2026-11-10T00:00:00+00:00'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage = Storage(db_path)
+
+    with sqlite3.connect(db_path) as check:
+        columns = {
+            row[1] for row in check.execute("PRAGMA table_info(checkin_records)")
+        }
+        preserved = check.execute(
+            "SELECT run_id, delta, streak_days, message FROM checkin_records"
+        ).fetchone()
+    assert "balance" not in columns
+    assert preserved == ("run-legacy", 100, 7, "旧记录")
+    record = storage.get_history(limit=1)["records"][0]
+    assert "balance" not in record
+    assert (
+        storage.get_provider_config("workbuddy").checkin_credits
+        == DEFAULT_CHECKIN_CREDITS
+    )
+
+
+def test_provider_config_checkin_credits_persists(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "credits.db")
+    cfg = storage.get_provider_config("workbuddy")
+    assert cfg.checkin_credits == DEFAULT_CHECKIN_CREDITS
+
+    cfg.checkin_credits = 250
+    storage.save_provider_config(cfg)
+    assert storage.get_provider_config("workbuddy").checkin_credits == 250
 
 
 def test_effective_jitter_uses_provider_override_when_set() -> None:
@@ -408,3 +489,56 @@ def test_storage_run_maintenance_backup_state_and_vacuum(tmp_path: Path) -> None
     assert vacuum_result["vacuumed"] is True
     assert vacuum_result["vacuum_error"] is None
     assert storage.get_maintenance_state().get("last_vacuum_at")
+
+
+def test_storage_get_runs_includes_summary_counts(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "runs_summary.db")
+    storage.record_run_start("run-real", TriggerType.MANUAL_WEB)
+    storage.save_checkin_result(
+        "run-real",
+        CheckinResult(
+            provider_id="alpha",
+            display_name="Alpha",
+            status=CheckinStatus.SUCCESS,
+            message="ok",
+            biz_date="2026-11-18",
+            snapshot=CreditSnapshot(delta=30, streak_days=2),
+        ),
+    )
+    storage.save_checkin_result(
+        "run-real",
+        CheckinResult(
+            provider_id="beta",
+            display_name="Beta",
+            status=CheckinStatus.FAILED,
+            message="err",
+            biz_date="2026-11-18",
+        ),
+    )
+    storage.record_run_finish("run-real", "completed")
+
+    storage.record_run_start("run-dry", TriggerType.MANUAL_WEB)
+    storage.save_checkin_result(
+        "run-dry",
+        CheckinResult(
+            provider_id="alpha",
+            display_name="Alpha",
+            status=CheckinStatus.ALREADY_DONE,
+            message="dry",
+            biz_date="2026-11-18",
+            snapshot=CreditSnapshot(delta=99, streak_days=2),
+            dry_run=True,
+        ),
+    )
+    storage.record_run_finish("run-dry", "completed")
+
+    runs = {run["run_id"]: run for run in storage.get_runs()}
+    assert runs["run-real"]["record_count"] == 2
+    assert runs["run-real"]["ok_count"] == 1
+    assert runs["run-real"]["total_delta"] == 30
+    assert runs["run-real"]["dry_run"] == 0
+
+    assert runs["run-dry"]["record_count"] == 1
+    assert runs["run-dry"]["ok_count"] == 1
+    assert runs["run-dry"]["total_delta"] == 0
+    assert runs["run-dry"]["dry_run"] == 1

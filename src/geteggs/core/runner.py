@@ -148,12 +148,7 @@ class CheckinRunner:
             lines = []
             for r in success_items:
                 delta_str = f" +{r.snapshot.delta}" if r.snapshot and r.snapshot.delta > 0 else ""
-                bal_str = (
-                    f"（余额 {r.snapshot.balance}）"
-                    if r.snapshot and r.snapshot.balance is not None
-                    else ""
-                )
-                lines.append(f"{r.display_name} 签到成功{delta_str}{bal_str}")
+                lines.append(f"{r.display_name} 签到成功{delta_str}")
             provider_key = ",".join(sorted({r.provider_id for r in success_items}))
             _send_once(
                 f"daily_success:{biz_date}:{provider_key}",
@@ -264,7 +259,6 @@ class CheckinRunner:
                                     message="今日已完成签到（本地账本缓存命中）。",
                                     biz_date=biz_date,
                                     snapshot=CreditSnapshot(
-                                        balance=existing.get("balance"),
                                         delta=0,
                                         streak_days=existing.get("streak_days"),
                                     ),

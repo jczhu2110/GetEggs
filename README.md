@@ -60,7 +60,7 @@ uv sync --extra dev
    ```powershell
    uv run geteggs schedule install --time 10:15
    ```
-   也可在 Web 控制台的「调度与设置」页一键安装或卸载。
+   也可在 Web 控制台的「工具与设置」页一键安装或卸载。
 
 ---
 
