@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import platform
@@ -21,7 +22,7 @@ from geteggs.core.models import (
     DoctorResult,
     ProviderConfig,
 )
-from geteggs.providers.base import BaseProvider, LogCallback, extract_first, mask_secret
+from geteggs.providers.base import BaseProvider, LogCallback, mask_secret
 from geteggs.providers.trae_auth import (
     DEFAULT_BASE_URL,
     TraeCredentialError,
@@ -81,39 +82,54 @@ def _normalize_base_url(value: Any) -> Optional[str]:
     return text or None
 
 
+def _root_first(payload: dict[str, Any], *keys: str) -> Any:
+    """Trae responses put status/code at the JSON root; nested data is fallback."""
+    for key in keys:
+        if key in payload and payload[key] is not None:
+            return payload[key]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in keys:
+            if key in data and data[key] is not None:
+                return data[key]
+    return None
+
+
 def _parse_business_code(payload: dict[str, Any]) -> Optional[int]:
-    return _to_int(extract_first(payload, "code", "statusCode"))
+    return _to_int(_root_first(payload, "code", "statusCode"))
 
 
 def _parse_message(payload: dict[str, Any]) -> str:
-    return str(extract_first(payload, "message", "msg") or "").strip()
+    return str(_root_first(payload, "message", "msg") or "").strip()
 
 
 def _payload_amount(payload: dict[str, Any]) -> Optional[int]:
-    for key in ("points", "credits", "credit", "extra_credits", "extraCredits"):
-        amount = _to_int(extract_first(payload, key))
-        if amount is not None and amount > 0:
-            return min(amount, MAX_CHECKIN_CREDITS)
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    for source in (data, payload):
+        for key in ("points", "credits", "credit", "extra_credits", "extraCredits"):
+            amount = _to_int(source.get(key))
+            if amount is not None and amount > 0:
+                return min(amount, MAX_CHECKIN_CREDITS)
     return None
 
 
 class _StatusInfo:
     def __init__(self, payload: dict[str, Any]) -> None:
-        self.enable = _to_bool(extract_first(payload, "enable", "enabled"))
+        self.enable = _to_bool(_root_first(payload, "enable", "enabled"))
         self.checked_in = _to_bool(
-            extract_first(payload, "checked_in", "checkedIn")
+            _root_first(payload, "checked_in", "checkedIn")
         )
         did_checked_in = _to_bool(
-            extract_first(payload, "did_checked_in", "didCheckedIn")
+            _root_first(payload, "did_checked_in", "didCheckedIn")
         )
         if did_checked_in is not None:
             if self.checked_in is None:
                 self.checked_in = did_checked_in
             elif did_checked_in:
                 self.checked_in = True
-        self.credits = _to_int(extract_first(payload, "credits", "credit"))
+        self.credits = _to_int(_root_first(payload, "credits", "credit"))
         self.extra_credits = _to_int(
-            extract_first(payload, "extra_credits", "extraCredits")
+            _root_first(payload, "extra_credits", "extraCredits")
         )
 
     @property
@@ -190,8 +206,24 @@ class TraeProvider(BaseProvider):
     supports_streak = False
     fixed_business_day_start = "00:00"
 
-    def __init__(self, transport: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        transport: Optional[Any] = None,
+        *,
+        claim_verify_attempts: int = 3,
+        claim_verify_delay_seconds: float = 0.5,
+    ) -> None:
         self._transport = transport
+        try:
+            self._claim_verify_attempts = max(1, min(5, int(claim_verify_attempts)))
+        except (TypeError, ValueError):
+            self._claim_verify_attempts = 3
+        try:
+            self._claim_verify_delay_seconds = max(
+                0.0, float(claim_verify_delay_seconds)
+            )
+        except (TypeError, ValueError):
+            self._claim_verify_delay_seconds = 0.5
 
     # ---- BaseProvider contract ----
 
@@ -247,7 +279,10 @@ class TraeProvider(BaseProvider):
         configured = str(config.extra.get("app_version") or "").strip()
         if configured:
             return configured
-        exe = self.detect_client_exe(config)
+        try:
+            exe = self.detect_client_exe(config)
+        except Exception:  # noqa: BLE001
+            exe = None
         if exe:
             product = Path(exe).parent / "resources" / "app" / "product.json"
             try:
@@ -265,6 +300,17 @@ class TraeProvider(BaseProvider):
             or _normalize_base_url(creds.host)
             or DEFAULT_BASE_URL
         )
+
+    @staticmethod
+    def _allow_token_refresh(config: ProviderConfig) -> bool:
+        return bool(config.extra.get("allow_token_refresh", True))
+
+    @staticmethod
+    def _req_source(config: ProviderConfig, creds: TraeCredentials) -> int:
+        configured = _to_int(config.extra.get("req_source"))
+        if configured in (1, 2):
+            return configured
+        return creds.req_source if creds.req_source in (1, 2) else 1
 
     def _http_client(self, config: ProviderConfig) -> Any:
         import httpx
@@ -328,11 +374,13 @@ class TraeProvider(BaseProvider):
         creds: TraeCredentials,
         version: str,
     ) -> tuple[Any, dict[str, Any]]:
-        req_source = _to_int(config.extra.get("req_source")) or 1
-        if req_source not in (1, 2):
-            req_source = 1
         return await self._post(
-            client, config, creds, version, STATUS_PATH, {"req_source": req_source}
+            client,
+            config,
+            creds,
+            version,
+            STATUS_PATH,
+            {"req_source": self._req_source(config, creds)},
         )
 
     async def _claim(
@@ -342,11 +390,13 @@ class TraeProvider(BaseProvider):
         creds: TraeCredentials,
         version: str,
     ) -> tuple[Any, dict[str, Any]]:
-        req_source = _to_int(config.extra.get("req_source")) or 1
-        if req_source not in (1, 2):
-            req_source = 1
         return await self._post(
-            client, config, creds, version, CLAIM_PATH, {"req_source": req_source}
+            client,
+            config,
+            creds,
+            version,
+            CLAIM_PATH,
+            {"req_source": self._req_source(config, creds)},
         )
 
     # ---- Token refresh ----
@@ -497,7 +547,7 @@ class TraeProvider(BaseProvider):
                 )
                 try:
                     save_token_cache(new_creds)
-                except OSError as exc:
+                except Exception as exc:  # noqa: BLE001
                     if log:
                         log("warning", f"Trae 续期成功，但本地加密缓存写入失败：{exc}")
                 if log:
@@ -514,13 +564,106 @@ class TraeProvider(BaseProvider):
                 break
         raise TraeRefreshError(last_error)
 
+    def _fallback_credentials(
+        self, config: ProviderConfig, current: TraeCredentials
+    ) -> Optional[TraeCredentials]:
+        try:
+            fresh = load_trae_credentials(config, use_cache=False)
+        except TraeCredentialError:
+            return None
+        if not fresh.access_token and not fresh.refresh_token:
+            return None
+        if (
+            fresh.access_token == current.access_token
+            and fresh.refresh_token == current.refresh_token
+        ):
+            return None
+        return fresh
+
+    async def _refresh_with_fallback(
+        self,
+        client: Any,
+        config: ProviderConfig,
+        creds: TraeCredentials,
+        version: str,
+        log: Optional[LogCallback],
+    ) -> TraeCredentials:
+        try:
+            return await self._refresh_token(client, config, creds, version, log)
+        except TraeRefreshError:
+            fallback = self._fallback_credentials(config, creds)
+            if fallback is None:
+                raise
+            if log:
+                log(
+                    "warning",
+                    "Trae 缓存续期失败，已回退到客户端当前登录态重试。",
+                )
+            if token_is_expired(fallback):
+                if not fallback.refreshable:
+                    raise
+                return await self._refresh_token(
+                    client, config, fallback, version, log
+                )
+            try:
+                save_token_cache(fallback)
+            except Exception as exc:  # noqa: BLE001
+                if log:
+                    log("warning", f"Trae 回退客户端登录态后，缓存更新失败：{exc}")
+            return fallback
+
+    async def _verify_claim_status(
+        self,
+        client: Any,
+        config: ProviderConfig,
+        creds: TraeCredentials,
+        version: str,
+    ) -> tuple[Optional[_StatusInfo], str]:
+        last_info: Optional[_StatusInfo] = None
+        for attempt in range(self._claim_verify_attempts):
+            try:
+                response, payload = await self._status(
+                    client, config, creds, version
+                )
+            except Exception:  # noqa: BLE001
+                return None, "unavailable"
+            code = _parse_business_code(payload)
+            if not response.is_success or code not in (None, 0):
+                return None, "unavailable"
+            info = _StatusInfo(payload)
+            if info.schema_ok and info.checked_in:
+                return info, "confirmed"
+            if info.schema_ok and not info.checked_in:
+                last_info = info
+            else:
+                return None, "unavailable"
+            if (
+                attempt + 1 < self._claim_verify_attempts
+                and self._claim_verify_delay_seconds > 0
+            ):
+                await asyncio.sleep(self._claim_verify_delay_seconds)
+        return last_info, "unconfirmed"
+
     # ---- Doctor ----
 
     async def doctor(self, config: ProviderConfig) -> DoctorResult:
         import httpx
 
-        exe = self.detect_client_exe(config)
-        storage_path = find_storage_json(config)
+        try:
+            exe = self.detect_client_exe(config)
+            storage_path = find_storage_json(config)
+        except Exception as exc:  # noqa: BLE001
+            return DoctorResult(
+                provider_id=self.id,
+                display_name=self.display_name,
+                client_installed=False,
+                client_exe_path=None,
+                auth_file_found=False,
+                auth_file_path=None,
+                auth_readable=False,
+                healthy=False,
+                message=f"检测 Trae 本地路径失败：{type(exc).__name__}。",
+            )
         try:
             creds = load_trae_credentials(config)
         except TraeCredentialError as exc:
@@ -535,6 +678,20 @@ class TraeProvider(BaseProvider):
                 healthy=False,
                 message=str(exc),
             )
+        except Exception as exc:  # noqa: BLE001
+            return DoctorResult(
+                provider_id=self.id,
+                display_name=self.display_name,
+                client_installed=bool(exe),
+                client_exe_path=exe,
+                auth_file_found=storage_path is not None,
+                auth_file_path=str(storage_path) if storage_path else None,
+                auth_readable=False,
+                healthy=False,
+                message=f"读取 Trae 登录态失败：{type(exc).__name__}。",
+            )
+
+        allow_refresh = self._allow_token_refresh(config)
 
         def result(
             healthy: bool, message: str, **extra: Any
@@ -544,6 +701,7 @@ class TraeProvider(BaseProvider):
                 "host": self._base_url(config, creds),
                 "device_id": mask_secret(creds.device_id),
                 "refreshable": creds.refreshable,
+                "auto_refresh": allow_refresh,
                 **extra,
             }
             return DoctorResult(
@@ -567,10 +725,16 @@ class TraeProvider(BaseProvider):
                 "已读取 Trae 登录态，但未找到真实设备号；请打开 Trae CN 客户端重新登录。",
             )
         if token_is_expired(creds):
-            if creds.refreshable:
+            if creds.refreshable and allow_refresh:
                 return result(
                     True,
                     "Trae 登录态已过期，执行签到时会自动续期；如客户端掉线请重新登录。",
+                    verified=False,
+                )
+            if creds.refreshable and not allow_refresh:
+                return result(
+                    False,
+                    "Trae 登录态已过期，自动续期已关闭；请打开客户端刷新登录态。",
                     verified=False,
                 )
             return result(
@@ -588,9 +752,12 @@ class TraeProvider(BaseProvider):
                 response, payload = await self._status(client, config, creds, version)
                 code = _parse_business_code(payload)
                 if response.status_code in (401, 403) or code in AUTH_CODES:
-                    if creds.refreshable:
+                    if creds.refreshable and allow_refresh:
                         message = "Trae 在线校验未通过，执行签到时会尝试自动续期。"
                         details.update(verified=False)
+                    elif creds.refreshable and not allow_refresh:
+                        healthy = False
+                        message = "Trae 登录态已失效，自动续期已关闭；请打开客户端重新登录。"
                     else:
                         healthy = False
                         message = "Trae 登录态已失效，请打开客户端重新登录。"
@@ -606,10 +773,17 @@ class TraeProvider(BaseProvider):
                     healthy = False
                     message = f"Trae 在线校验失败（HTTP {response.status_code}）。"
                 elif code == 9074:
-                    message = "凭据已配置，但暂时无法在线校验（设备校验或排队限流）。"
+                    healthy = False
+                    message = "Trae 设备校验未通过或排队限流，暂时无法在线校验。"
+                elif code == 9004:
+                    message = "本地登录态有效，今日 Trae 积分已领取。"
+                    details.update(today_checked_in=True, verified=True)
+                elif code == 9095:
+                    healthy = False
+                    message = "本机设备今日已签到其他 Trae 账号，当前账号未领取。"
                 elif code in (9090, 9102):
                     message = "本地登录态有效，当前 Trae 每日签到活动未开启。"
-                    details.update(activity_enabled=False)
+                    details.update(activity_enabled=False, verified=True)
                 elif code not in (None, 0):
                     healthy = False
                     message = f"Trae 签到接口返回 code={code}，可能已改版。"
@@ -620,16 +794,13 @@ class TraeProvider(BaseProvider):
                         message = "Trae 状态接口响应结构异常，接口可能已变更。"
                     elif info.enable is False:
                         message = "本地登录态有效，当前 Trae 每日签到活动未开启。"
-                        details.update(activity_enabled=False)
+                        details.update(activity_enabled=False, verified=True)
                     elif info.checked_in:
                         message = "本地登录态有效，今日 Trae 积分已领取。"
-                        details.update(today_checked_in=True)
+                        details.update(today_checked_in=True, verified=True)
                     else:
                         message = "本地登录态有效，今日可以签到。"
-                        details.update(today_checked_in=False)
-                details["verified"] = (
-                    healthy and response.is_success and code != 9074
-                )
+                        details.update(today_checked_in=False, verified=True)
         except httpx.HTTPError as exc:
             message = f"凭据已配置，但暂时无法在线校验：{type(exc).__name__}。"
         except Exception as exc:  # noqa: BLE001
@@ -701,6 +872,15 @@ class TraeProvider(BaseProvider):
                 dry_run=dry_run,
                 raw_error_type="TraeCredentialError",
             )
+        except Exception as exc:  # noqa: BLE001
+            return self._result(
+                CheckinStatus.FAILED,
+                f"读取 Trae 登录态失败：{type(exc).__name__}。",
+                biz_date,
+                started=started,
+                dry_run=dry_run,
+                raw_error_type=type(exc).__name__,
+            )
         if not creds.device_id:
             return self._result(
                 CheckinStatus.NEEDS_MANUAL,
@@ -719,6 +899,7 @@ class TraeProvider(BaseProvider):
         )
 
         refreshed = False
+        allow_refresh = self._allow_token_refresh(config)
         try:
             async with self._http_client(config) as client:
                 if token_is_expired(creds):
@@ -726,6 +907,15 @@ class TraeProvider(BaseProvider):
                         return self._result(
                             CheckinStatus.AUTH_EXPIRED,
                             "Dry-Run 不执行登录态续期；请先打开 Trae CN 客户端刷新登录态。",
+                            biz_date,
+                            started=started,
+                            dry_run=dry_run,
+                            raw_error_type="TraeAuthExpired",
+                        )
+                    if not allow_refresh:
+                        return self._result(
+                            CheckinStatus.AUTH_EXPIRED,
+                            "Trae 登录态已过期，自动续期已关闭；请打开客户端刷新登录态。",
                             biz_date,
                             started=started,
                             dry_run=dry_run,
@@ -741,7 +931,7 @@ class TraeProvider(BaseProvider):
                             raw_error_type="TraeAuthExpired",
                         )
                     try:
-                        creds = await self._refresh_token(
+                        creds = await self._refresh_with_fallback(
                             client, config, creds, version, emit
                         )
                         refreshed = True
@@ -761,9 +951,14 @@ class TraeProvider(BaseProvider):
                 )
                 code = _parse_business_code(payload)
                 if self._is_auth_status(response.status_code, code):
-                    if not dry_run and not refreshed and creds.refreshable:
+                    if (
+                        not dry_run
+                        and not refreshed
+                        and creds.refreshable
+                        and allow_refresh
+                    ):
                         try:
-                            creds = await self._refresh_token(
+                            creds = await self._refresh_with_fallback(
                                 client, config, creds, version, emit
                             )
                             refreshed = True
@@ -781,9 +976,14 @@ class TraeProvider(BaseProvider):
                         )
                         code = _parse_business_code(payload)
                     if self._is_auth_status(response.status_code, code):
+                        message = (
+                            "Trae 登录态已失效，自动续期已关闭；请打开客户端重新登录。"
+                            if not allow_refresh
+                            else "Trae 登录态已失效，请打开 Trae CN 客户端重新登录。"
+                        )
                         return self._result(
                             CheckinStatus.AUTH_EXPIRED,
-                            "Trae 登录态已失效，请打开 Trae CN 客户端重新登录。",
+                            message,
                             biz_date,
                             started=started,
                             dry_run=dry_run,
@@ -899,9 +1099,9 @@ class TraeProvider(BaseProvider):
                 )
                 claim_code = _parse_business_code(claim_payload)
                 if self._is_auth_status(claim_response.status_code, claim_code):
-                    if not refreshed and creds.refreshable:
+                    if not refreshed and creds.refreshable and allow_refresh:
                         try:
-                            creds = await self._refresh_token(
+                            creds = await self._refresh_with_fallback(
                                 client, config, creds, version, emit
                             )
                             refreshed = True
@@ -919,9 +1119,14 @@ class TraeProvider(BaseProvider):
                         )
                         claim_code = _parse_business_code(claim_payload)
                     if self._is_auth_status(claim_response.status_code, claim_code):
+                        message = (
+                            "Trae 领取凭证已失效，自动续期已关闭；请打开客户端重新登录。"
+                            if not allow_refresh
+                            else "Trae 领取凭证已失效，请打开客户端重新登录。"
+                        )
                         return self._result(
                             CheckinStatus.AUTH_EXPIRED,
-                            "Trae 领取凭证已失效，请打开客户端重新登录。",
+                            message,
                             biz_date,
                             started=started,
                             dry_run=dry_run,
@@ -1005,28 +1210,19 @@ class TraeProvider(BaseProvider):
 
                 emit("info", "Trae 领取接口返回成功，正在二次确认到账状态...")
                 amount = _payload_amount(claim_payload) or info.reward_hint or config.checkin_credits
+                verify_info, verify_state = await self._verify_claim_status(
+                    client, config, creds, version
+                )
                 verification_warning = ""
-                try:
-                    post_response, post_payload = await self._status(
-                        client, config, creds, version
-                    )
-                    post_code = _parse_business_code(post_payload)
-                    if post_response.is_success and post_code in (None, 0):
-                        post_info = _StatusInfo(post_payload)
-                        if post_info.schema_ok and not post_info.checked_in:
-                            return self._result(
-                                CheckinStatus.FAILED,
-                                "Trae 领取接口返回成功，但状态未更新，可能未到账。",
-                                biz_date,
-                                started=started,
-                                dry_run=dry_run,
-                                raw_error_type="TraeClaimUnconfirmed",
-                            )
-                        amount = post_info.reward_hint or amount
-                    else:
-                        verification_warning = "（二次确认暂不可用）"
-                except httpx.HTTPError:
+                verify_error: Optional[str] = None
+                if verify_state == "confirmed":
+                    amount = (verify_info.reward_hint if verify_info else None) or amount
+                elif verify_state == "unconfirmed":
+                    verification_warning = "（状态暂未刷新，请稍后在 Trae 客户端确认）"
+                    verify_error = "TraeClaimUnconfirmed"
+                else:
                     verification_warning = "（二次确认暂不可用）"
+                    verify_error = "TraeClaimUnconfirmed"
 
                 amount = min(max(amount, 0), MAX_CHECKIN_CREDITS)
                 snapshot = CreditSnapshot(
@@ -1046,6 +1242,7 @@ class TraeProvider(BaseProvider):
                     started=started,
                     dry_run=dry_run,
                     snapshot=snapshot,
+                    raw_error_type=verify_error,
                 )
         except httpx.HTTPError as exc:
             return self._result(

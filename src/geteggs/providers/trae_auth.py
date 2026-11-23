@@ -53,6 +53,7 @@ class TraeCredentials:
     device_public_key_pem: Optional[str] = None
     machine_id: Optional[str] = None
     source_path: Optional[str] = None
+    req_source: int = 1
     cached: bool = False
 
     @property
@@ -180,32 +181,38 @@ def decrypt_icube_value(value: str) -> dict[str, Any]:
     return parsed
 
 
-def _candidate_storage_paths(config: ProviderConfig) -> list[Path]:
-    candidates: list[Path] = []
-    custom = (
+def _custom_storage_path(config: ProviderConfig) -> Optional[Path]:
+    raw = (
         str(config.extra.get("auth_file_path") or "").strip()
         or str(os.environ.get("GETEGGS_TRAE_STORAGE_PATH") or "").strip()
     )
-    if custom:
-        path = Path(custom).expanduser()
-        if path.is_dir():
-            candidates.append(path.joinpath(*STORAGE_SUFFIX))
-            candidates.append(path / "storage.json")
-            candidates.append(path / "globalStorage" / "storage.json")
-        else:
-            candidates.append(path)
+    return Path(raw).expanduser() if raw else None
 
-    names = ("Trae CN", "TRAE SOLO CN", "TRAE SOLO", "Trae")
-    appdata = os.environ.get("APPDATA")
-    if appdata:
+
+def _candidate_storage_paths(config: ProviderConfig) -> list[Path]:
+    candidates: list[Path] = []
+    custom = _custom_storage_path(config)
+    if custom is not None:
+        if custom.is_dir():
+            candidates.append(custom.joinpath(*STORAGE_SUFFIX))
+            candidates.append(custom / "storage.json")
+            candidates.append(custom / "globalStorage" / "storage.json")
+        else:
+            candidates.append(custom)
+    else:
+        names = ("Trae CN", "TRAE SOLO CN", "TRAE SOLO", "Trae")
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            for name in names:
+                candidates.append(Path(appdata) / name / Path(*STORAGE_SUFFIX))
+        home = Path.home()
         for name in names:
-            candidates.append(Path(appdata) / name / Path(*STORAGE_SUFFIX))
-    home = Path.home()
-    for name in names:
-        candidates.append(home / "Library" / "Application Support" / name / Path(*STORAGE_SUFFIX))
-    for base in (home, home / ".config"):
-        for name in (".trae-cn", ".trae", "Trae CN", "TRAE SOLO CN"):
-            candidates.append(base / name / Path(*STORAGE_SUFFIX))
+            candidates.append(
+                home / "Library" / "Application Support" / name / Path(*STORAGE_SUFFIX)
+            )
+        for base in (home, home / ".config"):
+            for name in (".trae-cn", ".trae", "Trae CN", "TRAE SOLO CN"):
+                candidates.append(base / name / Path(*STORAGE_SUFFIX))
 
     seen: set[Path] = set()
     unique: list[Path] = []
@@ -229,18 +236,32 @@ def _valid_device_id(value: Any) -> Optional[str]:
     return text if _DEVICE_ID_RE.fullmatch(text) else None
 
 
-def find_device_id(storage: dict[str, Any]) -> Optional[str]:
+def _coerce_req_source(value: Any, default: int = 1) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number in (1, 2) else default
+
+
+def find_device_ids(storage: dict[str, Any]) -> list[str]:
+    found: list[str] = []
     for key, value in storage.items():
         text = str(key or "")
         if text.startswith(DEVICE_KEY_PREFIX):
-            found = _valid_device_id(text[len(DEVICE_KEY_PREFIX) :])
-            if found:
-                return found
+            candidate = _valid_device_id(text[len(DEVICE_KEY_PREFIX) :])
         elif text.rstrip(":") == DEVICE_KEY_PREFIX.rstrip(":"):
-            found = _valid_device_id(value)
-            if found:
-                return found
-    return None
+            candidate = _valid_device_id(value)
+        else:
+            candidate = None
+        if candidate and candidate not in found:
+            found.append(candidate)
+    return found
+
+
+def find_device_id(storage: dict[str, Any]) -> Optional[str]:
+    ids = find_device_ids(storage)
+    return ids[0] if ids else None
 
 
 def _load_device_info(
@@ -327,7 +348,11 @@ def jwt_user_id(token: Optional[str]) -> Optional[str]:
 
 
 def token_expires_at(creds: TraeCredentials) -> Optional[str]:
-    return creds.access_expires_at or jwt_expiry(creds.access_token)
+    return (
+        _iso(creds.access_expires_at)
+        or jwt_expiry(creds.access_token)
+        or creds.access_expires_at
+    )
 
 
 def token_is_expired(creds: TraeCredentials, *, skew_seconds: int = 60) -> bool:
@@ -364,6 +389,7 @@ def save_token_cache(creds: TraeCredentials) -> None:
         "host": creds.host,
         "device_id": creds.device_id,
         "machine_id": creds.machine_id,
+        "req_source": creds.req_source,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     save_secure_json(get_trae_auth_path(), payload)
@@ -381,6 +407,7 @@ def _cache_credentials(cache: dict[str, Any], source_path: str) -> TraeCredentia
         device_id=_valid_device_id(cache.get("device_id")),
         machine_id=str(cache.get("machine_id") or "").strip() or None,
         source_path=source_path,
+        req_source=_coerce_req_source(cache.get("req_source")),
         cached=True,
     )
 
@@ -391,6 +418,12 @@ def _merge_cache(creds: TraeCredentials, cache: Optional[dict[str, Any]]) -> Tra
     cache_uid = str(cache.get("user_id") or "").strip() or None
     if creds.user_id and cache_uid and cache_uid != creds.user_id:
         return creds
+    cache_device = _valid_device_id(cache.get("device_id"))
+    if creds.device_id and cache_device and creds.device_id != cache_device:
+        return creds
+    if cache.get("req_source") is not None:
+        if _coerce_req_source(cache.get("req_source")) != creds.req_source:
+            return creds
 
     cached_access = str(cache.get("access_token") or "").strip() or None
     if not cached_access:
@@ -420,69 +453,113 @@ def _merge_cache(creds: TraeCredentials, cache: Optional[dict[str, Any]]) -> Tra
     return creds
 
 
-def load_trae_credentials(config: ProviderConfig) -> TraeCredentials:
-    """Load Trae CN credentials from the local client, falling back to the cache."""
-    storage_path = find_storage_json(config)
-    if storage_path is not None:
-        try:
-            storage = json.loads(storage_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise TraeCredentialError(
-                f"无法读取 Trae 登录态文件 {storage_path}：{type(exc).__name__}"
-            ) from exc
-        if not isinstance(storage, dict):
-            raise TraeCredentialError("Trae 登录态文件不是 JSON 对象。")
+def _load_from_storage_path(storage_path: Path) -> TraeCredentials:
+    try:
+        storage = json.loads(storage_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise TraeCredentialError(
+            f"无法读取 Trae 登录态文件 {storage_path}：{type(exc).__name__}"
+        ) from exc
+    if not isinstance(storage, dict):
+        raise TraeCredentialError("Trae 登录态文件不是 JSON 对象。")
 
-        blob = storage.get(CLOUDIDE_KEY)
-        if not isinstance(blob, str) or not blob.strip():
-            raise TraeCredentialError(
-                "Trae CN 客户端当前未登录，请先打开客户端完成登录。"
-            )
-        try:
-            account = decrypt_icube_value(blob)
-        except TraeCredentialError as exc:
-            raise TraeCredentialError(
-                f"{exc} 请打开 Trae CN 客户端重新登录；如仍失败，客户端登录态格式可能已变更。"
-            ) from exc
-
-        token = account.get("token") or account.get("accessToken") or account.get("access_token")
-        refresh = account.get("refreshToken") or account.get("refresh_token")
-        access_token = token.strip() if isinstance(token, str) and token.strip() else None
-        refresh_token = refresh.strip() if isinstance(refresh, str) and refresh.strip() else None
-        if not access_token and not refresh_token:
-            raise TraeCredentialError(
-                "Trae 登录态中没有找到 accessToken 或 refreshToken，请重新登录客户端。"
-            )
-
-        device_id = find_device_id(storage)
-        private_pem, public_pem = _load_device_info(storage, device_id)
-        user_id = str(account.get("userId") or "").strip() or jwt_user_id(access_token)
-        raw_account = account.get("account") if isinstance(account.get("account"), dict) else {}
-        username = str(raw_account.get("username") or "").strip() or None
-        host = str(account.get("host") or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
-
-        creds = TraeCredentials(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            access_expires_at=_iso(account.get("expiredAt")) or jwt_expiry(access_token),
-            refresh_expires_at=_iso(account.get("refreshExpiredAt")),
-            user_id=user_id,
-            username=username,
-            host=host,
-            device_id=device_id,
-            device_private_key_pem=private_pem,
-            device_public_key_pem=public_pem,
-            machine_id=str(storage.get("telemetry.machineId") or "").strip() or None,
-            source_path=str(storage_path),
-            cached=False,
+    blob = storage.get(CLOUDIDE_KEY)
+    if not isinstance(blob, str) or not blob.strip():
+        raise TraeCredentialError(
+            "Trae CN 客户端当前未登录，请先打开客户端完成登录。"
         )
-        return _merge_cache(creds, _load_cache())
+    try:
+        account = decrypt_icube_value(blob)
+    except TraeCredentialError as exc:
+        raise TraeCredentialError(
+            f"{exc} 请打开 Trae CN 客户端重新登录；如仍失败，客户端登录态格式可能已变更。"
+        ) from exc
 
-    cache = _load_cache()
-    if cache:
-        creds = _cache_credentials(cache, str(get_trae_auth_path()))
-        if creds.access_token or creds.refresh_token:
-            return creds
+    token = account.get("token") or account.get("accessToken") or account.get("access_token")
+    refresh = account.get("refreshToken") or account.get("refresh_token")
+    access_token = token.strip() if isinstance(token, str) and token.strip() else None
+    refresh_token = refresh.strip() if isinstance(refresh, str) and refresh.strip() else None
+    if not access_token and not refresh_token:
+        raise TraeCredentialError(
+            "Trae 登录态中没有找到 accessToken 或 refreshToken，请重新登录客户端。"
+        )
+
+    device_id: Optional[str] = None
+    private_pem: Optional[str] = None
+    public_pem: Optional[str] = None
+    for candidate in find_device_ids(storage):
+        if device_id is None:
+            device_id = candidate
+        private, public = _load_device_info(storage, candidate)
+        if private and public:
+            device_id, private_pem, public_pem = candidate, private, public
+            break
+
+    user_id = str(account.get("userId") or "").strip() or jwt_user_id(access_token)
+    raw_account = account.get("account") if isinstance(account.get("account"), dict) else {}
+    username = str(raw_account.get("username") or "").strip() or None
+    host = str(account.get("host") or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+    parts = {part.lower() for part in storage_path.parts}
+    req_source = 2 if ("trae solo cn" in parts or "trae solo" in parts) else 1
+
+    return TraeCredentials(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        access_expires_at=_iso(account.get("expiredAt")) or jwt_expiry(access_token),
+        refresh_expires_at=_iso(account.get("refreshExpiredAt")),
+        user_id=user_id,
+        username=username,
+        host=host,
+        device_id=device_id,
+        device_private_key_pem=private_pem,
+        device_public_key_pem=public_pem,
+        machine_id=str(storage.get("telemetry.machineId") or "").strip() or None,
+        source_path=str(storage_path),
+        req_source=req_source,
+        cached=False,
+    )
+
+
+def load_trae_credentials(
+    config: ProviderConfig, *, use_cache: bool = True
+) -> TraeCredentials:
+    """Load Trae CN credentials from the local client, falling back to the cache."""
+    try:
+        custom_path = _custom_storage_path(config)
+        candidates = _candidate_storage_paths(config)
+    except (OSError, ValueError) as exc:
+        raise TraeCredentialError(
+            f"Trae 登录态路径无效：{type(exc).__name__}"
+        ) from exc
+
+    saw_storage = False
+    last_error: Optional[TraeCredentialError] = None
+    for storage_path in candidates:
+        if not storage_path.is_file():
+            continue
+        saw_storage = True
+        try:
+            creds = _load_from_storage_path(storage_path)
+        except TraeCredentialError as exc:
+            last_error = exc
+            continue
+        return _merge_cache(creds, _load_cache()) if use_cache else creds
+
+    if saw_storage and last_error is not None:
+        raise last_error
+    if custom_path is not None:
+        raise TraeCredentialError(
+            "指定的 Trae 登录态文件路径不存在，请检查高级配置中的 auth_file_path。"
+        )
+
+    if use_cache:
+        cache = _load_cache()
+        if cache:
+            creds = _cache_credentials(cache, str(get_trae_auth_path()))
+            if creds.access_token or creds.refresh_token:
+                return creds
+    if last_error is not None:
+        raise last_error
     raise TraeCredentialError(
         "未找到 Trae CN 本地登录态。请安装并登录 Trae CN 客户端，"
         "或在 Trae 工具的高级配置中指定 storage.json 路径。"

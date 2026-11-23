@@ -14,10 +14,17 @@ from typing import Any, Optional
 import httpx
 import pytest
 
+from geteggs.core.config import get_trae_auth_path
 from geteggs.core.models import CheckinStatus, ProviderConfig
+from geteggs.core.secure_store import save_secure_json
 from geteggs.core.storage import Storage
 from geteggs.providers.registry import get_provider
-from geteggs.providers.trae import TraeProvider
+from geteggs.providers.trae import (
+    TraeProvider,
+    _parse_business_code,
+    _payload_amount,
+    _StatusInfo,
+)
 from geteggs.providers.trae_auth import (
     CLOUDIDE_KEY,
     DEVICE_KEY_PREFIX,
@@ -72,12 +79,11 @@ def _device_keys() -> tuple[str, str]:
     return private_pem, public_pem
 
 
-def _write_storage(
-    tmp_path: Path,
+def _storage_payload(
     *,
     access_expires: Optional[datetime] = None,
     include_keys: bool = True,
-) -> Path:
+) -> dict[str, Any]:
     if access_expires is None:
         access_expires = datetime.now(timezone.utc) + timedelta(days=10)
     refresh_expires = datetime.now(timezone.utc) + timedelta(days=180)
@@ -101,16 +107,41 @@ def _write_storage(
         )
     else:
         storage[f"{DEVICE_KEY_PREFIX}{DEVICE_ID}"] = _encrypt_value({})
-    path = tmp_path / "storage.json"
-    path.write_text(json.dumps(storage, ensure_ascii=False), encoding="utf-8")
+    return storage
+
+
+def _write_storage_file(
+    path: Path,
+    *,
+    access_expires: Optional[datetime] = None,
+    include_keys: bool = True,
+) -> Path:
+    payload = _storage_payload(
+        access_expires=access_expires, include_keys=include_keys
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
 
 
-def _config(path: Path) -> ProviderConfig:
-    return ProviderConfig(
-        provider_id="trae",
-        extra={"auth_file_path": str(path), "app_version": "1.107.1"},
+def _write_storage(
+    tmp_path: Path,
+    *,
+    access_expires: Optional[datetime] = None,
+    include_keys: bool = True,
+) -> Path:
+    return _write_storage_file(
+        tmp_path / "storage.json",
+        access_expires=access_expires,
+        include_keys=include_keys,
     )
+
+
+def _config(path: Optional[Path] = None, **extra: Any) -> ProviderConfig:
+    payload: dict[str, Any] = {"app_version": "1.107.1", **extra}
+    if path is not None:
+        payload["auth_file_path"] = str(path)
+    return ProviderConfig(provider_id="trae", extra=payload)
 
 
 def _provider(handler: Any) -> TraeProvider:
@@ -345,9 +376,9 @@ def test_trae_doctor_marks_device_check_unverified(tmp_path: Path) -> None:
 
     doctor = asyncio.run(_provider(handler).doctor(_config(path)))
 
-    assert doctor.healthy is True
+    assert doctor.healthy is False
     assert doctor.details.get("verified") is False
-    assert "无法在线校验" in doctor.message
+    assert "设备校验" in doctor.message
 
 
 def test_trae_registered_and_disabled_by_default(tmp_path: Path) -> None:
@@ -360,3 +391,405 @@ def test_trae_registered_and_disabled_by_default(tmp_path: Path) -> None:
     cfg = storage.get_provider_config("trae")
     assert cfg.enabled is False
     assert cfg.business_day_start == "00:00"
+
+
+def test_trae_unconfirmed_claim_is_soft_success(tmp_path: Path) -> None:
+    path = _write_storage(tmp_path)
+    status_calls = 0
+    claim_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal status_calls, claim_calls
+        if request.url.path.endswith("/checkin_credits/status"):
+            status_calls += 1
+            return httpx.Response(
+                200,
+                json={"code": 0, "enable": True, "checked_in": False, "credits": 100},
+            )
+        if request.url.path.endswith("/checkin_credits/claim"):
+            claim_calls += 1
+            return httpx.Response(
+                200, json={"code": 0, "data": {"points": 100}}
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    provider = TraeProvider(
+        transport=httpx.MockTransport(handler),
+        claim_verify_attempts=3,
+        claim_verify_delay_seconds=0,
+    )
+    result = asyncio.run(provider.checkin(_config(path), BIZ_DATE))
+
+    assert result.status == CheckinStatus.SUCCESS
+    assert result.raw_error_type == "TraeClaimUnconfirmed"
+    assert "状态暂未刷新" in result.message
+    assert result.snapshot is not None and result.snapshot.delta == 100
+    assert claim_calls == 1
+    assert status_calls == 4
+
+
+def test_trae_claim_verification_retries_until_checked(tmp_path: Path) -> None:
+    path = _write_storage(tmp_path)
+    status_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal status_calls
+        if request.url.path.endswith("/checkin_credits/status"):
+            status_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "enable": True,
+                    "checked_in": status_calls >= 3,
+                    "credits": 100,
+                },
+            )
+        if request.url.path.endswith("/checkin_credits/claim"):
+            return httpx.Response(
+                200, json={"code": 0, "data": {"points": 100}}
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    provider = TraeProvider(
+        transport=httpx.MockTransport(handler),
+        claim_verify_attempts=3,
+        claim_verify_delay_seconds=0,
+    )
+    result = asyncio.run(provider.checkin(_config(path), BIZ_DATE))
+
+    assert result.status == CheckinStatus.SUCCESS
+    assert result.raw_error_type is None
+    assert status_calls == 3
+
+
+def test_trae_claim_verification_unavailable_is_soft_success(
+    tmp_path: Path,
+) -> None:
+    path = _write_storage(tmp_path)
+    post_claim = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_claim
+        if request.url.path.endswith("/checkin_credits/status"):
+            if post_claim:
+                return httpx.Response(500)
+            return httpx.Response(
+                200,
+                json={"code": 0, "enable": True, "checked_in": False, "credits": 100},
+            )
+        if request.url.path.endswith("/checkin_credits/claim"):
+            post_claim = True
+            return httpx.Response(
+                200, json={"code": 0, "data": {"points": 100}}
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    result = asyncio.run(_provider(handler).checkin(_config(path), BIZ_DATE))
+
+    assert result.status == CheckinStatus.SUCCESS
+    assert result.raw_error_type == "TraeClaimUnconfirmed"
+    assert "二次确认暂不可用" in result.message
+
+
+def test_trae_disabled_auto_refresh_does_not_call_api(tmp_path: Path) -> None:
+    path = _write_storage(
+        tmp_path, access_expires=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    called: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request.url.path)
+        return httpx.Response(500)
+
+    result = asyncio.run(
+        _provider(handler).checkin(
+            _config(path, allow_token_refresh=False), BIZ_DATE
+        )
+    )
+
+    assert result.status == CheckinStatus.AUTH_EXPIRED
+    assert result.raw_error_type == "TraeAuthExpired"
+    assert called == []
+
+
+def test_trae_doctor_reports_disabled_auto_refresh(tmp_path: Path) -> None:
+    path = _write_storage(
+        tmp_path, access_expires=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    doctor = asyncio.run(
+        _provider(lambda request: httpx.Response(500)).doctor(
+            _config(path, allow_token_refresh=False)
+        )
+    )
+
+    assert doctor.healthy is False
+    assert "自动续期已关闭" in doctor.message
+    assert doctor.details.get("auto_refresh") is False
+
+
+def test_trae_cache_device_mismatch_is_ignored(tmp_path: Path) -> None:
+    path = _write_storage(tmp_path)
+    save_secure_json(
+        get_trae_auth_path(),
+        {
+            "access_token": "cache-token",
+            "refresh_token": "cache-refresh",
+            "access_expires_at": (
+                datetime.now(timezone.utc) + timedelta(days=20)
+            ).isoformat(),
+            "user_id": "user-123",
+            "host": "https://api.trae.cn",
+            "device_id": "9999999999999999",
+        },
+    )
+
+    creds = load_trae_credentials(_config(path))
+
+    assert creds.access_token == "test-access-token"
+    assert creds.device_id == DEVICE_ID
+
+
+def test_trae_cache_req_source_mismatch_is_ignored(tmp_path: Path) -> None:
+    path = _write_storage(tmp_path)
+    save_secure_json(
+        get_trae_auth_path(),
+        {
+            "access_token": "cache-token",
+            "refresh_token": "cache-refresh",
+            "access_expires_at": (
+                datetime.now(timezone.utc) + timedelta(days=20)
+            ).isoformat(),
+            "user_id": "user-123",
+            "host": "https://api.trae.cn",
+            "device_id": DEVICE_ID,
+            "req_source": 2,
+        },
+    )
+
+    creds = load_trae_credentials(_config(path))
+
+    assert creds.access_token == "test-access-token"
+    assert creds.req_source == 1
+
+
+def test_trae_legacy_cache_keeps_solo_req_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    appdata = tmp_path / "appdata"
+    _write_storage_file(
+        appdata / "TRAE SOLO CN" / "User" / "globalStorage" / "storage.json"
+    )
+    monkeypatch.setenv("APPDATA", str(appdata))
+    save_secure_json(
+        get_trae_auth_path(),
+        {
+            "access_token": "cache-token",
+            "refresh_token": "cache-refresh",
+            "access_expires_at": (
+                datetime.now(timezone.utc) + timedelta(days=20)
+            ).isoformat(),
+            "user_id": "user-123",
+            "host": "https://api.trae.cn",
+            "device_id": DEVICE_ID,
+        },
+    )
+
+    creds = load_trae_credentials(_config())
+
+    assert creds.access_token == "cache-token"
+    assert creds.req_source == 2
+
+
+def test_trae_custom_path_does_not_fall_back_to_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    appdata = tmp_path / "appdata"
+    default = appdata / "Trae CN" / "User" / "globalStorage" / "storage.json"
+    _write_storage_file(default)
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    custom = tmp_path / "custom" / "storage.json"
+    custom.parent.mkdir(parents=True)
+    custom.write_text(
+        json.dumps({"telemetry.machineId": "machine-1"}), encoding="utf-8"
+    )
+
+    with pytest.raises(TraeCredentialError, match="未登录"):
+        load_trae_credentials(_config(custom))
+
+
+def test_trae_custom_missing_path_does_not_use_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    appdata = tmp_path / "appdata"
+    _write_storage_file(
+        appdata / "Trae CN" / "User" / "globalStorage" / "storage.json"
+    )
+    monkeypatch.setenv("APPDATA", str(appdata))
+    save_secure_json(
+        get_trae_auth_path(),
+        {
+            "access_token": "cache-token",
+            "refresh_token": "cache-refresh",
+            "access_expires_at": (
+                datetime.now(timezone.utc) + timedelta(days=20)
+            ).isoformat(),
+            "user_id": "user-123",
+            "host": "https://api.trae.cn",
+            "device_id": DEVICE_ID,
+        },
+    )
+
+    missing = tmp_path / "missing" / "storage.json"
+    with pytest.raises(TraeCredentialError, match="路径不存在"):
+        load_trae_credentials(_config(missing))
+
+
+def test_trae_solo_word_in_parent_is_not_solo_client(tmp_path: Path) -> None:
+    path = (
+        tmp_path
+        / "solo_user"
+        / "Trae CN"
+        / "User"
+        / "globalStorage"
+        / "storage.json"
+    )
+    _write_storage_file(path)
+
+    creds = load_trae_credentials(_config(path))
+
+    assert creds.req_source == 1
+
+
+def test_trae_refresh_failure_falls_back_to_client(tmp_path: Path) -> None:
+    path = _write_storage(tmp_path)
+    save_secure_json(
+        get_trae_auth_path(),
+        {
+            "access_token": "cache-token",
+            "refresh_token": "cache-refresh",
+            "access_expires_at": (
+                datetime.now(timezone.utc) + timedelta(days=20)
+            ).isoformat(),
+            "user_id": "user-123",
+            "host": "https://api.trae.cn",
+            "device_id": DEVICE_ID,
+        },
+    )
+    refresh_calls = 0
+    client_status_calls = 0
+    claim_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal refresh_calls, client_status_calls, claim_calls
+        auth = request.headers.get("authorization", "")
+        if request.url.path.endswith("/oauth/ExchangeToken"):
+            refresh_calls += 1
+            return httpx.Response(400, json={"code": 20101})
+        if request.url.path.endswith("/checkin_credits/status"):
+            if "cache-token" in auth:
+                return httpx.Response(401, json={"code": 1002})
+            client_status_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "enable": True,
+                    "checked_in": client_status_calls >= 2,
+                    "credits": 100,
+                },
+            )
+        if request.url.path.endswith("/checkin_credits/claim"):
+            claim_calls += 1
+            return httpx.Response(
+                200, json={"code": 0, "data": {"points": 100}}
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    provider = TraeProvider(
+        transport=httpx.MockTransport(handler),
+        claim_verify_delay_seconds=0,
+    )
+    result = asyncio.run(provider.checkin(_config(path), BIZ_DATE))
+
+    assert result.status == CheckinStatus.SUCCESS
+    assert refresh_calls > 0
+    assert claim_calls == 1
+    cached = load_trae_credentials(_config(path), use_cache=True)
+    assert cached.access_token == "test-access-token"
+
+
+def test_trae_prefers_valid_storage_and_uses_solo_req_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    appdata = tmp_path / "appdata"
+    logged_out = appdata / "Trae CN" / "User" / "globalStorage" / "storage.json"
+    logged_out.parent.mkdir(parents=True)
+    logged_out.write_text(
+        json.dumps({"telemetry.machineId": "machine-1"}), encoding="utf-8"
+    )
+    solo = appdata / "TRAE SOLO CN" / "User" / "globalStorage" / "storage.json"
+    _write_storage_file(solo)
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    config = _config()
+    creds = load_trae_credentials(config)
+    assert creds.source_path and "TRAE SOLO CN" in creds.source_path
+    assert creds.req_source == 2
+
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"code": 0, "enable": True, "checked_in": True, "credits": 100},
+        )
+
+    result = asyncio.run(_provider(handler).checkin(config, BIZ_DATE))
+
+    assert result.status == CheckinStatus.ALREADY_DONE
+    assert bodies and bodies[0]["req_source"] == 2
+
+
+def test_trae_picks_device_with_keys(tmp_path: Path) -> None:
+    payload = _storage_payload()
+    payload.pop(f"{DEVICE_KEY_PREFIX}{DEVICE_ID}")
+    first = "1111111111111111"
+    second = "2222222222222222"
+    payload[f"{DEVICE_KEY_PREFIX}{first}"] = _encrypt_value({})
+    private_pem, public_pem = _device_keys()
+    payload[f"{DEVICE_KEY_PREFIX}{second}"] = _encrypt_value(
+        {"privateKeyPEM": private_pem, "publicKeyPEM": public_pem}
+    )
+    path = tmp_path / "storage.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    creds = load_trae_credentials(_config(path))
+
+    assert creds.device_id == second
+    assert creds.refreshable is True
+
+
+def test_trae_doctor_handles_bad_custom_path() -> None:
+    config = _config(auth_file_path="bad\x00path")
+    doctor = asyncio.run(TraeProvider().doctor(config))
+
+    assert doctor.healthy is False
+    assert "路径" in doctor.message
+
+
+def test_trae_response_parsing_prefers_root() -> None:
+    assert _parse_business_code({"code": 0, "data": {"code": 4001}}) == 0
+
+    info = _StatusInfo(
+        {
+            "enable": True,
+            "checked_in": False,
+            "data": {"enable": False, "checked_in": True},
+        }
+    )
+    assert info.enable is True
+    assert info.checked_in is False
+    assert _payload_amount({"credits": 500, "data": {"points": 100}}) == 100

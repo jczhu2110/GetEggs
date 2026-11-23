@@ -367,6 +367,19 @@ function buildProviderAdvancedForm(provider) {
       : pid === "trae"
         ? "Trae 以接口返回积分为准，此项仅作兜底"
         : "接口未返回奖励时按此计入";
+  const allowRefresh = extra.allow_token_refresh !== false;
+  const refreshToggle =
+    pid === "trae"
+      ? `
+      <label class="field">
+        <span>登录态续期策略</span>
+        <span class="checkbox-field compact">
+          <input name="allow_token_refresh" type="checkbox" ${allowRefresh ? "checked" : ""} />
+          <span>允许自动续期（可能使 Trae 客户端重新登录）</span>
+        </span>
+      </label>
+    `
+      : "";
 
   const extraInputs = getProviderExtraFields(pid)
     .map(
@@ -382,6 +395,7 @@ function buildProviderAdvancedForm(provider) {
   return `
     <form class="subgrid-form" data-provider-form="${pidEsc}">
       ${extraInputs}
+      ${refreshToggle}
       <label class="field">
         <span>签到积分（${creditsHint}，默认 ${DEFAULT_CHECKIN_CREDITS}）</span>
         <input name="checkin_credits" type="number" min="0" max="${MAX_CHECKIN_CREDITS}" step="1" class="input" value="${creditsVal}" />
@@ -439,7 +453,7 @@ function buildCredentialBlock(provider) {
     return `
       <div class="tool-cred-box">
         <h4>Trae 国内版本地登录态</h4>
-        <p class="muted">GetEggs 只读读取 Trae CN 客户端的加密登录态，签到按真实设备每日一次。登录态接近过期时会按需续期，续期可能使 Trae 客户端需要重新登录。</p>
+        <p class="muted">GetEggs 只读读取 Trae CN 客户端的加密登录态，签到按真实设备每日一次。登录态接近过期时会按需续期，续期可能使 Trae 客户端需要重新登录；可在下方高级配置中关闭自动续期。</p>
         <div class="inline-actions">
           <button type="button" class="btn btn-secondary btn-sm" data-launch-provider="${escapeHtml(pid)}">打开 Trae 客户端</button>
           <button type="button" class="btn btn-ghost btn-sm" data-doctor-provider="${escapeHtml(pid)}">重新体检</button>
@@ -716,6 +730,7 @@ function resetProviderForm(providerId) {
   const businessStartInput = form.querySelector("[name='business_day_start']");
   const jitterInput = form.querySelector("[name='jitter_minutes']");
   const creditsInput = form.querySelector("[name='checkin_credits']");
+  const allowRefreshInput = form.querySelector("[name='allow_token_refresh']");
   if (earliestInput) earliestInput.value = provider.earliest_time || "00:00";
   if (businessStartInput) {
     businessStartInput.value =
@@ -726,6 +741,9 @@ function resetProviderForm(providerId) {
   }
   if (creditsInput) {
     creditsInput.value = String(provider.checkin_credits ?? DEFAULT_CHECKIN_CREDITS);
+  }
+  if (allowRefreshInput) {
+    allowRefreshInput.checked = extra.allow_token_refresh !== false;
   }
   markProviderFormDirty(providerId, false);
 }
@@ -761,6 +779,10 @@ async function submitProviderForm(form) {
       payload.jitter_override = true;
     } else {
       payload.jitter_override = false;
+    }
+    const allowRefreshInput = form.querySelector("[name='allow_token_refresh']");
+    if (allowRefreshInput) {
+      payload.allow_token_refresh = allowRefreshInput.checked;
     }
 
     const previous = settingsProviders.find((p) => p.provider_id === pid);

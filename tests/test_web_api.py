@@ -481,6 +481,38 @@ def test_web_qoder_pat_save_status_clear(
     assert not stored.exists()
 
 
+def test_web_trae_allow_token_refresh_persists(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "trae-config.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FakeTraeProvider()],
+    )
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/providers/trae/config",
+        json={"allow_token_refresh": False, "checkin_credits": 150},
+    )
+    assert response.status_code == 200
+    provider = response.json()["provider"]
+    assert provider["extra"]["allow_token_refresh"] is False
+    assert provider["checkin_credits"] == 150
+
+    settings_provider = client.get("/api/settings").json()["providers"][0]
+    assert settings_provider["extra"]["allow_token_refresh"] is False
+
+    response = client.put(
+        "/api/providers/trae/config", json={"allow_token_refresh": True}
+    )
+    assert response.status_code == 200
+    assert response.json()["provider"]["extra"]["allow_token_refresh"] is True
+
+
 def test_web_run_accepts_multiple_provider_ids(tmp_path: Path) -> None:
     storage = Storage(tmp_path / "multi.db")
     runner = CheckinRunner(

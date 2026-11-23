@@ -61,6 +61,7 @@ class ProviderConfigUpdateRequest(BaseModel):
     client_exe_path: Optional[str] = None
     browser_state_path: Optional[str] = None
     base_url: Optional[str] = None
+    allow_token_refresh: Optional[bool] = None
 
     @field_validator("earliest_time")
     @classmethod
@@ -590,6 +591,8 @@ def create_app(
                     extra[field_name] = cleaned
                 else:
                     extra.pop(field_name, None)
+        if req.allow_token_refresh is not None:
+            extra["allow_token_refresh"] = bool(req.allow_token_refresh)
         cfg.extra = extra
 
         saved = app_storage.save_provider_config(cfg)

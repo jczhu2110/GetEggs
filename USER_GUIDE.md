@@ -163,19 +163,22 @@ uv run geteggs auth workbuddy
 
 1. 安装并登录 Trae CN 桌面客户端，确保客户端内能看到今日签到入口。
 2. 打开「工具与设置」→ Trae 国内版卡片，点击「立即体检」。
-3. 体检会只读读取 `%APPDATA%\Trae CN\User\globalStorage\storage.json`，校验真实设备号、accessToken 与设备密钥，不会提交签到。
+3. 体检会默认只读读取 `%APPDATA%\Trae CN\User\globalStorage\storage.json`（自动兼容 Trae SOLO CN 客户端；指定自定义路径时不再探测默认位置），校验真实设备号、accessToken 与设备密钥，不会提交签到。
 4. 若提示登录态失效，点击「打开 Trae 客户端」重新登录后再体检。
 5. 打开 Trae 卡片的「自动调度」开关（Trae 默认停用，需手动开启后才会进入一键签到、全部预检和定时任务）。
 6. 首次使用建议先执行「预检」，确认返回“Dry-Run：今日可签到（预计 N 积分，未提交）”，再点击「立即签到」。
+7. 高级配置中的「允许自动续期」默认开启。续期会轮换 refreshToken，可能导致 Trae 客户端需要重新登录；如不希望自动续期，可关闭该开关，改为在 accessToken 过期前打开客户端刷新登录态。
 
 说明：
 
 - Trae CN 每日签到按北京时间自然日 `00:00` 重置；一台设备每天只能签一个账号。
 - GetEggs 只读客户端登录态，不修改 Trae 客户端文件；真实设备号、accessToken、refreshToken 与设备私钥不会写入日志或返回前端。
-- accessToken 接近或已经过期时，GetEggs 会按需调用官方续期接口；续期会轮换 refreshToken，可能导致 Trae 客户端需要重新登录。如不希望触发续期，请在 accessToken 过期前打开一次 Trae 客户端刷新登录态。
+- accessToken 接近或已经过期时，GetEggs 会按需调用官方续期接口；续期会轮换 refreshToken，可能导致 Trae 客户端需要重新登录。可在高级配置关闭「允许自动续期」；关闭后请在 accessToken 过期前打开一次 Trae 客户端刷新登录态。
+- 本地缓存的令牌续期失败时，会自动回退到客户端当前登录态重试；仍失败才提示需要人工处理。
+- 领取接口返回成功即按成功记录；若到账状态暂未刷新，会提示“状态暂未刷新，请稍后在 Trae 客户端确认”，不会误报失败。
 - 若提示“本机设备今日已签到其他 Trae 账号”，说明该设备当天已被另一个账号使用，当前账号当天无法再签，请更换设备或次日再试。
-- 高级配置支持自定义 `storage.json` 路径和客户端 exe 路径；通常留空自动探测即可。
-- Trae 国内版与国际版活动不同；本工具仅适配 Trae CN 国内版。
+- 高级配置支持自定义 `storage.json` 路径和客户端 exe 路径；通常留空自动探测即可。指定自定义 `storage.json` 后仅使用该文件，不会回退到默认客户端账号。
+- Trae 国内版与国际版活动不同；本工具仅适配 Trae CN 国内版（含 Trae SOLO CN 客户端）。
 
 ### 3.4 启用与停用工具
 
@@ -435,7 +438,7 @@ uv run geteggs notify-test
 - 打开 Trae CN 客户端并确认已登录；
 - 回到 GetEggs 的 Trae 卡片点击「立即体检」；
 - 如仍失败，确认客户端版本未改动登录态格式，或在高级配置中指定正确的 `storage.json` 路径；
-- accessToken 过期时 GetEggs 会尝试自动续期；续期后如 Trae 客户端掉线，重新登录一次即可。
+- accessToken 过期时 GetEggs 会尝试自动续期；如已关闭「允许自动续期」或续期后 Trae 客户端掉线，请打开客户端重新登录一次即可。
 
 ### Trae 提示本机设备今日已签到其他账号
 
