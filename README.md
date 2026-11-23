@@ -6,6 +6,7 @@ Local-First 的 AI Agent 工具每日自动签到与积分追踪助手（Python 
 
 - **WorkBuddy**：读取桌面端登录态或受控浏览器会话，只读体检、状态预检与每日签到；签到接口 404/5xx 时安全中止，不误提交。
 - **Qoder CN**：使用 PAT 兑换短期访问令牌，查询每日活动并领取 Credits（预检时只读，不提交领取）；每日活动以 **10:00 为界**，Qoder 的业务日固定为 `10:00`。
+- **Trae 国内版（Trae CN）**：只读读取本地 Trae CN 客户端加密登录态与真实设备号，调用官方客户端同款签到接口领取每日积分；按自然日 `00:00` 重置，一台设备每天只能签一个账号。
 
 ---
 
@@ -63,7 +64,8 @@ uv sync --extra dev
 
 4. **配置工具**：
    - WorkBuddy：确认登录态正常并开启「自动调度」；
-   - Qoder：在「工具与设置」→ Qoder 卡片粘贴 PAT 并保存，再开启「自动调度」（Qoder 默认停用）。
+   - Qoder：在「工具与设置」→ Qoder 卡片粘贴 PAT 并保存，再开启「自动调度」（Qoder 默认停用）；
+   - Trae 国内版：安装并登录 Trae CN 客户端，在 Trae 卡片点击「立即体检」确认本地登录态，再开启「自动调度」（Trae 默认停用）。
 
 5. **预检与正式签到**：
    ```powershell
@@ -98,7 +100,9 @@ uv run pytest
 ## 数据存储与安全说明
 
 - 所有签到流水、运行批次、通知审计与设置均存储在本地 `%LOCALAPPDATA%\GetEggs\geteggs.db`（可通过环境变量 `GETEGGS_HOME` 覆盖）。
-- `qoder_pat.json` 与 `workbuddy_browser_state.json` 在 Windows 下使用当前用户的 DPAPI 加密存储；兼容历史明文文件，并在下次写入时自动迁移为加密格式。
+- `qoder_pat.json`、`workbuddy_browser_state.json` 与 `trae_auth.json` 在 Windows 下使用当前用户的 DPAPI 加密存储；兼容历史明文文件，并在下次写入时自动迁移为加密格式。
+- Trae 国内版仅**只读**读取 `%APPDATA%\Trae CN\User\globalStorage\storage.json`，不会修改客户端文件；真实设备号、accessToken、refreshToken 与设备私钥不会写入日志或返回前端。
 - `ui-state.json` 保存当前 Web 服务地址与一次性启动令牌，仅用于本机打开页面；服务重启后令牌会自动更新。
 - 程序**不存储明文密码**，也**不回传原始 Token 到前端 Web 页面**；遇到登录态失效、加密封装凭证或人机验证时会停止重试并提示手动处理。
-- Qoder CN 使用非官方活动接口，接口字段或策略可能变化；GetEggs 会把异常隔离为单个工具的结果，不影响其他工具与历史数据。
+- Qoder CN 与 Trae CN 使用非官方接口，接口字段或策略可能变化；GetEggs 会把异常隔离为单个工具的结果，不影响其他工具与历史数据。
+- Trae CN 在 accessToken 过期后会按需续期；续期轮换 refreshToken，可能导致 Trae 客户端需要重新登录。若不希望自动续期，请在 accessToken 过期后打开客户端刷新登录态。

@@ -33,6 +33,13 @@ const ACTION_NEEDED_STATUSES = new Set([
   "failed",
 ]);
 
+const RUN_TRIGGER_LABELS = {
+  scheduled: "计划任务",
+  missed_catchup: "登录补跑任务",
+  manual_cli: "命令行签到任务",
+  manual_web: "其他页面发起的签到",
+};
+
 function renderAlertStrip(providers) {
   const strip = $("#overview-alert-strip");
   if (!strip) return;
@@ -577,6 +584,32 @@ function appendLogLine(level, text) {
   container.scrollTop = container.scrollHeight;
 }
 
+async function showRunBusyHint() {
+  let hint =
+    "另一个签到任务正在执行中（可能是计划任务或另一页面），为防重复领取已取消本次操作，请等待其完成后再试。";
+  try {
+    const data = await apiFetch("/api/runs?limit=5");
+    const running = (data.runs || []).find((item) => item.status === "running");
+    if (running) {
+      const label = RUN_TRIGGER_LABELS[running.trigger_type] || "签到任务";
+      const started = new Date(running.started_at);
+      if (Number.isFinite(started.getTime())) {
+        const minutes = Math.max(
+          1,
+          Math.round((Date.now() - started.getTime()) / 60000)
+        );
+        hint = `${label}正在执行（已运行约 ${minutes} 分钟），为防重复领取已取消本次操作，请等待其完成后再试。`;
+      } else {
+        hint = `${label}正在执行，为防重复领取已取消本次操作，请等待其完成后再试。`;
+      }
+    }
+  } catch {
+    // 接口不可用时保留兜底提示
+  }
+  appendLogLine("warning", `[提示] ${hint}`);
+  showBanner(hint, true);
+}
+
 async function triggerRun(providerIds = null, dryRun = false, triggerButton = null) {
   const ids =
     providerIds == null
@@ -642,18 +675,28 @@ async function triggerRun(providerIds = null, dryRun = false, triggerButton = nu
       callbacks.onRunComplete();
     });
     es.addEventListener("error", (ev) => {
-      let serverMessage = null;
+      let payload = null;
       if (ev.data) {
         try {
-          serverMessage = JSON.parse(ev.data).message;
+          payload = JSON.parse(ev.data);
         } catch {
-          serverMessage = null;
+          payload = null;
         }
       }
+      const serverMessage = payload?.message || null;
+      const runBusy =
+        payload?.code === "run_busy" ||
+        Boolean(
+          serverMessage && serverMessage.includes("另一个签到任务正在执行中")
+        );
       if (serverMessage) {
         appendLogLine("error", `[错误] ${serverMessage}`);
-        showBanner(serverMessage, true);
-        finalizeLiveDrawer(false, "执行出错");
+        if (runBusy) {
+          void showRunBusyHint();
+        } else {
+          showBanner(serverMessage, true);
+        }
+        finalizeLiveDrawer(false, runBusy ? "已有任务在执行" : "执行出错");
       } else {
         appendLogLine("error", "[连接中断] 实时日志连接已断开，请刷新页面或检查本地 Web 服务。");
         showBanner("实时日志连接中断", true);

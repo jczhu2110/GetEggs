@@ -121,11 +121,19 @@ class ActiveRunState:
         for q in list(self.subscribers):
             q.put_nowait(item)
 
-    def complete(self, summary: Optional[dict[str, Any]], error: Optional[str] = None) -> None:
+    def complete(
+        self,
+        summary: Optional[dict[str, Any]],
+        error: Optional[str] = None,
+        code: Optional[str] = None,
+    ) -> None:
         self.finished = True
         self.summary = summary
         if error:
-            self.publish("error", {"message": error})
+            payload: dict[str, Any] = {"message": error}
+            if code:
+                payload["code"] = code
+            self.publish("error", payload)
         else:
             self.publish("done", summary or {})
         for q in list(self.subscribers):
@@ -385,7 +393,7 @@ def create_app(
                 )
                 state.complete(summary.model_dump())
             except RunLockBusyError as exc:
-                state.complete(None, error=str(exc))
+                state.complete(None, error=str(exc), code="run_busy")
             except Exception as exc:  # noqa: BLE001
                 state.complete(None, error=f"执行异常：{exc}")
             finally:

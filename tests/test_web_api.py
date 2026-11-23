@@ -570,6 +570,32 @@ def test_web_shutdown_rejects_external_run_lock(tmp_path: Path) -> None:
     assert "计划任务" in blocked.json()["detail"]
 
 
+def test_web_run_lock_busy_emits_run_busy_code(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "run_busy.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FakeWebProvider()],
+    )
+    client = TestClient(app)
+
+    with acquire_run_lock(runner.lock_path):
+        response = client.post(
+            "/api/runs", json={"provider_ids": ["workbuddy"], "dry_run": True}
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+        with client.stream("GET", f"/api/runs/{run_id}/stream") as stream:
+            body = "".join(stream.iter_text())
+
+    assert "另一个签到任务正在执行中" in body
+    assert '"code": "run_busy"' in body
+
+
 def test_web_overview_uses_provider_business_date(tmp_path: Path) -> None:
     class FixedBusinessDayProvider(FakeWebProvider):
         def business_date(

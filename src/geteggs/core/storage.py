@@ -21,9 +21,9 @@ from geteggs.core.models import (
     utc_now_iso,
 )
 
-DEFAULT_DISABLED_PROVIDERS = {"qoder"}
-# Keep in sync with QoderProvider.fixed_business_day_start.
-FIXED_BUSINESS_DAY_START = {"qoder": "10:00"}
+DEFAULT_DISABLED_PROVIDERS = {"qoder", "trae"}
+# Keep in sync with provider fixed_business_day_start values.
+FIXED_BUSINESS_DAY_START = {"qoder": "10:00", "trae": "00:00"}
 
 SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS app_settings (

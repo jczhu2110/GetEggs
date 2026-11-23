@@ -13,13 +13,7 @@ import {
   showBanner,
 } from "./utils.js";
 
-const PLANNED_TOOLS = [
-  {
-    provider_id: "trae",
-    display_name: "Trae",
-    description: "AI 编程工具适配器开发中",
-  },
-];
+const PLANNED_TOOLS = [];
 
 const RETENTION_PRESETS = {
   compact: {
@@ -81,6 +75,18 @@ const PROVIDER_EXTRA_FIELDS = {
       name: "client_exe_path",
       label: "自定义客户端 exe 路径",
       placeholder: "留空自动探测，如 C:\\Users\\...\\Qoder.exe",
+    },
+  ],
+  trae: [
+    {
+      name: "auth_file_path",
+      label: "自定义 Trae storage.json 路径",
+      placeholder: "留空自动探测，如 C:\\Users\\...\\Trae CN\\User\\globalStorage\\storage.json",
+    },
+    {
+      name: "client_exe_path",
+      label: "自定义客户端 exe 路径",
+      placeholder: "留空自动探测，如 D:\\Trae\\Trae CN\\Trae CN.exe",
     },
   ],
 };
@@ -358,7 +364,9 @@ function buildProviderAdvancedForm(provider) {
   const creditsHint =
     pid === "qoder"
       ? "Qoder 以活动返回金额为准，此项仅作兜底"
-      : "接口未返回奖励时按此计入";
+      : pid === "trae"
+        ? "Trae 以接口返回积分为准，此项仅作兜底"
+        : "接口未返回奖励时按此计入";
 
   const extraInputs = getProviderExtraFields(pid)
     .map(
@@ -423,6 +431,18 @@ function buildCredentialBlock(provider) {
         <div class="inline-actions">
           <button type="button" class="btn btn-secondary btn-sm" data-auth-browser="${escapeHtml(pid)}">浏览器授权</button>
           <button type="button" class="btn btn-ghost btn-sm" data-launch-provider="${escapeHtml(pid)}">打开客户端</button>
+        </div>
+      </div>
+    `;
+  }
+  if (pid === "trae") {
+    return `
+      <div class="tool-cred-box">
+        <h4>Trae 国内版本地登录态</h4>
+        <p class="muted">GetEggs 只读读取 Trae CN 客户端的加密登录态，签到按真实设备每日一次。登录态接近过期时会按需续期，续期可能使 Trae 客户端需要重新登录。</p>
+        <div class="inline-actions">
+          <button type="button" class="btn btn-secondary btn-sm" data-launch-provider="${escapeHtml(pid)}">打开 Trae 客户端</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-doctor-provider="${escapeHtml(pid)}">重新体检</button>
         </div>
       </div>
     `;
@@ -559,6 +579,8 @@ function updateToolCardDoctorUi(providerId) {
         quickBtn = `<button type="button" class="btn btn-secondary btn-sm" data-auth-browser="${escapeHtml(providerId)}">浏览器授权</button>`;
       } else if (providerId === "qoder") {
         quickBtn = `<button type="button" class="btn btn-secondary btn-sm" data-focus-pat="qoder">配置 PAT</button>`;
+      } else if (providerId === "trae") {
+        quickBtn = `<button type="button" class="btn btn-secondary btn-sm" data-launch-provider="${escapeHtml(providerId)}">打开客户端</button>`;
       } else {
         quickBtn = `<button type="button" class="btn btn-secondary btn-sm" data-open-tool-adv="${escapeHtml(providerId)}">检查路径</button>`;
       }

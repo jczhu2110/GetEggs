@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from geteggs.providers.base import BaseProvider
 from geteggs.providers.qoder import QoderProvider
+from geteggs.providers.trae import TraeProvider
 from geteggs.providers.workbuddy import WorkBuddyProvider
 
 _PROVIDERS: dict[str, BaseProvider] = {
     WorkBuddyProvider.id: WorkBuddyProvider(),
     QoderProvider.id: QoderProvider(),
+    TraeProvider.id: TraeProvider(),
 }
 
 

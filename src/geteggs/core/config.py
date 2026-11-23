@@ -50,6 +50,11 @@ def get_qoder_pat_path() -> Path:
     return get_data_dir() / "qoder_pat.json"
 
 
+def get_trae_auth_path() -> Path:
+    """Return path to the DPAPI-protected Trae CN rotated-token cache."""
+    return get_data_dir() / "trae_auth.json"
+
+
 def get_timezone(tz_name: str = "Asia/Shanghai") -> timezone | ZoneInfo:
     """Resolve timezone safely on Windows even when system tzdata is absent."""
     try:
