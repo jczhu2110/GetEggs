@@ -41,6 +41,43 @@ def test_is_portal_url_accepts_current_portal_domains() -> None:
     assert not _is_portal_url("https://www.workbuddy.cn/login")
     assert not _is_portal_url("https://www.codebuddy.cn/signin?from=profile")
     assert not _is_portal_url("https://example.com/profile/usage")
+    assert not _is_portal_url("http://www.codebuddy.cn/profile/usage")
+    assert not _is_portal_url("https://codebuddy.cn.evil.com/profile/usage")
+    assert not _is_portal_url(
+        "https://open.weixin.qq.com/connect/qrconnect?redirect_uri=https://www.codebuddy.cn/profile/usage"
+    )
+
+
+def test_parse_storage_state_filters_untrusted_origins_and_expired_cookies(
+    tmp_path: Path,
+) -> None:
+    state_file = _write_json(
+        tmp_path / "strict_state.json",
+        {
+            "cookies": [
+                {"name": "valid", "value": "ok", "domain": ".codebuddy.cn", "expires": 4102444800},
+                {"name": "expired", "value": "old", "domain": ".codebuddy.cn", "expires": 100},
+                {"name": "sso_broad", "value": "nope", "domain": ".tencent.com"},
+                {"name": "spoof", "value": "nope", "domain": "evil-workbuddy.com"},
+            ],
+            "origins": [
+                {
+                    "origin": "https://evil.example",
+                    "localStorage": [{"name": "accessToken", "value": "evil_tok"}],
+                },
+                {
+                    "origin": "https://www.codebuddy.cn",
+                    "localStorage": [{"name": "uid", "value": "u_portal"}],
+                },
+            ],
+        },
+    )
+    parsed = parse_storage_state(state_file)
+    assert parsed is not None
+    assert parsed["cookies"] == {"valid": "ok"}
+    assert len(parsed["cookie_entries"]) == 1
+    assert parsed["cookie_entries"][0]["domain"] == ".codebuddy.cn"
+    assert parsed["access_token"] is None
 
 
 def test_authorize_browser_uses_desktop_metadata_domain(tmp_path: Path) -> None:

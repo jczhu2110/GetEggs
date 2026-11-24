@@ -138,6 +138,8 @@ def _patch_schedule(monkeypatch) -> None:
 
 def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None:
     _patch_schedule(monkeypatch)
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    monkeypatch.delenv("GETEGGS_ALLOW_CUSTOM_CONFIG", raising=False)
     storage = Storage(tmp_path / "web.db")
     runner = CheckinRunner(storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock")
     provider = FakeWebProvider()
@@ -181,12 +183,13 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert toast_resp.json()["ok"] is True
 
     # Provider settings update persists extra fields and jitter override.
+    browser_state_target = str((tmp_path / "browser_state.json").as_posix())
     upd = client.put(
         "/api/providers/workbuddy/config",
         json={
             "enabled": True,
             "auth_file_path": "C:/custom/workbuddy-desktop.info",
-            "browser_state_path": "C:/custom/browser_state.json",
+            "browser_state_path": browser_state_target,
             "jitter_minutes": 5,
             "checkin_credits": 250,
             "business_day_start": "10:00",
@@ -195,7 +198,7 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert upd.status_code == 200
     provider_extra = upd.json()["provider"]["extra"]
     assert provider_extra["auth_file_path"] == "C:/custom/workbuddy-desktop.info"
-    assert provider_extra["browser_state_path"] == "C:/custom/browser_state.json"
+    assert provider_extra["browser_state_path"] == browser_state_target
     assert provider_extra["jitter_override"] is True
     assert upd.json()["provider"]["checkin_credits"] == 250
     assert upd.json()["provider"]["business_day_start"] == "10:00"
@@ -713,3 +716,333 @@ def test_web_static_assets_and_settings_metadata(
     ):
         resp = client.get(asset)
         assert resp.status_code == 200, f"failed to fetch {asset}"
+
+
+def test_web_security_headers_csrf_and_custom_config_toggle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _patch_schedule(monkeypatch)
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    monkeypatch.delenv("GETEGGS_ALLOW_CUSTOM_CONFIG", raising=False)
+    storage = Storage(tmp_path / "sec.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=True,
+        startup_token="tok123",
+        providers=[FakeWebProvider()],
+    )
+    client = TestClient(app)
+
+    # OpenAPI schema and static index.html must not bypass auth.
+    assert client.get("/openapi.json").status_code == 404
+    assert client.get("/static/index.html").status_code == 401
+
+    auth_resp = client.get("/auth?token=tok123", follow_redirects=False)
+    assert auth_resp.status_code == 302
+    assert auth_resp.headers.get("x-frame-options") == "DENY"
+    assert auth_resp.headers.get("x-content-type-options") == "nosniff"
+    assert auth_resp.headers.get("cache-control") == "no-store"
+    assert "frame-ancestors 'none'" in (
+        auth_resp.headers.get("content-security-policy") or ""
+    )
+
+    # Launcher splash page navigates from another loopback port to /auth.
+    splash_nav = client.get(
+        "/auth?token=tok123",
+        follow_redirects=False,
+        headers={
+            "Host": "127.0.0.1:18765",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "navigate",
+        },
+    )
+    assert splash_nav.status_code == 302
+
+    splash_root = client.get(
+        "/",
+        headers={
+            "Host": "127.0.0.1:18765",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "navigate",
+        },
+    )
+    assert splash_root.status_code == 200
+
+    # Same-site (cross-port) API access must still be blocked.
+    cross_port_api = client.get(
+        "/api/overview",
+        headers={
+            "Host": "127.0.0.1:18765",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "cors",
+        },
+    )
+    assert cross_port_api.status_code == 403
+
+    # Cross-port localhost CSRF and missing custom header must be blocked.
+    cross_port = client.post(
+        "/api/notifiers/test",
+        headers={
+            "Host": "127.0.0.1:18765",
+            "Origin": "http://127.0.0.1:3000",
+            "X-GetEggs-Request": "1",
+        },
+    )
+    assert cross_port.status_code == 403
+
+    missing_csrf_hdr = client.post(
+        "/api/notifiers/test",
+        headers={
+            "Host": "127.0.0.1:18765",
+            "Origin": "http://127.0.0.1:18765",
+        },
+    )
+    assert missing_csrf_hdr.status_code == 403
+
+    same_origin_ok = client.post(
+        "/api/notifiers/test",
+        headers={
+            "Host": "127.0.0.1:18765",
+            "Origin": "http://127.0.0.1:18765",
+            "Sec-Fetch-Site": "same-origin",
+            "X-GetEggs-Request": "1",
+        },
+    )
+    assert same_origin_ok.status_code == 200
+
+    # IPv6 loopback host must be parsed properly.
+    ipv6_ok = client.get("/api/overview", headers={"Host": "[::1]:18765"})
+    assert ipv6_ok.status_code == 200
+
+    # Strict config validation rejects untrusted base_url, UNC paths, and out-of-dir browser state.
+    assert (
+        client.put(
+            "/api/providers/workbuddy/config",
+            json={"base_url": "https://evil.example"},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/providers/workbuddy/config",
+            json={"base_url": "http://www.codebuddy.cn"},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/providers/workbuddy/config",
+            json={"auth_file_path": r"\\attacker\share\info.json"},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/providers/workbuddy/config",
+            json={"browser_state_path": "C:/Windows/Temp/outside.json"},
+        ).status_code
+        == 422
+    )
+
+    # Env toggle relaxes allowlist while still blocking UNC paths and control chars.
+    monkeypatch.setenv("GETEGGS_ALLOW_CUSTOM_CONFIG", "1")
+    relaxed_ok = client.put(
+        "/api/providers/workbuddy/config",
+        json={
+            "base_url": "http://127.0.0.1:9999",
+            "browser_state_path": "C:/custom/outside.json",
+        },
+    )
+    assert relaxed_ok.status_code == 200
+    assert (
+        client.put(
+            "/api/providers/workbuddy/config",
+            json={"auth_file_path": r"\\attacker\share\still-blocked"},
+        ).status_code
+        == 422
+    )
+
+
+def test_web_shutdown_triggers_graceful_uvicorn_exit(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "graceful.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FakeWebProvider()],
+    )
+
+    class FakeServer:
+        should_exit = False
+
+    fake_server = FakeServer()
+    app.state.uvicorn_server = fake_server
+    with TestClient(app) as client:
+        resp = client.post("/api/system/shutdown")
+        assert resp.status_code == 200
+        # Once shutting down, new runs are rejected.
+        blocked_run = client.post(
+            "/api/runs", json={"provider_id": "workbuddy", "dry_run": True}
+        )
+        assert blocked_run.status_code == 503
+        time.sleep(0.4)
+        assert fake_server.should_exit is True
+
+
+def test_web_sse_does_not_drop_terminal_event_during_history_yield() -> None:
+    from geteggs.web.app import ActiveRunState
+
+    state = ActiveRunState(run_id="race-1")
+    state.publish("log", {"message": "step-1"})
+    history, queue, was_finished = state.subscribe(0)
+    assert was_finished is False
+    assert queue is not None
+    assert len(history) == 1
+
+    # Simulate completion occurring while the SSE generator is still yielding history.
+    state.publish("log", {"message": "step-2"})
+    state.complete({"run_id": "race-1"})
+
+    drained = []
+    while True:
+        item = queue.get_nowait()
+        if item is None:
+            break
+        drained.append(item)
+    assert [item["type"] for item in drained] == ["log", "done"]
+    assert drained[0]["data"]["message"] == "step-2"
+
+
+def test_web_history_month_validation_biz_date_and_provider_config_edges(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _patch_schedule(monkeypatch)
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    storage = Storage(tmp_path / "p1_edges.db")
+    for idx, day in enumerate(("2026-11-10", "2026-11-11")):
+        storage.save_checkin_result(
+            f"run-{idx}",
+            CheckinResult(
+                provider_id="workbuddy",
+                display_name="Fake WorkBuddy",
+                status=CheckinStatus.SUCCESS,
+                message=f"ok-{idx}",
+                biz_date=day,
+                snapshot=CreditSnapshot(delta=50),
+            ),
+        )
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    qoder = QoderProvider()
+    qoder._token_cache[("https://openapi.qoder.com.cn", "digest")] = ("cached-tok", 9e9)
+
+    class NoBrowserProvider(FakeTraeProvider):
+        supports_browser_auth = False
+
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=False,
+        providers=[FakeWebProvider(), NoBrowserProvider(), qoder],
+    )
+    with TestClient(app) as client:
+        # Invalid month wildcard must be rejected (422).
+        assert client.get("/api/history?month=%25").status_code == 422
+
+        filtered = client.get(
+            "/api/history?month=2026-11&biz_date=2026-11-10&limit=10"
+        )
+        assert filtered.status_code == 200
+        body = filtered.json()
+        assert [r["biz_date"] for r in body["records"]] == ["2026-11-10"]
+        assert body["has_more"] is False
+
+        # jitter_override=False must take precedence even when jitter_minutes is also sent.
+        upd = client.put(
+            "/api/providers/workbuddy/config",
+            json={"jitter_minutes": 10, "jitter_override": False},
+        )
+        assert upd.status_code == 200
+        assert "jitter_override" not in upd.json()["provider"]["extra"]
+
+        # Providers without browser auth support must be rejected upfront (400).
+        unsupported = client.post("/api/providers/trae/auth-browser")
+        assert unsupported.status_code == 400
+
+        # Clearing Qoder PAT must evict in-memory exchanged token cache.
+        cleared = client.delete("/api/providers/qoder/pat")
+        assert cleared.status_code == 200
+        assert qoder._token_cache == {}
+
+        # Verify P1 frontend layout/interaction fixes remain intact.
+        css_text = client.get("/static/styles.css").text
+        assert "margin-inline: auto;" in css_text
+        utils_text = client.get("/static/utils.js").text
+        assert "X-GetEggs-Request" in utils_text
+        assert "Array.isArray(payload.detail)" in utils_text
+        history_text = client.get("/static/history.js").text
+        assert "biz_date" in history_text
+        assert "has_more" in history_text
+
+        # Verify P2 WCAG accessibility & frontend hygiene fixes remain intact.
+        html_text = client.get("/").text
+        assert 'role="tooltip"' in html_text
+        assert 'aria-controls="subtab-runs"' in html_text
+        assert 'id="live-drawer-log" class="live-drawer-log" role="log" aria-live="polite"' in html_text
+        assert "一次性令牌" not in html_text
+
+        assert "visibility: hidden;" in css_text
+        assert 'body[data-tab="settings"] .toast-banner' in css_text
+        assert ".trend-bar:focus-visible" in css_text
+
+        charts_text = client.get("/static/charts.js").text
+        assert 'role="group"' in charts_text
+        assert "delegatedContainers" in charts_text
+
+        app_text = client.get("/static/app.js").text
+        assert "window.__trendResizeTimer" not in app_text
+        assert "appState.stopped" in app_text
+
+        settings_text = client.get("/static/settings.js").text
+        assert "PLANNED_TOOLS" not in settings_text
+        assert 'role="switch"' in settings_text
+        assert "appState.stopped = true" in settings_text
+        assert "267008" in settings_text
+        assert "window.__bannerTimer" not in utils_text
+
+        # Verify follow-up audit regression fixes in frontend assets.
+        assert 'aria-describedby="metric-schedule metric-schedule-chip metric-schedule-sub"' in html_text
+        assert "--chart-focus: #ffffff;" in css_text
+        assert "outline: none;" not in css_text
+        overview_text = client.get("/static/overview.js").text
+        assert "updateRunningCardPills();" in overview_text
+        assert "skipCalendarRender" in history_text
+
+
+def test_web_static_index_html_auth_guard_is_case_insensitive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _patch_schedule(monkeypatch)
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    storage = Storage(tmp_path / "auth_case.db")
+    runner = CheckinRunner(
+        storage=storage, notifier=DummyNotifier(), lock_path=tmp_path / "run.lock"
+    )
+    app = create_app(
+        storage=storage,
+        runner=runner,
+        auth_enabled=True,
+        providers=[FakeWebProvider()],
+    )
+    with TestClient(app) as client:
+        assert client.get("/static/index.html").status_code == 401
+        assert client.get("/static/INDEX.HTML").status_code == 401
+        assert client.get("/static/Index.Html").status_code == 401

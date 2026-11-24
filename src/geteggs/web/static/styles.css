@@ -12,7 +12,7 @@
 
   --text: #121316;
   --text-secondary: #45474f;
-  --muted: #73757f;
+  --muted: #5f626c;
 
   /* Primary Electric Cobalt Blue */
   --accent: #2546f5;
@@ -106,7 +106,7 @@ button, input, select, textarea { font-family: inherit; }
   outline-offset: 2px;
 }
 
-.input:focus-visible { outline: none; }
+.input:focus-visible { outline: 2px solid transparent; }
 
 code {
   background: var(--surface-3);
@@ -1399,7 +1399,11 @@ code {
 .trend-bar:focus {
   opacity: 0.88;
   filter: brightness(0.92);
-  outline: none;
+}
+
+.trend-bar:focus-visible {
+  outline: 2px solid var(--chart-focus, var(--accent));
+  outline-offset: 2px;
 }
 
 @keyframes barRise {
@@ -1485,7 +1489,7 @@ code {
   font-family: var(--mono);
   font-size: 10px;
   letter-spacing: 0.08em;
-  color: #6b7080;
+  color: #8b92a6;
   margin-bottom: 10px;
 }
 
@@ -2301,7 +2305,7 @@ button.cal-day:hover {
 }
 
 .input:focus {
-  outline: none;
+  outline: 2px solid transparent;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
@@ -2439,6 +2443,7 @@ input[type="checkbox"]:not(.switch-input) {
   --chart-grid: rgba(255, 255, 255, 0.18);
   --chart-axis-line: rgba(255, 255, 255, 0.34);
   --chart-axis: rgba(255, 255, 255, 0.78);
+  --chart-focus: #ffffff;
 }
 
 .aux-cobalt-bottom-grid {
@@ -2562,9 +2567,10 @@ input[type="checkbox"]:not(.switch-input) {
 
 .save-bar {
   position: fixed;
-  left: 50%;
+  left: 0;
+  right: 0;
   bottom: 20px;
-  transform: translateX(-50%);
+  margin-inline: auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2784,16 +2790,22 @@ body:not([data-tab="settings"]) .save-bar {
   max-width: min(440px, calc(100vw - 44px));
   box-shadow: var(--shadow-lg);
   opacity: 0;
+  visibility: hidden;
   transform: translateY(10px) scale(0.98);
   pointer-events: none;
-  transition: opacity 0.22s ease, transform 0.24s var(--ease);
+  transition: opacity 0.22s ease, transform 0.24s var(--ease), visibility 0.22s ease;
   z-index: 60;
 }
 
 .toast-banner.show {
   opacity: 1;
+  visibility: visible;
   transform: translateY(0) scale(1);
   pointer-events: auto;
+}
+
+body[data-tab="settings"] .toast-banner {
+  bottom: 84px;
 }
 
 .toast-banner.toast-success { border-left-color: var(--success); }

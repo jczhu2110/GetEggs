@@ -658,3 +658,159 @@ def test_workbuddy_dry_run_unknown_state_is_unavailable(tmp_path: Path) -> None:
 
     assert res.status == CheckinStatus.UNAVAILABLE
     assert "/v2/billing/meter/daily-checkin" not in called_paths
+
+
+def test_workbuddy_real_run_unknown_state_refuses_checkin(tmp_path: Path) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+    called_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called_paths.append(request.url.path)
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16", dry_run=False))
+
+    assert res.status == CheckinStatus.SCHEMA_CHANGED
+    assert res.raw_error_type == "UnknownCheckinState"
+    assert "/v2/billing/meter/daily-checkin" not in called_paths
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "expected"),
+    [
+        (404, {"message": "Not Found"}, CheckinStatus.SCHEMA_CHANGED),
+        (429, {"error": "rate limit"}, CheckinStatus.FAILED),
+        (400, {"error": "bad request"}, CheckinStatus.FAILED),
+        (200, {}, CheckinStatus.SCHEMA_CHANGED),
+    ],
+)
+def test_workbuddy_does_not_misclassify_4xx_or_empty_200_as_success(
+    tmp_path: Path, status_code: int, body: dict, expected: CheckinStatus
+) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(200, json={"code": 0, "data": {"checkedIn": False}})
+        if request.url.path == "/v2/billing/meter/daily-checkin":
+            return httpx.Response(status_code, json=body)
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
+
+    assert res.status == expected
+    assert res.snapshot is None or res.snapshot.delta == 0
+
+
+def test_workbuddy_already_hint_with_zero_reward_and_parse_expiry_edges(
+    tmp_path: Path,
+) -> None:
+    from geteggs.providers.workbuddy import _parse_expiry
+
+    assert _parse_expiry(True) == (None, False)
+    assert _parse_expiry(1e20) == (None, False)
+
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(200, json={"code": 0, "data": {"checkedIn": False}})
+        if request.url.path == "/v2/billing/meter/daily-checkin":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "message": "今日已签到",
+                    "data": {"rewardCredits": 0},
+                },
+            )
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
+    assert res.status == CheckinStatus.ALREADY_DONE
+
+
+def test_workbuddy_desktop_fallback_uses_browser_base_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {
+            "accessToken": "desktop_expired_tok",
+            "domain": "https://www.codebuddy.cn",
+            "account": {"uid": "u_desktop"},
+        },
+    )
+    browser_state = tmp_path / "browser-state.json"
+    browser_state.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "wb_sess",
+                        "value": "cookie_val",
+                        "domain": ".workbuddy.cn",
+                        "path": "/",
+                    }
+                ],
+                "origins": [
+                    {
+                        "origin": "https://copilot.tencent.com",
+                        "localStorage": [
+                            {"name": "uid", "value": "u_browser"},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_browser_checkin(state_path, *, base_url, uid, dry_run, log):
+        captured["base_url"] = base_url
+        captured["uid"] = uid
+        return {
+            "authenticated": True,
+            "statusRes": {
+                "status": 200,
+                "data": {"code": 0, "data": {"checkedIn": True}},
+            },
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    provider = WorkBuddyProvider(
+        transport=httpx.MockTransport(handler),
+        browser_checkin_fn=fake_browser_checkin,
+    )
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        extra={
+            "auth_file_path": str(auth_file),
+            "browser_state_path": str(browser_state),
+        },
+    )
+    res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
+    assert res.status == CheckinStatus.ALREADY_DONE
+    assert captured["base_url"] == "https://copilot.tencent.com"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +28,8 @@ class _DataBlob(ctypes.Structure):
 def _protect(data: bytes) -> bytes:
     from ctypes import wintypes
 
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     crypt32.CryptProtectData.argtypes = [
         ctypes.POINTER(_DataBlob),
         wintypes.LPCWSTR,
@@ -63,8 +64,8 @@ def _protect(data: bytes) -> bytes:
 def _unprotect(data: bytes) -> bytes:
     from ctypes import wintypes
 
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     crypt32.CryptUnprotectData.argtypes = [
         ctypes.POINTER(_DataBlob),
         ctypes.POINTER(wintypes.LPWSTR),
@@ -101,9 +102,23 @@ def save_secure_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     blob = _HEADER + _protect(payload) if os.name == "nt" else payload
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_bytes(blob)
-    os.replace(tmp_path, path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(blob)
+            handle.flush()
+        if os.name != "nt":
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def load_secure_json(path: Path) -> dict[str, Any]:

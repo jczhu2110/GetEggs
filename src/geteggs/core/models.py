@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from geteggs.core.config import validate_timezone_name
 
 _HHMM_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 DEFAULT_CHECKIN_CREDITS = 100
@@ -116,6 +118,8 @@ class RunSummary(BaseModel):
 class ProviderConfig(BaseModel):
     """Per-provider persistent settings stored in SQLite."""
 
+    model_config = ConfigDict(validate_assignment=True)
+
     provider_id: str
     enabled: bool = True
     earliest_time: str = "00:00"
@@ -126,14 +130,28 @@ class ProviderConfig(BaseModel):
     )
     extra: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("earliest_time")
+    @classmethod
+    def _validate_earliest_time(cls, value: str) -> str:
+        return validate_hhmm(value)
+
     @field_validator("business_day_start")
     @classmethod
     def _validate_business_day_start(cls, value: str) -> str:
         return validate_hhmm(value)
 
+    @field_validator("jitter_minutes")
+    @classmethod
+    def _validate_provider_jitter_minutes(cls, value: int) -> int:
+        if not 0 <= value <= 120:
+            raise ValueError("Provider 随机抖动窗口必须在 0-120 分钟之间。")
+        return value
+
 
 class GlobalSettings(BaseModel):
     """Application-level settings."""
+
+    model_config = ConfigDict(validate_assignment=True)
 
     schedule_time: str = "10:15"
     jitter_minutes: int = 15
@@ -163,10 +181,7 @@ class GlobalSettings(BaseModel):
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
-        cleaned = (value or "").strip()
-        if not cleaned:
-            raise ValueError("时区不能为空。")
-        return cleaned
+        return validate_timezone_name(value)
 
     @field_validator(
         "run_events_retention_days",

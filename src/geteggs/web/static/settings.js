@@ -13,8 +13,6 @@ import {
   showBanner,
 } from "./utils.js";
 
-const PLANNED_TOOLS = [];
-
 const RETENTION_PRESETS = {
   compact: {
     run_events_retention_days: 14,
@@ -136,6 +134,8 @@ let lastScheduleInfo = null;
 let settingsProviders = [];
 const doctorByProvider = new Map();
 const doctorChecking = new Set();
+const queuedDoctorProviders = new Set();
+const providerSaving = new Set();
 const expandedTools = new Set();
 const dirtyProviderForms = new Set();
 
@@ -210,10 +210,10 @@ function collectGlobalSettings() {
     throw new Error("设置尚未加载完成，请稍候再操作。");
   }
   const scheduleTime = $("#set-schedule-time").value || "10:15";
-  const jitterRaw = $("#set-jitter-minutes").value;
+  const jitterRaw = ($("#set-jitter-minutes").value ?? "").trim();
   const jitterMinutes = jitterRaw === "" ? 15 : Number(jitterRaw);
-  if (!Number.isFinite(jitterMinutes) || jitterMinutes < 0 || jitterMinutes > 120) {
-    throw new Error("随机抖动窗口必须在 0-120 分钟之间。");
+  if (!Number.isInteger(jitterMinutes) || jitterMinutes < 0 || jitterMinutes > 120) {
+    throw new Error("随机抖动窗口必须是 0-120 分钟之间的整数。");
   }
   const retentionValue = (selector, fallback) => {
     const raw = $(selector).value;
@@ -275,12 +275,14 @@ function detectRetentionPreset() {
 function syncPresetHighlight(forced = null) {
   const active = forced || detectRetentionPreset();
   $$("[data-retention-preset]").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.retentionPreset === active);
+    const isActive = btn.dataset.retentionPreset === active;
+    btn.classList.toggle("active", isActive);
+    btn.setAttribute("aria-pressed", isActive ? "true" : "false");
   });
 }
 
 async function saveGlobalSettings(successMessage) {
-  if (globalSaveBusy) return false;
+  if (globalSaveBusy || scheduleBusy) return false;
   globalSaveBusy = true;
   const saveButton = $("#btn-save-global-settings");
   if (saveButton) saveButton.disabled = true;
@@ -292,7 +294,7 @@ async function saveGlobalSettings(successMessage) {
       body: JSON.stringify(payload),
     });
     lastSavedGlobal = saved.global || payload;
-    updateSaveBarVisibility();
+    populateGlobalForm(lastSavedGlobal);
 
     const scheduleChanged = Boolean(
       previous &&
@@ -302,8 +304,12 @@ async function saveGlobalSettings(successMessage) {
     );
     if (scheduleChanged && canAutoSyncSchedule()) {
       try {
-        await syncScheduleIfInstalled();
-        showBanner("全局设置已保存，计划任务已按新配置同步。");
+        const synced = await syncScheduleIfInstalled();
+        showBanner(
+          synced
+            ? "全局设置已保存，计划任务已按新配置同步。"
+            : "全局设置已保存；计划任务当前忙碌，请稍后手动点击「安装 / 更新计划任务」同步。"
+        );
         return true;
       } catch (err) {
         showBanner(`设置已保存，但计划任务同步失败：${err.message}`, true);
@@ -494,7 +500,7 @@ function renderToolCards() {
 
               <div class="tool-card-controls">
                 <label class="switch-field" title="开启或停用每日自动签到">
-                  <input type="checkbox" class="switch-input" data-tool-toggle="${pidEsc}" ${provider.enabled ? "checked" : ""} />
+                  <input type="checkbox" role="switch" class="switch-input" data-tool-toggle="${pidEsc}" ${provider.enabled ? "checked" : ""} />
                   <span>自动调度</span>
                 </label>
                 <button type="button" class="btn btn-quiet btn-sm" data-tool-expand="${pidEsc}" aria-expanded="${expanded ? "true" : "false"}">
@@ -525,12 +531,7 @@ function renderToolCards() {
 
   const plannedEl = $("#planned-tools-note");
   if (plannedEl) {
-    if (PLANNED_TOOLS.length) {
-      plannedEl.textContent = `即将支持：${PLANNED_TOOLS.map((t) => `${t.display_name}（${t.description}）`).join("、")}`;
-      plannedEl.hidden = false;
-    } else {
-      plannedEl.hidden = true;
-    }
+    plannedEl.hidden = true;
   }
 
   settingsProviders.forEach((p) => updateToolCardDoctorUi(p.provider_id));
@@ -647,7 +648,10 @@ async function runDoctor({ providerId = null, silent = false } = {}) {
     : settingsProviders.map((p) => p.provider_id);
 
   if (!targets.length) return;
-  if (targets.some((id) => doctorChecking.has(id))) return;
+  if (targets.some((id) => doctorChecking.has(id))) {
+    if (providerId) queuedDoctorProviders.add(providerId);
+    return;
+  }
 
   targets.forEach((id) => {
     doctorChecking.add(id);
@@ -666,8 +670,6 @@ async function runDoctor({ providerId = null, silent = false } = {}) {
     doctorFetched = true;
     (results || []).forEach((r) => {
       doctorByProvider.set(r.provider_id, r);
-      doctorChecking.delete(r.provider_id);
-      updateToolCardDoctorUi(r.provider_id);
     });
     const stamp = $("#doctor-last-checked");
     if (stamp) {
@@ -678,17 +680,28 @@ async function runDoctor({ providerId = null, silent = false } = {}) {
       showBanner(unhealthy ? `体检完成，${unhealthy} 个工具需要关注` : "全部工具环境健康就绪");
     }
   } catch (err) {
+    if (!silent) showBanner(err.message, true);
+  } finally {
     targets.forEach((id) => {
       doctorChecking.delete(id);
       updateToolCardDoctorUi(id);
     });
-    if (!silent) showBanner(err.message, true);
-  } finally {
     if (!providerId && allBtn) {
       allBtn.disabled = false;
       if (originalHtml !== undefined) allBtn.innerHTML = originalHtml;
     }
+    for (const id of targets) {
+      if (queuedDoctorProviders.has(id)) {
+        queuedDoctorProviders.delete(id);
+        void runDoctor({ providerId: id, silent: true });
+      }
+    }
   }
+}
+
+export function refreshProviderDoctor(providerId) {
+  if (!settingsFetched || !providerId) return;
+  void runDoctor({ providerId, silent: true });
 }
 
 function setToolExpanded(providerId, expand) {
@@ -754,7 +767,10 @@ async function submitProviderForm(form) {
     return;
   }
   const pid = form.dataset.providerForm;
-  if (!pid) return;
+  if (!pid || providerSaving.has(pid)) return;
+  providerSaving.add(pid);
+  const submitBtn = form.querySelector("button[type='submit']");
+  if (submitBtn) submitBtn.disabled = true;
 
   try {
     const payload = {};
@@ -763,8 +779,10 @@ async function submitProviderForm(form) {
     }
     const earliest = form.querySelector("[name='earliest_time']")?.value;
     if (earliest) payload.earliest_time = earliest;
-    const businessStart = form.querySelector("[name='business_day_start']")?.value;
-    if (businessStart) payload.business_day_start = businessStart;
+    const businessStartInput = form.querySelector("[name='business_day_start']");
+    if (businessStartInput && !businessStartInput.disabled && businessStartInput.value) {
+      payload.business_day_start = businessStartInput.value;
+    }
     const creditsValue = (form.querySelector("[name='checkin_credits']")?.value ?? "").trim();
     const checkinCredits =
       creditsValue === "" ? DEFAULT_CHECKIN_CREDITS : Number(creditsValue);
@@ -773,9 +791,14 @@ async function submitProviderForm(form) {
       return;
     }
     payload.checkin_credits = checkinCredits;
-    const jitterValue = form.querySelector("[name='jitter_minutes']")?.value ?? "";
+    const jitterValue = (form.querySelector("[name='jitter_minutes']")?.value ?? "").trim();
     if (jitterValue !== "") {
-      payload.jitter_minutes = Number(jitterValue);
+      const jitterNum = Number(jitterValue);
+      if (!Number.isInteger(jitterNum) || jitterNum < 0 || jitterNum > 120) {
+        showBanner("单工具随机抖动窗口必须是 0-120 分钟之间的整数。", true);
+        return;
+      }
+      payload.jitter_minutes = jitterNum;
       payload.jitter_override = true;
     } else {
       payload.jitter_override = false;
@@ -798,15 +821,19 @@ async function submitProviderForm(form) {
     if (idx >= 0 && res.provider) {
       settingsProviders[idx] = { ...settingsProviders[idx], ...res.provider };
     }
-    markProviderFormDirty(pid, false);
+    resetProviderForm(pid);
     const name = settingsProviders[idx]?.display_name || pid;
     const afterJitter = res.provider?.extra?.jitter_override
       ? Number(res.provider.jitter_minutes || 0)
       : Number(lastSavedGlobal?.jitter_minutes ?? 15);
     if (beforeJitter !== afterJitter && canAutoSyncSchedule()) {
       try {
-        await syncScheduleIfInstalled();
-        showBanner(`${name} 配置已保存，计划任务执行时限已同步`);
+        const synced = await syncScheduleIfInstalled();
+        showBanner(
+          synced
+            ? `${name} 配置已保存，计划任务执行时限已同步`
+            : `${name} 配置已保存；计划任务当前忙碌，请稍后手动同步执行时限`
+        );
       } catch (err) {
         showBanner(`${name} 配置已保存，但计划任务时限同步失败：${err.message}`, true);
       }
@@ -820,6 +847,9 @@ async function submitProviderForm(form) {
     callbacks.onOverviewRefresh(true);
   } catch (err) {
     showBanner(err.message, true);
+  } finally {
+    providerSaving.delete(pid);
+    if (submitBtn && submitBtn.isConnected) submitBtn.disabled = !settingsLoaded;
   }
 }
 
@@ -844,17 +874,33 @@ function formatTaskResult(code) {
   if (code === null || code === undefined || code === "") return "--";
   const value = Number(code);
   if (value === 0) return "成功";
+  if (value === 267008) return "已就绪";
   if (value === 267011) return "尚未运行";
   if (value === 267009) return "正在运行";
   return `异常（代码 ${code}）`;
 }
 
 async function syncScheduleIfInstalled() {
-  if (!lastScheduleInfo?.installed) return false;
-  const res = await apiFetch("/api/schedule/install", { method: "POST" });
-  renderScheduleBox(res.schedule);
-  callbacks.onOverviewRefresh();
-  return true;
+  if (!lastScheduleInfo?.installed || scheduleBusy) return false;
+  scheduleBusy = true;
+  try {
+    const res = await apiFetch("/api/schedule/install", { method: "POST" });
+    renderScheduleBox(res.schedule);
+    callbacks.onOverviewRefresh();
+    return true;
+  } finally {
+    scheduleBusy = false;
+  }
+}
+
+export async function refreshScheduleStatus() {
+  if (scheduleBusy) return;
+  try {
+    const sch = await apiFetch("/api/schedule");
+    renderScheduleBox(sch);
+  } catch {
+    // 保留已有展示
+  }
 }
 
 function canAutoSyncSchedule() {
@@ -938,6 +984,15 @@ export async function loadSettings({ autoDoctor = true } = {}) {
         runDoctor({ silent: true });
       }
     } catch (err) {
+      const container = $("#tool-cards-list");
+      if (container && !settingsFetched) {
+        container.innerHTML = `
+          <div class="tool-card-placeholder">
+            <p class="muted">加载工具配置失败：${escapeHtml(err.message)}</p>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-retry-load-settings">重试加载</button>
+          </div>
+        `;
+      }
       showBanner(err.message, true);
     }
   })();
@@ -980,7 +1035,7 @@ export async function focusSection(sectionId) {
 }
 
 async function installSchedule() {
-  if (scheduleBusy) return;
+  if (scheduleBusy || globalSaveBusy) return;
   scheduleBusy = true;
   const installButton = $("#btn-install-schedule");
   const uninstallButton = $("#btn-uninstall-schedule");
@@ -1012,7 +1067,7 @@ async function installSchedule() {
 }
 
 async function uninstallSchedule() {
-  if (scheduleBusy) return;
+  if (scheduleBusy || globalSaveBusy) return;
   const confirmed = await confirmAction({
     title: "卸载 Windows 计划任务",
     message: "确定要移除每日自动签到计划任务吗？",
@@ -1024,7 +1079,7 @@ async function uninstallSchedule() {
     confirmText: "确认卸载",
     danger: true,
   });
-  if (!confirmed) return;
+  if (!confirmed || scheduleBusy || globalSaveBusy) return;
 
   scheduleBusy = true;
   const installButton = $("#btn-install-schedule");
@@ -1093,6 +1148,7 @@ export function initSettings(userCallbacks = {}) {
   // 保留策略预设点击
   $$("[data-retention-preset]").forEach((btn) => {
     btn.addEventListener("click", () => {
+      if (!settingsLoaded) return;
       const name = btn.dataset.retentionPreset;
       if (name === "custom") {
         const details = $("#retention-custom-details");
@@ -1115,6 +1171,10 @@ export function initSettings(userCallbacks = {}) {
   // 统一工具卡片区事件委托
   const toolsList = $("#tool-cards-list");
   toolsList?.addEventListener("click", async (ev) => {
+    if (ev.target.closest("#btn-retry-load-settings")) {
+      loadSettings({ autoDoctor: true });
+      return;
+    }
     const expandBtn = ev.target.closest("[data-tool-expand]");
     if (expandBtn) {
       const pid = expandBtn.dataset.toolExpand;
@@ -1225,9 +1285,11 @@ export function initSettings(userCallbacks = {}) {
         card?.classList.toggle("is-enabled", enabled);
         if (lastScheduleInfo?.installed && canAutoSyncSchedule()) {
           try {
-            await syncScheduleIfInstalled();
+            const synced = await syncScheduleIfInstalled();
             showBanner(
-              `已${enabled ? "启用" : "停用"} ${name} 自动调度，计划任务执行时限已同步`
+              synced
+                ? `已${enabled ? "启用" : "停用"} ${name} 自动调度，计划任务执行时限已同步`
+                : `已${enabled ? "启用" : "停用"} ${name} 自动调度；计划任务当前忙碌，请稍后手动同步执行时限`
             );
           } catch (err) {
             showBanner(
@@ -1294,14 +1356,18 @@ export function initSettings(userCallbacks = {}) {
 
   $("#btn-run-maintenance")?.addEventListener("click", async (ev) => {
     const button = ev.currentTarget;
+    const impacts = [
+      "清理前会自动为当前 SQLite 数据库创建一份完整备份",
+      "仅删除超出保留期的日志、通知、批次与旧流水",
+      "不会影响当前工具配置、凭据及最近状态",
+    ];
+    if (isGlobalDirty()) {
+      impacts.unshift("注意：当前有未保存的保留期修改，本次清理将按上次已保存的策略执行");
+    }
     const confirmed = await confirmAction({
       title: "清理过期历史数据",
-      message: "将按当前保留策略清理超出保留天数的记录：",
-      impacts: [
-        "清理前会自动为当前 SQLite 数据库创建一份完整备份",
-        "仅删除超出保留期的日志、通知、批次与旧流水",
-        "不会影响当前工具配置、凭据及最近状态",
-      ],
+      message: "将按已保存的保留策略清理超出保留天数的记录：",
+      impacts,
       confirmText: "立即清理",
       danger: false,
     });
@@ -1354,6 +1420,7 @@ export function initSettings(userCallbacks = {}) {
     button.textContent = "正在关闭...";
     try {
       const res = await apiFetch("/api/system/shutdown", { method: "POST" });
+      appState.stopped = true;
       showBanner(res.message);
     } catch (err) {
       showBanner(err.message, true);

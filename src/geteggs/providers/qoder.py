@@ -8,10 +8,18 @@ import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
 
-from geteggs.core.config import get_qoder_pat_path
+if TYPE_CHECKING:
+    import httpx
+
+from geteggs.core.config import (
+    allow_custom_config,
+    get_qoder_pat_path,
+    is_unc_path,
+    validate_provider_base_url,
+)
 from geteggs.core.models import (
     DEFAULT_CHECKIN_CREDITS,
     MAX_CHECKIN_CREDITS,
@@ -22,7 +30,7 @@ from geteggs.core.models import (
     ProviderConfig,
 )
 from geteggs.core.secure_store import load_secure_json
-from geteggs.providers.base import BaseProvider, LogCallback
+from geteggs.providers.base import BaseProvider, LogCallback, parse_timestamp
 
 QODER_CN_BASE_URL = "https://openapi.qoder.com.cn"
 CAMPAIGNS_PATH = "/sash/api/v1/me/campaigns"
@@ -96,6 +104,10 @@ class QoderProvider(BaseProvider):
     def _forget_job_token(self, config: ProviderConfig, pat: str) -> None:
         self._token_cache.pop(self._token_cache_key(config, pat), None)
 
+    def clear_token_cache(self) -> None:
+        """Drop all cached exchanged job tokens (e.g., after PAT update/clear)."""
+        self._token_cache.clear()
+
     # ---- BaseProvider contract ----
 
     def detect_client_exe(self, config: ProviderConfig) -> Optional[str]:
@@ -114,7 +126,7 @@ class QoderProvider(BaseProvider):
             ]
         )
         custom = str(config.extra.get("client_exe_path") or "").strip()
-        if custom:
+        if custom and "\x00" not in custom and not is_unc_path(custom):
             candidates.insert(0, Path(custom).expanduser())
         for cmd in ("qoder", "qoder.exe"):
             found = shutil.which(cmd)
@@ -181,9 +193,10 @@ class QoderProvider(BaseProvider):
                         http_status=response.status_code,
                     )
                 if not response.is_success:
+                    transient = response.status_code == 429 or response.status_code >= 500
                     return result(
-                        True,
-                        f"PAT 已配置，但暂时无法在线校验（HTTP {response.status_code}）。",
+                        transient,
+                        f"PAT 已配置，但在线校验返回 HTTP {response.status_code}。",
                         verified=False,
                         http_status=response.status_code,
                     )
@@ -225,8 +238,10 @@ class QoderProvider(BaseProvider):
                     claimable=claimable,
                     claimed=claimed,
                 )
+        except (ValueError, httpx.InvalidURL) as exc:
+            return result(False, f"配置无效：{type(exc).__name__}" if isinstance(exc, httpx.InvalidURL) else str(exc), verified=False)
         except httpx.HTTPError as exc:
-            reason = str(exc) or type(exc).__name__
+            reason = type(exc).__name__
             return result(
                 True,
                 f"PAT 已配置，但暂时无法在线校验：{reason}",
@@ -396,6 +411,7 @@ class QoderProvider(BaseProvider):
                     body={},
                 )
                 if claim_response.status_code in (401, 403):
+                    self._forget_job_token(config, pat)
                     return self._result(
                         CheckinStatus.AUTH_EXPIRED,
                         "Qoder CN 领取凭证已失效，请更新 PAT。",
@@ -412,6 +428,15 @@ class QoderProvider(BaseProvider):
                         started=started,
                         dry_run=dry_run,
                         raw_error_type="QoderSchemaError",
+                    )
+                if claim_response.status_code == 429:
+                    return self._result(
+                        CheckinStatus.FAILED,
+                        "Qoder CN 领取请求频率受限（HTTP 429），请稍后重试。",
+                        biz_date,
+                        started=started,
+                        dry_run=dry_run,
+                        raw_error_type="QoderRateLimit",
                     )
                 if not claim_response.is_success:
                     return self._result(
@@ -451,10 +476,19 @@ class QoderProvider(BaseProvider):
                         expiring_at=expiring_at,
                     ),
                 )
-        except httpx.HTTPError as exc:
+        except ValueError as exc:
+            return self._result(
+                CheckinStatus.UNAVAILABLE,
+                str(exc),
+                biz_date,
+                started=started,
+                dry_run=dry_run,
+                raw_error_type="InvalidConfig",
+            )
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             return self._result(
                 CheckinStatus.FAILED,
-                f"Qoder CN 网络请求失败：{exc}",
+                f"Qoder CN 网络请求失败：{type(exc).__name__}",
                 biz_date,
                 started=started,
                 dry_run=dry_run,
@@ -503,14 +537,24 @@ class QoderProvider(BaseProvider):
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None, str(path)
+        allowed_keys = set(env_names)
         for raw_line in text.splitlines():
-            line = raw_line.strip().strip('"').strip("'")
+            line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
             if "=" in line:
                 key, value = line.split("=", 1)
-                if key.strip() in PAT_ENV_NAMES:
+                normalized_key = key.strip()
+                if normalized_key.lower().startswith("export "):
+                    normalized_key = normalized_key[7:].strip()
+                if normalized_key in allowed_keys:
                     line = value.strip().strip('"').strip("'")
+                elif normalized_key.isidentifier():
+                    continue
+                else:
+                    line = line.strip('"').strip("'")
+            else:
+                line = line.strip('"').strip("'")
             if line:
                 return line, str(path)
         return None, str(path)
@@ -529,7 +573,10 @@ class QoderProvider(BaseProvider):
 
     @staticmethod
     def _base_url(config: ProviderConfig) -> str:
-        return str(config.extra.get("base_url") or QODER_CN_BASE_URL).rstrip("/")
+        raw = str(config.extra.get("base_url") or "").strip()
+        if not raw:
+            return QODER_CN_BASE_URL
+        return validate_provider_base_url(QoderProvider.id, raw)
 
     def _headers(self, token: str) -> dict[str, str]:
         return {
@@ -592,10 +639,7 @@ class QoderProvider(BaseProvider):
         cached = self._cached_job_token(config, pat)
         if cached:
             response, payload = await self._fetch_campaigns(client, config, cached)
-            # Rate limiting is not a token problem; reuse the answer. Other
-            # failures (expired token, changed endpoint, upstream 5xx) fall
-            # back to the PAT/exchange path.
-            if response.is_success or response.status_code == 429:
+            if response.is_success or response.status_code in (400, 404, 410, 429):
                 return response, payload, cached
             self._forget_job_token(config, pat)
 
@@ -618,7 +662,10 @@ class QoderProvider(BaseProvider):
         pat: str,
         emit: LogCallback,
     ) -> tuple[Optional[str], Optional[float]]:
-        path = str(config.extra.get("pat_exchange_path") or DEFAULT_EXCHANGE_PATH)
+        path = str(config.extra.get("pat_exchange_path") or DEFAULT_EXCHANGE_PATH).strip()
+        if not allow_custom_config():
+            if not path.startswith("/") or "://" in path or ".." in path or "\\" in path:
+                raise ValueError("Qoder PAT 兑换路径必须是以 / 开头的相对路径。")
         response, payload = await self._request(
             client,
             config,
@@ -698,27 +745,7 @@ class QoderProvider(BaseProvider):
 
     @staticmethod
     def _parse_time(value: Any) -> Optional[datetime]:
-        if isinstance(value, (int, float)):
-            return QoderProvider._epoch_to_datetime(float(value))
-        if not isinstance(value, str) or not value.strip():
-            return None
-        text = value.strip()
-        if text.isdigit():
-            return QoderProvider._epoch_to_datetime(float(text))
-        if text.endswith("Z"):
-            text = f"{text[:-1]}+00:00"
-        try:
-            moment = datetime.fromisoformat(text)
-        except ValueError:
-            return None
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        return moment
-
-    @staticmethod
-    def _epoch_to_datetime(value: float) -> datetime:
-        seconds = value / 1000.0 if value > 10_000_000_000 else value
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        return parse_timestamp(value)
 
     @staticmethod
     def _benefit_amount(

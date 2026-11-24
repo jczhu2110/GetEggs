@@ -168,7 +168,7 @@
             </div>
           </article>
 
-          <article class="metric-card metric-card-cobalt clickable" role="button" tabindex="0" data-goto-tab="settings" data-focus-section="schedule-panel" title="前往「工具与设置」管理计划任务">
+          <article class="metric-card metric-card-cobalt clickable" role="button" tabindex="0" aria-label="Windows 计划任务状态，点击前往设置管理计划任务" aria-describedby="metric-schedule metric-schedule-chip metric-schedule-sub" data-goto-tab="settings" data-focus-section="schedule-panel" title="前往「工具与设置」管理计划任务">
             <div class="metric-cobalt-top">
               <div class="metric-top">
                 <span class="metric-label">AUTOMATION · Windows 计划任务</span>
@@ -229,7 +229,7 @@
           </div>
           <div class="trend-chart-wrap">
             <div id="trend-mini-chart" class="trend-chart"></div>
-            <div id="trend-mini-tooltip" class="chart-tooltip" role="status" aria-hidden="true"></div>
+            <div id="trend-mini-tooltip" class="chart-tooltip" role="tooltip" aria-hidden="true"></div>
           </div>
         </div>
 
@@ -293,7 +293,7 @@
                 <path d="M8 12h8M12 8v8"/>
               </svg>
               <h3>127.0.0.1 严苛同源</h3>
-              <p>Web 服务仅绑定本机回环地址，启动一次性令牌校验配合 Origin 拦截，零外部遥测上报。</p>
+              <p>Web 服务仅绑定本机回环地址，本地启动令牌与 HttpOnly 会话校验配合严苛同源拦截，零外部遥测上报。</p>
             </div>
           </div>
         </section>
@@ -379,7 +379,7 @@
             </div>
             <div class="trend-chart-wrap">
               <div id="trend-chart" class="trend-chart"></div>
-              <div id="trend-tooltip" class="chart-tooltip" role="status" aria-hidden="true"></div>
+              <div id="trend-tooltip" class="chart-tooltip" role="tooltip" aria-hidden="true"></div>
             </div>
           </div>
           <div class="aux-cobalt-bottom">
@@ -409,8 +409,8 @@
         <div class="panel stack-gap">
           <div class="section-header">
             <div class="subtab-group" role="tablist" aria-label="历史日志分类">
-              <button type="button" class="subtab-btn active" role="tab" aria-selected="true" data-history-subtab="runs">最近执行记录</button>
-              <button type="button" class="subtab-btn" role="tab" aria-selected="false" data-history-subtab="notifications" tabindex="-1">通知发送审计</button>
+              <button type="button" id="subtab-btn-runs" class="subtab-btn active" role="tab" aria-selected="true" aria-controls="subtab-runs" data-history-subtab="runs">最近执行记录</button>
+              <button type="button" id="subtab-btn-notifications" class="subtab-btn" role="tab" aria-selected="false" aria-controls="subtab-notifications" data-history-subtab="notifications" tabindex="-1">通知发送审计</button>
             </div>
             <button id="btn-refresh-audit" type="button" class="btn btn-ghost btn-icon" title="刷新列表" aria-label="刷新当前列表">
               <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -420,7 +420,7 @@
             </button>
           </div>
 
-          <div id="subtab-runs" class="subtab-panel active">
+          <div id="subtab-runs" class="subtab-panel active" role="tabpanel" aria-labelledby="subtab-btn-runs">
             <div class="table-wrap">
               <table class="data-table">
                 <thead>
@@ -438,7 +438,7 @@
             </div>
           </div>
 
-          <div id="subtab-notifications" class="subtab-panel">
+          <div id="subtab-notifications" class="subtab-panel" role="tabpanel" aria-labelledby="subtab-btn-notifications">
             <div class="table-wrap">
               <table class="data-table">
                 <thead>
@@ -641,7 +641,7 @@
   </div>
 
   <!-- Floating non-blocking SSE live execution drawer -->
-  <aside id="live-drawer" class="live-drawer" aria-live="polite" hidden>
+  <aside id="live-drawer" class="live-drawer" aria-label="实时执行日志" hidden>
     <div class="live-drawer-header">
       <div class="live-drawer-title">
         <span id="live-drawer-dot" class="status-dot running"></span>
@@ -654,7 +654,7 @@
         <button type="button" id="btn-drawer-close" class="drawer-icon-btn" title="关闭" aria-label="关闭日志抽屉">×</button>
       </div>
     </div>
-    <pre id="live-drawer-log" class="live-drawer-log"></pre>
+    <pre id="live-drawer-log" class="live-drawer-log" role="log" aria-live="polite"></pre>
   </aside>
 
   <!-- Custom Confirmation Dialog -->

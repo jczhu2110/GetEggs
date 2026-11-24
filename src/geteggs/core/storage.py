@@ -75,6 +75,9 @@ CREATE INDEX IF NOT EXISTS idx_records_provider_date
 CREATE INDEX IF NOT EXISTS idx_records_biz_date
     ON checkin_records(biz_date);
 
+CREATE INDEX IF NOT EXISTS idx_records_run_id
+    ON checkin_records(run_id);
+
 CREATE INDEX IF NOT EXISTS idx_checkin_runs_started_at
     ON checkin_runs(started_at);
 
@@ -127,7 +130,6 @@ class Storage:
         conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             with conn:
                 yield conn
@@ -136,6 +138,7 @@ class Storage:
 
     def init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             conn.executescript(SCHEMA_SQL)
             self._drop_legacy_balance_column(conn)
             self._add_missing_provider_credit_column(conn)
@@ -220,7 +223,15 @@ class Storage:
             ).fetchone()
         if not row:
             return GlobalSettings()
-        return GlobalSettings.model_validate_json(row["value_json"])
+        raw_json = row["value_json"]
+        try:
+            return GlobalSettings.model_validate_json(raw_json)
+        except ValueError:
+            data = json.loads(raw_json)
+            if isinstance(data, dict) and "timezone" in data:
+                data["timezone"] = "Asia/Shanghai"
+                return GlobalSettings.model_validate(data)
+            raise
 
     def save_settings(self, settings: GlobalSettings) -> GlobalSettings:
         now = utc_now_iso()
@@ -380,10 +391,10 @@ class Storage:
         count = 0
         for row in rows:
             status = CheckinStatus(row["status"])
-            if status.is_done_for_today:
-                break
-            if status.requires_user_action or status == CheckinStatus.FAILED:
+            if status.requires_user_action:
                 count += 1
+            else:
+                break
         return count
 
     def get_latest_record(self, provider_id: str) -> Optional[dict[str, Any]]:
@@ -503,26 +514,35 @@ class Storage:
         provider_id: Optional[str] = None,
         month: Optional[str] = None,
         offset: int = 0,
+        biz_date: Optional[str] = None,
     ) -> dict[str, Any]:
-        clauses = ["dry_run = 0"]
-        params: list[Any] = []
+        base_clauses = ["dry_run = 0"]
+        base_params: list[Any] = []
         if provider_id:
-            clauses.append("provider_id = ?")
-            params.append(provider_id)
+            base_clauses.append("provider_id = ?")
+            base_params.append(provider_id)
         if month:
-            clauses.append("biz_date LIKE ?")
-            params.append(f"{month}%")
+            base_clauses.append("biz_date LIKE ?")
+            base_params.append(f"{month}%")
 
-        where_sql = " AND ".join(clauses)
+        record_clauses = list(base_clauses)
+        record_params = list(base_params)
+        if biz_date:
+            record_clauses.append("biz_date = ?")
+            record_params.append(biz_date)
+
+        base_where = " AND ".join(base_clauses)
+        record_where = " AND ".join(record_clauses)
+        safe_offset = max(0, offset)
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT * FROM checkin_records
-                WHERE {where_sql}
+                WHERE {record_where}
                 ORDER BY id DESC
                 LIMIT ? OFFSET ?
                 """,
-                (*params, limit, max(0, offset)),
+                (*record_params, limit + 1, safe_offset),
             ).fetchall()
 
             calendar_rows = conn.execute(
@@ -531,18 +551,21 @@ class Storage:
                        MAX(CASE WHEN status IN ('success', 'already_done') THEN 1 ELSE 0 END) AS ok,
                        SUM(delta) AS delta
                 FROM checkin_records
-                WHERE {where_sql}
+                WHERE {base_where}
                 GROUP BY biz_date
                 ORDER BY biz_date ASC
                 """,
-                tuple(params),
+                tuple(base_params),
             ).fetchall()
 
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
         return {
-            "records": [dict(r) for r in rows],
+            "records": [dict(r) for r in page_rows],
             "calendar": [dict(r) for r in calendar_rows],
-            "offset": max(0, offset),
+            "offset": safe_offset,
             "limit": limit,
+            "has_more": has_more,
         }
 
     # ---- Run history ----
@@ -713,7 +736,12 @@ class Storage:
             Path(f"{self.db_path}-wal"),
             Path(f"{self.db_path}-shm"),
         ]
-        db_size = sum(path.stat().st_size for path in size_paths if path.exists())
+        db_size = 0
+        for path in size_paths:
+            try:
+                db_size += path.stat().st_size
+            except OSError:
+                continue
         return {
             "db_path": str(self.db_path),
             "db_size": db_size,
@@ -730,9 +758,10 @@ class Storage:
         records_cutoff = (
             datetime.now(tz).date() - timedelta(days=settings.ledger_retention_days)
         ).strftime("%Y-%m-%d")
+        stale_minutes = max(120, settings.jitter_minutes * 3 + 60)
         return {
             "now": now_utc.isoformat(),
-            "stale": (now_utc - timedelta(hours=2)).isoformat(),
+            "stale": (now_utc - timedelta(minutes=stale_minutes)).isoformat(),
             "events": (
                 now_utc - timedelta(days=settings.run_events_retention_days)
             ).isoformat(),

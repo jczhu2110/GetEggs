@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import time
 from dataclasses import replace
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from geteggs.core.config import is_unc_path, validate_provider_base_url
 from geteggs.core.models import (
     DEFAULT_CHECKIN_CREDITS,
     MAX_CHECKIN_CREDITS,
@@ -145,9 +147,18 @@ class _StatusInfo:
         return None
 
 
+_TRAE_DISPLAY_RE = re.compile(r"(?<![A-Za-z])trae(?![A-Za-z])", re.IGNORECASE)
+_REGISTRY_CACHE: dict[str, Any] = {"locations": None, "expires_at": 0.0}
+_REGISTRY_CACHE_TTL_SECONDS = 60.0
+
+
 def _registry_install_locations() -> list[Path]:
     if os.name != "nt":
         return []
+    now = time.monotonic()
+    cached = _REGISTRY_CACHE.get("locations")
+    if cached is not None and now < float(_REGISTRY_CACHE.get("expires_at") or 0.0):
+        return list(cached)
     try:
         import winreg
     except ImportError:
@@ -176,7 +187,7 @@ def _registry_install_locations() -> list[Path]:
                                 )
                             except OSError:
                                 continue
-                            if "trae" not in display.lower():
+                            if not _TRAE_DISPLAY_RE.search(display):
                                 continue
                             try:
                                 location = str(
@@ -193,6 +204,8 @@ def _registry_install_locations() -> list[Path]:
                     winreg.CloseKey(base)
                 except OSError:
                     pass
+    _REGISTRY_CACHE["locations"] = list(locations)
+    _REGISTRY_CACHE["expires_at"] = time.monotonic() + _REGISTRY_CACHE_TTL_SECONDS
     return locations
 
 
@@ -230,12 +243,8 @@ class TraeProvider(BaseProvider):
     def detect_client_exe(self, config: ProviderConfig) -> Optional[str]:
         candidates: list[Path] = []
         custom = str(config.extra.get("client_exe_path") or "").strip()
-        if custom:
+        if custom and "\x00" not in custom and not is_unc_path(custom):
             candidates.append(Path(custom).expanduser())
-
-        for location in _registry_install_locations():
-            candidates.append(location / "Trae CN.exe")
-            candidates.append(location / "Trae.exe")
 
         local_app_data = os.environ.get("LOCALAPPDATA")
         program_files = os.environ.get("ProgramFiles")
@@ -260,10 +269,6 @@ class TraeProvider(BaseProvider):
                 Path(r"C:\Program Files\Trae CN\Trae CN.exe"),
             ]
         )
-        for command in ("trae-cn", "trae"):
-            found = shutil.which(command)
-            if found:
-                candidates.append(Path(found))
 
         seen: set[Path] = set()
         for candidate in candidates:
@@ -273,16 +278,36 @@ class TraeProvider(BaseProvider):
             seen.add(resolved)
             if resolved.is_file():
                 return str(resolved)
+
+        # Prefer real .exe installations from Windows Uninstall registry over PATH .cmd shims.
+        for location in _registry_install_locations():
+            for exe_name in ("Trae CN.exe", "Trae.exe"):
+                resolved = (location / exe_name).expanduser().resolve(strict=False)
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                if resolved.is_file():
+                    return str(resolved)
+
+        for command in ("trae-cn", "trae"):
+            found = shutil.which(command)
+            if found:
+                resolved = Path(found).expanduser().resolve(strict=False)
+                if resolved not in seen and resolved.is_file():
+                    return str(resolved)
         return None
 
-    def _client_version(self, config: ProviderConfig) -> str:
+    def _client_version(
+        self, config: ProviderConfig, *, exe: Optional[str] = None
+    ) -> str:
         configured = str(config.extra.get("app_version") or "").strip()
         if configured:
             return configured
-        try:
-            exe = self.detect_client_exe(config)
-        except Exception:  # noqa: BLE001
-            exe = None
+        if exe is None:
+            try:
+                exe = self.detect_client_exe(config)
+            except Exception:  # noqa: BLE001
+                exe = None
         if exe:
             product = Path(exe).parent / "resources" / "app" / "product.json"
             try:
@@ -295,11 +320,17 @@ class TraeProvider(BaseProvider):
         return DEFAULT_IDE_VERSION
 
     def _base_url(self, config: ProviderConfig, creds: TraeCredentials) -> str:
-        return (
-            _normalize_base_url(config.extra.get("base_url"))
-            or _normalize_base_url(creds.host)
-            or DEFAULT_BASE_URL
-        )
+        for raw in (config.extra.get("base_url"), creds.host):
+            normalized = _normalize_base_url(raw)
+            if not normalized:
+                continue
+            try:
+                validated = validate_provider_base_url(self.id, normalized)
+            except ValueError:
+                continue
+            if validated:
+                return validated
+        return DEFAULT_BASE_URL
 
     @staticmethod
     def _allow_token_refresh(config: ProviderConfig) -> bool:
@@ -317,7 +348,7 @@ class TraeProvider(BaseProvider):
 
         options = {
             "timeout": httpx.Timeout(20.0),
-            "follow_redirects": True,
+            "follow_redirects": False,
             "transport": self._transport,
         }
         try:
@@ -503,7 +534,10 @@ class TraeProvider(BaseProvider):
         )
         last_error = "续期失败"
         for client_id, platform_code in combinations:
-            proof, device_info = self._device_proof(creds, client_id, version)
+            try:
+                proof, device_info = self._device_proof(creds, client_id, version)
+            except TraeCredentialError as exc:
+                raise TraeRefreshError(str(exc)) from exc
             if platform_code != "IDE_PC":
                 device_info = self._device_info(creds, version, platform_code)
             body = {
@@ -559,8 +593,28 @@ class TraeProvider(BaseProvider):
             if code is not None:
                 last_error += f"，code={code}"
             last_error += "）"
-            raw = response.text or ""
-            if "10101" not in raw and "20403" not in raw:
+            meta = payload.get("ResponseMetadata") if isinstance(payload, dict) else None
+            meta_err = meta.get("Error") if isinstance(meta, dict) else None
+            result_obj = payload.get("Result") if isinstance(payload, dict) else None
+            candidate_codes = {
+                code,
+                _to_int(
+                    _root_first(
+                        payload,
+                        "Code",
+                        "errorCode",
+                        "ErrorCode",
+                        "error_code",
+                        "subCode",
+                        "SubCode",
+                    )
+                ),
+                _to_int(meta_err.get("CodeN")) if isinstance(meta_err, dict) else None,
+                _to_int(meta_err.get("Code")) if isinstance(meta_err, dict) else None,
+                _to_int(result_obj.get("Code")) if isinstance(result_obj, dict) else None,
+            }
+            retryable_codes = {10101, 20403}
+            if not (candidate_codes & retryable_codes):
                 break
         raise TraeRefreshError(last_error)
 
@@ -620,29 +674,33 @@ class TraeProvider(BaseProvider):
         version: str,
     ) -> tuple[Optional[_StatusInfo], str]:
         last_info: Optional[_StatusInfo] = None
+        last_status = "unconfirmed"
         for attempt in range(self._claim_verify_attempts):
             try:
                 response, payload = await self._status(
                     client, config, creds, version
                 )
             except Exception:  # noqa: BLE001
-                return None, "unavailable"
-            code = _parse_business_code(payload)
-            if not response.is_success or code not in (None, 0):
-                return None, "unavailable"
-            info = _StatusInfo(payload)
-            if info.schema_ok and info.checked_in:
-                return info, "confirmed"
-            if info.schema_ok and not info.checked_in:
-                last_info = info
+                last_status = "unavailable"
             else:
-                return None, "unavailable"
+                code = _parse_business_code(payload)
+                if not response.is_success or code not in (None, 0):
+                    last_status = "unavailable"
+                else:
+                    info = _StatusInfo(payload)
+                    if info.schema_ok and info.checked_in:
+                        return info, "confirmed"
+                    if info.schema_ok and not info.checked_in:
+                        last_info = info
+                        last_status = "unconfirmed"
+                    else:
+                        last_status = "unavailable"
             if (
                 attempt + 1 < self._claim_verify_attempts
                 and self._claim_verify_delay_seconds > 0
             ):
                 await asyncio.sleep(self._claim_verify_delay_seconds)
-        return last_info, "unconfirmed"
+        return last_info, last_status
 
     # ---- Doctor ----
 
@@ -743,7 +801,7 @@ class TraeProvider(BaseProvider):
                 verified=False,
             )
 
-        version = self._client_version(config)
+        version = self._client_version(config, exe=exe)
         details: dict[str, Any] = {"verified": False}
         message = "本地 Trae 登录态有效。"
         healthy = True
@@ -1209,14 +1267,19 @@ class TraeProvider(BaseProvider):
                     )
 
                 emit("info", "Trae 领取接口返回成功，正在二次确认到账状态...")
-                amount = _payload_amount(claim_payload) or info.reward_hint or config.checkin_credits
+                claim_amount = _payload_amount(claim_payload)
+                amount = claim_amount or info.reward_hint or config.checkin_credits
                 verify_info, verify_state = await self._verify_claim_status(
                     client, config, creds, version
                 )
                 verification_warning = ""
                 verify_error: Optional[str] = None
                 if verify_state == "confirmed":
-                    amount = (verify_info.reward_hint if verify_info else None) or amount
+                    amount = (
+                        claim_amount
+                        or (verify_info.reward_hint if verify_info else None)
+                        or amount
+                    )
                 elif verify_state == "unconfirmed":
                     verification_warning = "（状态暂未刷新，请稍后在 Trae 客户端确认）"
                     verify_error = "TraeClaimUnconfirmed"

@@ -19,10 +19,15 @@ const selectedProviders = new Set();
 const runningProviderIds = new Set();
 let selectionInitialized = false;
 let selectionMode = false;
+let overviewSeq = 0;
+let drawerCloseTimer = null;
+let runSessionSeq = 0;
+let historyProviderOptionsKey = "";
 let callbacks = {
   onRunComplete: () => {},
   onOpenToolConfig: () => {},
   onOpenHistory: () => {},
+  onAuthComplete: () => {},
 };
 
 const ACTION_NEEDED_STATUSES = new Set([
@@ -150,22 +155,42 @@ function setRunButtonsBusy(busy) {
     const button = $(selector);
     if (button) button.disabled = busy;
   });
-  $$("[data-run-provider], [data-dry-provider], [data-provider-select]").forEach(
+  $$("[data-run-provider], [data-dry-provider], [data-provider-select], [data-hero-action]").forEach(
     (button) => {
       button.disabled = busy;
     }
   );
 }
 
+function updateRunningCardPills() {
+  appState.providers.forEach((p) => {
+    const card = document.querySelector(
+      `[data-provider-card="${CSS.escape(p.provider_id)}"]`
+    );
+    const pillHost = card?.querySelector(".provider-head > .pill");
+    if (!pillHost) return;
+    const status = runningProviderIds.has(p.provider_id)
+      ? "running"
+      : p.today_record?.status;
+    pillHost.outerHTML = statusPill(status);
+  });
+}
+
 function finishRun(triggerButton, originalHtml) {
   appState.activeRun = false;
   appState.historyDirty = true;
   runningProviderIds.clear();
+  updateRunningCardPills();
   setRunButtonsBusy(false);
   if (triggerButton && triggerButton.isConnected && originalHtml !== undefined) {
     triggerButton.innerHTML = originalHtml;
   }
   updateSelectionUi();
+  updateAuxiaTelemetry(
+    appState.providers,
+    latestScheduleSnapshot,
+    $("#metric-today-delta")?.dataset?.numVal ?? 0
+  );
 }
 
 let scheduleMetricRequest = null;
@@ -343,8 +368,10 @@ function loadScheduleMetric() {
 }
 
 export async function loadOverview(silent = false) {
+  const seq = ++overviewSeq;
   try {
     const data = await apiFetch("/api/overview");
+    if (seq !== overviewSeq) return;
     if (
       silent &&
       document.body.dataset.tab === "overview" &&
@@ -358,6 +385,7 @@ export async function loadOverview(silent = false) {
     const providers = data.providers || [];
     appState.providers = providers;
     appState.trend30d = data.trend_30d || [];
+    appState.bizDate = data.biz_date || null;
 
     renderAlertStrip(providers);
 
@@ -426,8 +454,8 @@ export async function loadOverview(silent = false) {
           const expiring = todayRec?.expiring_soon ?? rec?.expiring_soon;
           const expiringAt = todayRec?.expiring_at ?? rec?.expiring_at;
           const expiryParts = [];
-          if (expiring !== null && expiring !== undefined) expiryParts.push(`${expiring} 积分`);
-          if (expiringAt) expiryParts.push(`${formatDateTime(expiringAt)} 到期`);
+          if (Number(expiring) > 0) expiryParts.push(`${expiring} 积分`);
+          if (expiringAt && Number(expiring) > 0) expiryParts.push(`${formatDateTime(expiringAt)} 到期`);
           const expiryHtml = expiryParts.length
             ? `<div class="provider-expiry-note">即将过期：${escapeHtml(expiryParts.join(" · "))}</div>`
             : "";
@@ -515,16 +543,22 @@ export async function loadOverview(silent = false) {
 
     const providerSelect = $("#history-provider");
     if (providerSelect) {
-      const current = providerSelect.value;
-      providerSelect.innerHTML =
-        `<option value="">全部工具</option>` +
-        providers
-          .map(
-            (p) =>
-              `<option value="${escapeHtml(p.provider_id)}">${escapeHtml(p.display_name)}</option>`
-          )
-          .join("");
-      providerSelect.value = current;
+      const nextKey = providers
+        .map((p) => `${p.provider_id}\u0000${p.display_name}`)
+        .join("\u0001");
+      if (nextKey !== historyProviderOptionsKey) {
+        historyProviderOptionsKey = nextKey;
+        const current = providerSelect.value;
+        providerSelect.innerHTML =
+          `<option value="">全部工具</option>` +
+          providers
+            .map(
+              (p) =>
+                `<option value="${escapeHtml(p.provider_id)}">${escapeHtml(p.display_name)}</option>`
+            )
+            .join("");
+        providerSelect.value = current;
+      }
     }
 
     renderMiniTrendChart(appState.trend30d);
@@ -548,6 +582,10 @@ function openLiveDrawer(title) {
   const heading = $("#live-drawer-heading");
   if (!drawer || !logBox) return;
 
+  if (drawerCloseTimer !== null) {
+    clearTimeout(drawerCloseTimer);
+    drawerCloseTimer = null;
+  }
   logBox.textContent = "";
   if (heading) heading.textContent = title;
   if (dot) dot.className = "status-dot running";
@@ -569,7 +607,11 @@ function closeLiveDrawer() {
   const drawer = $("#live-drawer");
   if (!drawer) return;
   drawer.classList.remove("open");
-  setTimeout(() => {
+  if (drawerCloseTimer !== null) {
+    clearTimeout(drawerCloseTimer);
+  }
+  drawerCloseTimer = setTimeout(() => {
+    drawerCloseTimer = null;
     if (!drawer.classList.contains("open")) drawer.hidden = true;
   }, 240);
 }
@@ -584,11 +626,12 @@ function appendLogLine(level, text) {
   container.scrollTop = container.scrollHeight;
 }
 
-async function showRunBusyHint() {
+async function showRunBusyHint(sessionId) {
   let hint =
     "另一个签到任务正在执行中（可能是计划任务或另一页面），为防重复领取已取消本次操作，请等待其完成后再试。";
   try {
     const data = await apiFetch("/api/runs?limit=5");
+    if (sessionId !== runSessionSeq) return;
     const running = (data.runs || []).find((item) => item.status === "running");
     if (running) {
       const label = RUN_TRIGGER_LABELS[running.trigger_type] || "签到任务";
@@ -606,6 +649,7 @@ async function showRunBusyHint() {
   } catch {
     // 接口不可用时保留兜底提示
   }
+  if (sessionId !== runSessionSeq) return;
   appendLogLine("warning", `[提示] ${hint}`);
   showBanner(hint, true);
 }
@@ -626,6 +670,7 @@ async function triggerRun(providerIds = null, dryRun = false, triggerButton = nu
     return;
   }
 
+  const sessionId = ++runSessionSeq;
   appState.activeRun = true;
   const originalHtml = triggerButton?.innerHTML;
   if (triggerButton) {
@@ -635,6 +680,7 @@ async function triggerRun(providerIds = null, dryRun = false, triggerButton = nu
     ? ids
     : appState.providers.filter((p) => p.enabled).map((p) => p.provider_id);
   activeTargets.forEach((id) => runningProviderIds.add(id));
+  updateRunningCardPills();
   setRunButtonsBusy(true);
   updateAuxiaTelemetry(appState.providers, latestScheduleSnapshot, $("#metric-today-delta")?.dataset?.numVal ?? 0);
 
@@ -692,7 +738,7 @@ async function triggerRun(providerIds = null, dryRun = false, triggerButton = nu
       if (serverMessage) {
         appendLogLine("error", `[错误] ${serverMessage}`);
         if (runBusy) {
-          void showRunBusyHint();
+          void showRunBusyHint(sessionId);
         } else {
           showBanner(serverMessage, true);
         }
@@ -731,10 +777,12 @@ export async function authBrowser(providerId, triggerButton = null) {
   }
 
   appState.authBusy = true;
-  const buttons = $$("[data-auth-browser]");
-  buttons.forEach((button) => {
-    button.disabled = true;
-  });
+  const setAuthButtonsDisabled = (disabled) => {
+    $$("[data-auth-browser]").forEach((button) => {
+      button.disabled = disabled;
+    });
+  };
+  setAuthButtonsDisabled(true);
   const originalText = triggerButton?.textContent;
   if (triggerButton) {
     triggerButton.textContent = "等待登录...";
@@ -747,18 +795,29 @@ export async function authBrowser(providerId, triggerButton = null) {
     if (start.status === "success") {
       showBanner(start.message);
       loadOverview();
+      callbacks.onAuthComplete(providerId);
       return;
     }
 
     const deadline = Date.now() + 200000;
+    let consecutiveErrors = 0;
     while (Date.now() < deadline) {
       await sleep(2000);
-      const status = await apiFetch(
-        `/api/providers/${encodeURIComponent(providerId)}/auth-browser/status`
-      );
+      let status;
+      try {
+        status = await apiFetch(
+          `/api/providers/${encodeURIComponent(providerId)}/auth-browser/status`
+        );
+        consecutiveErrors = 0;
+      } catch (pollErr) {
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 3) throw pollErr;
+        continue;
+      }
       if (status.status === "success") {
         showBanner(status.message);
         loadOverview();
+        callbacks.onAuthComplete(providerId);
         return;
       }
       if (status.status === "error" || status.status === "idle") {
@@ -770,9 +829,7 @@ export async function authBrowser(providerId, triggerButton = null) {
     showBanner(err.message, true);
   } finally {
     appState.authBusy = false;
-    buttons.forEach((button) => {
-      button.disabled = false;
-    });
+    setAuthButtonsDisabled(false);
     if (triggerButton && triggerButton.isConnected) {
       triggerButton.textContent = originalText;
     }

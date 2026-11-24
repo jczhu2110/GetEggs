@@ -17,6 +17,7 @@ def acquire_run_lock(lock_path: Path) -> Iterator[None]:
     """Acquire an exclusive non-blocking process lock on `lock_path`."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, "a+", encoding="utf-8")
+    locked = False
     try:
         if os.name == "nt":
             import msvcrt
@@ -24,6 +25,7 @@ def acquire_run_lock(lock_path: Path) -> Iterator[None]:
             try:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
             except OSError as exc:
                 raise RunLockBusyError("另一个签到任务正在执行中，请稍后再试。") from exc
         else:
@@ -31,6 +33,7 @@ def acquire_run_lock(lock_path: Path) -> Iterator[None]:
 
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
             except OSError as exc:
                 raise RunLockBusyError("另一个签到任务正在执行中，请稍后再试。") from exc
 
@@ -40,16 +43,63 @@ def acquire_run_lock(lock_path: Path) -> Iterator[None]:
         handle.flush()
         yield
     finally:
-        try:
-            if os.name == "nt":
-                import msvcrt
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
 
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def is_lock_busy(lock_path: Path) -> bool:
+    """Non-destructively probe whether another process holds `lock_path`."""
+    if not lock_path.exists():
+        return False
+    try:
+        handle = open(lock_path, "r+", encoding="utf-8")
+    except OSError:
+        return False
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
+                return False
+            except OSError:
+                return True
+        else:
+            import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                return False
+            except OSError:
+                return True
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
         handle.close()

@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 from abc import ABC, abstractmethod
-from datetime import datetime
-from typing import Any, Callable, Optional
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from geteggs.core.config import business_date as resolve_business_date
+if TYPE_CHECKING:
+    import httpx
+
+from geteggs.core.config import (
+    business_date as resolve_business_date,
+    validate_local_file_path,
+)
 from geteggs.core.models import (
     CheckinResult,
     DoctorResult,
@@ -38,6 +45,41 @@ def extract_first(data: dict[str, Any], *keys: str) -> Any:
             if key in src and src[key] is not None:
                 return src[key]
     return None
+
+
+def parse_timestamp(value: Any) -> Optional[datetime]:
+    """Parse an epoch (seconds/milliseconds) or ISO-8601 timestamp safely into UTC."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            ts = float(value)
+        except OverflowError:
+            return None
+        if not math.isfinite(ts):
+            return None
+        if abs(ts) > 10_000_000_000:
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isascii() and text.isdigit():
+        return parse_timestamp(float(text))
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 class BaseProvider(ABC):
@@ -77,7 +119,8 @@ class BaseProvider(ABC):
         now: Optional[datetime] = None,
     ) -> str:
         """Return the current business date using the provider's daily reset time."""
-        return resolve_business_date(config.business_day_start, tz_name, now)
+        start = self.fixed_business_day_start or config.business_day_start
+        return resolve_business_date(start, tz_name, now)
 
     def launch_client(self, config: ProviderConfig) -> tuple[bool, str]:
         """Launch the official desktop client for manual login or interaction."""
@@ -85,7 +128,19 @@ class BaseProvider(ABC):
         if not exe:
             return False, f"未在本机找到 {self.display_name} 客户端可执行文件，请在设置中手动指定路径。"
         try:
-            kwargs: dict[str, Any] = {}
+            exe = validate_local_file_path(
+                exe,
+                field_label="客户端可执行文件路径",
+                require_exe_on_windows=True,
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        try:
+            kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
             if os.name == "nt":
                 kwargs["creationflags"] = (
                     getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
@@ -104,15 +159,19 @@ class BaseProvider(ABC):
     def build_http_client(
         transport: Optional[httpx.AsyncBaseTransport] = None,
         timeout: float = 15.0,
-        cookies: Optional[dict[str, str]] = None,
+        cookies: Optional[Any] = None,
     ) -> httpx.AsyncClient:
-        """Create a configured async HTTP client."""
+        """Create a configured async HTTP client with malformed-proxy fallback."""
         import httpx
 
-        return httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=True,
-            transport=transport,
-            cookies=cookies,
-            headers={"Accept": "application/json"},
-        )
+        options: dict[str, Any] = {
+            "timeout": httpx.Timeout(timeout),
+            "follow_redirects": False,
+            "transport": transport,
+            "cookies": cookies,
+            "headers": {"Accept": "application/json"},
+        }
+        try:
+            return httpx.AsyncClient(**options)
+        except (ValueError, ImportError, httpx.InvalidURL):
+            return httpx.AsyncClient(trust_env=False, **options)

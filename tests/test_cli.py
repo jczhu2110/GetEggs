@@ -244,15 +244,28 @@ def test_install_schedule_timeout_checks_existing_task(monkeypatch) -> None:
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
 def test_install_schedule_requests_elevation_when_not_admin(monkeypatch) -> None:
+    import base64
+
     monkeypatch.setattr(windows, "_is_elevated", lambda: False)
     monkeypatch.setattr(windows, "_probe_package_import", lambda *args: (True, ""))
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
+
+    def _extract_b64_var(script: str, var_name: str) -> str:
+        match = re.search(
+            rf"\${var_name}\s*=\s*\[System\.Text\.Encoding\]::UTF8\.GetString\(\[System\.Convert\]::FromBase64String\('([^']+)'\)\)",
+            script,
+        )
+        assert match, script
+        return base64.b64decode(match.group(1)).decode("utf-8")
 
     def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
         captured["script"] = script
-        match = re.search(r"--result-file','([^']+)'", script)
-        assert match, script
-        Path(match.group(1)).write_text(
+        result_file = Path(_extract_b64_var(script, "resultFile"))
+        params_file = Path(_extract_b64_var(script, "paramsFile"))
+        captured["result_file"] = result_file
+        captured["params_file"] = params_file
+        captured["params"] = json.loads(params_file.read_text(encoding="utf-8"))
+        result_file.write_text(
             json.dumps({"ok": True, "message": "提权安装成功"}, ensure_ascii=False),
             encoding="utf-8",
         )
@@ -260,14 +273,152 @@ def test_install_schedule_requests_elevation_when_not_admin(monkeypatch) -> None
 
     monkeypatch.setattr(windows, "_run_ps", fake_ps)
 
-    ok, message = windows.install_schedule("10:15")
+    ok, message = windows.install_schedule(
+        "08:30", catchup_on_logon=False, timeout_minutes=45
+    )
 
     assert ok is True
     assert message == "提权安装成功"
-    assert "-Verb RunAs" in captured["script"]
-    assert "--no-elevate" in captured["script"]
-    match = re.search(r"--result-file','([^']+)'", captured["script"])
-    assert match and not Path(match.group(1)).exists()
+    script_text = str(captured["script"])
+    assert "-Verb RunAs" in script_text
+    assert "--no-elevate" in script_text
+    assert "--params-file" in script_text
+    assert captured["params"]["schedule_time"] == "08:30"
+    assert captured["params"]["catchup_on_logon"] is False
+    assert captured["params"]["timeout_minutes"] == 45
+    assert not Path(captured["result_file"]).exists()
+    assert not Path(captured["params_file"]).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_install_schedule_encodes_unicode_quote_paths_safely(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(windows, "_is_elevated", lambda: True)
+    monkeypatch.setattr(windows, "_probe_package_import", lambda *args: (True, ""))
+    captured: dict[str, str] = {}
+
+    def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
+        captured["script"] = script
+        return 0, "OK", ""
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+    tricky_dir = tmp_path / "O\u2019Connor; Write-Output PWN"
+    ok, _ = windows.install_schedule("10:15", working_dir=tricky_dir, elevate=False)
+
+    assert ok is True
+    assert "\u2019" not in captured["script"]
+    assert "Write-Output PWN" not in captured["script"]
+    assert "-AtLogOn -User $userId" in captured["script"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_uninstall_schedule_stops_on_error_and_elevates_on_access_denied(
+    monkeypatch,
+) -> None:
+    import base64
+
+    monkeypatch.setattr(windows, "_is_elevated", lambda: False)
+    scripts: list[str] = []
+
+    def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
+        scripts.append(script)
+        if len(scripts) == 1:
+            return 1, "", "Access is denied."
+        match = re.search(
+            r"\$resultFile\s*=\s*\[System\.Text\.Encoding\]::UTF8\.GetString\(\[System\.Convert\]::FromBase64String\('([^']+)'\)\)",
+            script,
+        )
+        assert match, script
+        res_path = Path(base64.b64decode(match.group(1)).decode("utf-8"))
+        res_path.write_text(
+            json.dumps({"ok": True, "message": "提权卸载成功"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return 0, "", ""
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+
+    ok, message = windows.uninstall_schedule()
+
+    assert ok is True
+    assert message == "提权卸载成功"
+    assert len(scripts) == 2
+    assert "$ErrorActionPreference = 'Stop'" in scripts[0]
+    assert "-ErrorAction Stop" in scripts[0]
+    assert "-Verb RunAs" in scripts[1]
+
+
+def test_schedule_install_reads_params_file(tmp_path: Path, monkeypatch) -> None:
+    params_path = tmp_path / "params.json"
+    result_path = tmp_path / "result.json"
+    params_path.write_text(
+        json.dumps(
+            {
+                "schedule_time": "07:45",
+                "catchup_on_logon": False,
+                "working_dir": str(tmp_path),
+                "timeout_minutes": 55,
+                "target_user": "PC\\Alice",
+            }
+        ),
+        encoding="utf-8",
+    )
+    received: dict[str, object] = {}
+
+    def fake_install(schedule_time, **kwargs):
+        received["schedule_time"] = schedule_time
+        received.update(kwargs)
+        return True, "installed from params"
+
+    monkeypatch.setattr("geteggs.cli.install_schedule", fake_install)
+    result = runner.invoke(
+        cli.app,
+        [
+            "schedule",
+            "install",
+            "--no-elevate",
+            "--params-file",
+            str(params_path),
+            "--result-file",
+            str(result_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert received["schedule_time"] == "07:45"
+    assert received["catchup_on_logon"] is False
+    assert received["timeout_minutes"] == 55
+    assert received["target_user"] == "PC\\Alice"
+    assert json.loads(result_path.read_text(encoding="utf-8"))["ok"] is True
+
+
+def test_windows_toast_powershell_passes_text_via_env_vars(monkeypatch) -> None:
+    from geteggs.notifiers import windows_toast
+
+    captured: dict[str, object] = {}
+
+    class Proc:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env") or {}
+        return Proc()
+
+    monkeypatch.setattr(windows_toast.subprocess, "run", fake_run)
+    payload_msg = "error\u2019; Start-Process calc #\x00\x07"
+    ok, err = windows_toast._send_via_powershell("标题\u2019", payload_msg)
+
+    assert ok is True
+    assert err is None
+    script = captured["cmd"][-1]
+    assert "\u2019" not in script
+    assert "Start-Process" not in script
+    assert captured["env"]["GETEGGS_TOAST_TITLE"] == "标题\u2019"
+    assert captured["env"]["GETEGGS_TOAST_MSG"] == "error\u2019; Start-Process calc #"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
@@ -448,7 +599,7 @@ def test_splash_server_serves_loading_and_ready(
     server, url = launcher.start_splash_server(state)
     try:
         base = url.split("/loading", 1)[0]
-        with httpx.Client(timeout=5) as client:
+        with httpx.Client(timeout=5, trust_env=False) as client:
             loading = client.get(url)
             assert loading.status_code == 200
             assert "GetEggs 正在启动" in loading.text
@@ -630,3 +781,119 @@ def test_ui_quiet_does_not_print_token(tmp_path: Path, monkeypatch) -> None:
     assert result.exit_code == 0
     assert "已在运行" in result.output
     assert "token=secret" not in result.output
+
+
+def test_cli_unknown_provider_exits_cleanly() -> None:
+    doc = runner.invoke(cli.app, ["doctor", "--provider", "nonexistent"])
+    assert doc.exit_code == 1
+    assert "未知的插件" in doc.output
+
+    auth = runner.invoke(cli.app, ["auth", "nonexistent"])
+    assert auth.exit_code == 1
+    assert "未知的插件" in auth.output
+
+
+def test_cli_run_escapes_rich_markup_in_event_messages(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from geteggs.core.models import CheckinResult, CheckinStatus, LogEvent, RunSummary, TriggerType
+
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+
+    async def fake_run(self, **kwargs):
+        sink = kwargs.get("event_sink")
+        if sink:
+            sink(LogEvent(level="error", provider_id="workbuddy", message="raw [/red][bold] payload"))
+        return RunSummary(
+            run_id="r1",
+            trigger_type=TriggerType.MANUAL_CLI,
+            started_at="2026-11-24T00:00:00+00:00",
+            finished_at="2026-11-24T00:00:01+00:00",
+            results=[
+                CheckinResult(
+                    provider_id="workbuddy",
+                    display_name="WorkBuddy",
+                    status=CheckinStatus.SUCCESS,
+                    message="ok",
+                    biz_date="2026-11-24",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(cli.CheckinRunner, "run", fake_run)
+    res = runner.invoke(cli.app, ["run", "--dry-run"])
+    assert res.exit_code == 0
+    assert "[/red][bold]" in res.output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_get_schedule_status_query_failed_and_267008_healthy(monkeypatch) -> None:
+    monkeypatch.setattr(windows, "_task_missing_fast", lambda: None)
+
+    # Non-JSON / empty stdout on rc=0 must report query_failed rather than "not installed".
+    monkeypatch.setattr(windows, "_run_ps", lambda script, timeout=15: (0, "not json", ""))
+    bad = windows.get_schedule_status()
+    assert bad["installed"] is False
+    assert bad["query_failed"] is True
+
+    # SCHED_S_TASK_READY (267008) must be treated as healthy.
+    payload = json.dumps(
+        {
+            "installed": True,
+            "state": "Ready",
+            "next_run_time": "2026-11-25T09:00:00+08:00",
+            "last_run_time": None,
+            "last_task_result": 267008,
+        }
+    )
+    monkeypatch.setattr(windows, "_run_ps", lambda script, timeout=15: (0, payload, ""))
+    ready = windows.get_schedule_status()
+    assert ready["installed"] is True
+    assert not ready.get("query_failed")
+    assert "已安装并就绪" in ready["message"]
+
+
+def test_schedule_install_invalid_params_file_and_invalid_time_fail_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    bad_params = tmp_path / "missing_params.json"
+    result_file = tmp_path / "result.json"
+
+    res = runner.invoke(
+        cli.app,
+        [
+            "schedule",
+            "install",
+            "--no-elevate",
+            "--params-file",
+            str(bad_params),
+            "--result-file",
+            str(result_file),
+        ],
+    )
+    assert res.exit_code == 1
+    assert result_file.is_file()
+    payload = json.loads(result_file.read_text(encoding="utf-8"))
+    assert payload["ok"] is False
+
+    bad_time = runner.invoke(cli.app, ["schedule", "install", "--time", "99:99"])
+    assert bad_time.exit_code == 1
+    assert "定时时间格式无效" in bad_time.output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
+def test_uninstall_schedule_script_propagates_access_denied(monkeypatch) -> None:
+    captured: list[str] = []
+
+    def fake_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
+        captured.append(script)
+        return 0, "OK", ""
+
+    monkeypatch.setattr(windows, "_run_ps", fake_ps)
+    ok, _ = windows.uninstall_schedule(elevate=False)
+    assert ok is True
+    assert captured
+    assert "-ErrorAction SilentlyContinue" not in captured[0]
+    assert "Get-ScheduledTask -TaskName $taskName -ErrorAction Stop" in captured[0]
+    assert "NotFound|ObjectNotFound" in captured[0]

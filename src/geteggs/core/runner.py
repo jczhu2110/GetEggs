@@ -377,11 +377,17 @@ class CheckinRunner:
                             dry_run=dry_run,
                             raw_error_type=type(exc).__name__,
                         )
-                        self.storage.save_checkin_result(actual_run_id, result)
+                        try:
+                            self.storage.save_checkin_result(actual_run_id, result)
+                        except Exception:  # noqa: BLE001
+                            pass
                         results.append(result)
                         emit("error", result.message, provider.id)
 
-                self._notify_for_results(results, biz_date, notify=notify, dry_run=dry_run)
+                notify_biz_date = today_biz_date(settings.timezone)
+                self._notify_for_results(
+                    results, notify_biz_date, notify=notify, dry_run=dry_run
+                )
                 self.storage.record_run_finish(actual_run_id, "completed")
                 if not dry_run:
                     self._maybe_run_maintenance(settings, emit)

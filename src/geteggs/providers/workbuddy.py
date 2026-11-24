@@ -9,8 +9,15 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
+if TYPE_CHECKING:
+    import httpx
+
+from geteggs.core.config import (
+    is_unc_path,
+    validate_provider_base_url,
+)
 from geteggs.core.models import (
     DEFAULT_CHECKIN_CREDITS,
     MAX_CHECKIN_CREDITS,
@@ -20,7 +27,13 @@ from geteggs.core.models import (
     DoctorResult,
     ProviderConfig,
 )
-from geteggs.providers.base import BaseProvider, LogCallback, extract_first, mask_secret
+from geteggs.providers.base import (
+    BaseProvider,
+    LogCallback,
+    extract_first,
+    mask_secret,
+    parse_timestamp,
+)
 from geteggs.providers.workbuddy_browser import (
     browser_checkin_session,
     get_browser_state_path,
@@ -47,6 +60,7 @@ class WorkBuddyCredentials:
     is_expired: bool = False
     source_path: Optional[str] = None
     cookies: Optional[dict[str, str]] = None
+    cookie_entries: Optional[list[dict[str, Any]]] = None
 
 
 class CredentialFormatError(ValueError):
@@ -66,11 +80,22 @@ class CredentialFormatError(ValueError):
         self.domain = domain
 
 
+def _safe_custom_path(raw: Any) -> Optional[Path]:
+    if not raw:
+        return None
+    cleaned = str(raw).strip()
+    if not cleaned or "\x00" in cleaned or is_unc_path(cleaned):
+        return None
+    return Path(cleaned).expanduser()
+
+
 def _candidate_auth_paths(config: ProviderConfig) -> list[Path]:
     candidates: list[Path] = []
-    custom = config.extra.get("auth_file_path") or os.environ.get("GETEGGS_WORKBUDDY_AUTH_FILE")
-    if custom:
-        candidates.append(Path(str(custom)).expanduser())
+    custom = _safe_custom_path(
+        config.extra.get("auth_file_path") or os.environ.get("GETEGGS_WORKBUDDY_AUTH_FILE")
+    )
+    if custom is not None:
+        candidates.append(custom)
 
     local_app_data = os.environ.get("LOCALAPPDATA")
     app_data = os.environ.get("APPDATA")
@@ -110,9 +135,9 @@ def _candidate_auth_paths(config: ProviderConfig) -> list[Path]:
 
 def _candidate_exe_paths(config: ProviderConfig) -> list[Path]:
     candidates: list[Path] = []
-    custom = config.extra.get("client_exe_path")
-    if custom:
-        candidates.append(Path(str(custom)).expanduser())
+    custom = _safe_custom_path(config.extra.get("client_exe_path"))
+    if custom is not None:
+        candidates.append(custom)
 
     local_app_data = os.environ.get("LOCALAPPDATA")
     program_files = os.environ.get("ProgramFiles")
@@ -150,28 +175,14 @@ def _normalize_base_url(raw: Optional[str]) -> Optional[str]:
 
 
 def _parse_expiry(raw_exp: Any) -> tuple[Optional[str], bool]:
-    if raw_exp is None:
+    if raw_exp is None or isinstance(raw_exp, bool):
         return None, False
-    try:
-        if isinstance(raw_exp, (int, float)):
-            # Heuristic: >= 1e12 is milliseconds
-            ts = raw_exp / 1000.0 if raw_exp >= 1e12 else float(raw_exp)
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        elif isinstance(raw_exp, str) and raw_exp.strip():
-            text = raw_exp.strip()
-            if text.isdigit():
-                num = int(text)
-                ts = num / 1000.0 if num >= 1e12 else float(num)
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            else:
-                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            return None, False
+    dt = parse_timestamp(raw_exp)
+    if dt is not None:
         return dt.isoformat(), dt <= datetime.now(timezone.utc)
-    except (ValueError, OverflowError, OSError):
-        return str(raw_exp), False
+    if isinstance(raw_exp, str) and raw_exp.strip():
+        return raw_exp.strip(), False
+    return None, False
 
 
 def _select_credential_dict(payload: Any) -> dict[str, Any]:
@@ -227,9 +238,11 @@ def _extract_metadata(obj: dict[str, Any]) -> tuple[Optional[str], Optional[str]
 def parse_auth_file(path: Path) -> WorkBuddyCredentials:
     """Parse WorkBuddy `.info` session JSON defensively without exposing secrets."""
     try:
+        if path.stat().st_size > 2_000_000:
+            raise CredentialFormatError("登录态文件体积异常过大，已跳过读取。")
         raw_text = path.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        raise CredentialFormatError(f"无法读取登录态文件：{exc}") from exc
+        raise CredentialFormatError(f"无法读取登录态文件：{type(exc).__name__}") from exc
 
     if not raw_text:
         raise CredentialFormatError("登录态文件为空，请先在 WorkBuddy 客户端中登录账号。")
@@ -358,9 +371,42 @@ class WorkBuddyProvider(BaseProvider):
             *DEFAULT_BASE_URLS,
         ):
             normalized = _normalize_base_url(raw)
-            if normalized and normalized not in urls:
-                urls.append(normalized)
-        return urls
+            if not normalized:
+                continue
+            try:
+                validated = validate_provider_base_url(self.id, normalized)
+            except ValueError:
+                continue
+            if validated and validated not in urls:
+                urls.append(validated)
+        return urls or list(DEFAULT_BASE_URLS)
+
+    @staticmethod
+    def _build_cookie_jar(
+        creds: WorkBuddyCredentials, fallback_url: str
+    ) -> Optional[Any]:
+        import httpx
+        from urllib.parse import urlparse
+
+        if creds.cookie_entries:
+            jar = httpx.Cookies()
+            for entry in creds.cookie_entries:
+                name = entry.get("name")
+                value = entry.get("value")
+                domain = entry.get("domain")
+                path = entry.get("path") or "/"
+                if name and isinstance(value, str) and domain:
+                    jar.set(str(name), value, domain=str(domain), path=str(path))
+            return jar
+        if creds.cookies:
+            host = (urlparse(fallback_url).hostname or "").lower()
+            if not host:
+                return None
+            jar = httpx.Cookies()
+            for name, value in creds.cookies.items():
+                jar.set(str(name), value, domain=host, path="/")
+            return jar
+        return None
 
     def _build_headers(self, creds: WorkBuddyCredentials, base_url: str) -> dict[str, str]:
         domain_host = creds.domain or base_url.replace("https://", "").replace("http://", "").split("/")[0]
@@ -395,19 +441,31 @@ class WorkBuddyProvider(BaseProvider):
             is_expired=is_exp,
             source_path=str(state_path),
             cookies=parsed.get("cookies") or None,
+            cookie_entries=parsed.get("cookie_entries") or None,
         )
 
     async def authorize_browser(self, config: ProviderConfig) -> tuple[bool, str]:
         state_path = get_browser_state_path(config)
-        base_url = _normalize_base_url(config.extra.get("base_url"))
+        base_url: Optional[str] = None
+        raw_base = _normalize_base_url(config.extra.get("base_url"))
+        if raw_base:
+            try:
+                base_url = validate_provider_base_url(self.id, raw_base)
+            except ValueError as exc:
+                return False, str(exc)
         if not base_url:
             auth_path = self.find_auth_file(config)
             if auth_path:
                 try:
                     creds = parse_auth_file(auth_path)
-                    base_url = _normalize_base_url(creds.domain)
+                    candidate = _normalize_base_url(creds.domain)
                 except CredentialFormatError as exc:
-                    base_url = _normalize_base_url(exc.domain)
+                    candidate = _normalize_base_url(exc.domain)
+                if candidate:
+                    try:
+                        base_url = validate_provider_base_url(self.id, candidate)
+                    except ValueError:
+                        base_url = None
         base_url = base_url or DEFAULT_BASE_URLS[0]
         return await self._browser_auth_fn(
             state_path,
@@ -553,7 +611,7 @@ class WorkBuddyProvider(BaseProvider):
                 if log:
                     log("info", "会话令牌已在内存中刷新成功。")
                 return True
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError):
             return False
         return False
 
@@ -589,9 +647,9 @@ class WorkBuddyProvider(BaseProvider):
             ):
                 try:
                     resp = await self._post_api(client, creds, base_url, endpoint)
-                except httpx.HTTPError as exc:
+                except (httpx.HTTPError, httpx.InvalidURL) as exc:
                     if log:
-                        log("warning", f"请求 {base_url}{endpoint} 网络异常：{exc}")
+                        log("warning", f"请求 {base_url}{endpoint} 网络异常：{type(exc).__name__}")
                     last_url = base_url
                     continue
                 last_status = resp.status_code
@@ -699,6 +757,28 @@ class WorkBuddyProvider(BaseProvider):
                 raw_error_type=f"HTTP_{status_code}",
             )
 
+        if status_code in (404, 410):
+            return CheckinResult(
+                provider_id=self.id,
+                display_name=self.display_name,
+                status=CheckinStatus.SCHEMA_CHANGED,
+                message=f"WorkBuddy 签到接口不可用（HTTP {status_code}），接口可能已改版。",
+                biz_date=biz_date,
+                duration_ms=duration_ms,
+                raw_error_type=f"HTTP_{status_code}",
+            )
+
+        if not (200 <= status_code < 300):
+            return CheckinResult(
+                provider_id=self.id,
+                display_name=self.display_name,
+                status=CheckinStatus.FAILED,
+                message=f"WorkBuddy 签到接口返回异常状态（HTTP {status_code}）。",
+                biz_date=biz_date,
+                duration_ms=duration_ms,
+                raw_error_type=f"HTTP_{status_code}",
+            )
+
         if not isinstance(body, dict):
             return CheckinResult(
                 provider_id=self.id,
@@ -710,7 +790,8 @@ class WorkBuddyProvider(BaseProvider):
                 raw_error_type="UnexpectedPayloadType",
             )
 
-        code = body.get("code")
+        raw_code = body.get("code")
+        code = _to_int(raw_code)
         msg_text = str(body.get("message") or body.get("msg") or "")
         low_msg = msg_text.lower()
         reward = _to_int(
@@ -735,7 +816,7 @@ class WorkBuddyProvider(BaseProvider):
             or any(marker in msg_text for marker in ("已签到", "今日已签", "重复"))
             or ("已领取" in msg_text and not success_hint)
         )
-        if already_hint and (code == 10001 or reward is None):
+        if already_hint and (code == 10001 or reward is None or reward <= 0):
             return CheckinResult(
                 provider_id=self.id,
                 display_name=self.display_name,
@@ -746,25 +827,36 @@ class WorkBuddyProvider(BaseProvider):
                 duration_ms=duration_ms,
             )
 
-        if code is not None and code != 0:
+        if raw_code is not None and code != 0:
             if any(word in low_msg or word in msg_text for word in ("captcha", "verify", "风控", "验证")):
                 return CheckinResult(
                     provider_id=self.id,
                     display_name=self.display_name,
                     status=CheckinStatus.NEEDS_MANUAL,
-                    message=f"触发人工校验或风控提示（{msg_text or f'code={code}'}），请打开 WorkBuddy 手动处理。",
+                    message=f"触发人工校验或风控提示（{msg_text or f'code={raw_code}'}），请打开 WorkBuddy 手动处理。",
                     biz_date=biz_date,
                     duration_ms=duration_ms,
-                    raw_error_type=f"Code_{code}",
+                    raw_error_type=f"Code_{raw_code}",
                 )
             return CheckinResult(
                 provider_id=self.id,
                 display_name=self.display_name,
                 status=CheckinStatus.FAILED,
-                message=f"签到返回异常：code={code}, msg={msg_text or '未知错误'}",
+                message=f"签到返回异常：code={raw_code}, msg={msg_text or '未知错误'}",
                 biz_date=biz_date,
                 duration_ms=duration_ms,
-                raw_error_type=f"Code_{code}",
+                raw_error_type=f"Code_{raw_code}",
+            )
+
+        if raw_code is None and reward is None and not success_hint:
+            return CheckinResult(
+                provider_id=self.id,
+                display_name=self.display_name,
+                status=CheckinStatus.SCHEMA_CHANGED,
+                message="WorkBuddy 签到接口响应缺少状态码与奖励字段，接口可能已改版。",
+                biz_date=biz_date,
+                duration_ms=duration_ms,
+                raw_error_type="UnknownCheckinResponse",
             )
 
         delta = reward if reward is not None else default_credits
@@ -1065,7 +1157,7 @@ class WorkBuddyProvider(BaseProvider):
 
         async with self.build_http_client(
             transport=self._transport,
-            cookies=creds.cookies,
+            cookies=self._build_cookie_jar(creds, base_urls[0]),
         ) as client:
             if creds.is_expired and creds.refresh_token and not dry_run:
                 await self._try_refresh_token(client, creds, base_urls[0], log)
@@ -1097,11 +1189,12 @@ class WorkBuddyProvider(BaseProvider):
                 if browser_creds is not None:
                     if log:
                         log("info", "桌面登录态不可用，切换受控浏览器会话重试...")
+                    fallback_url = self._resolve_base_urls(config, browser_creds)[0]
                     return await self._checkin_via_browser(
                         config,
                         biz_date,
                         uid=browser_creds.uid,
-                        base_url=active_url,
+                        base_url=fallback_url,
                         dry_run=dry_run,
                         log=log,
                         started=started,
@@ -1220,6 +1313,18 @@ class WorkBuddyProvider(BaseProvider):
                     dry_run=True,
                 )
 
+            if pre_checked_in is None:
+                return CheckinResult(
+                    provider_id=self.id,
+                    display_name=self.display_name,
+                    status=CheckinStatus.SCHEMA_CHANGED,
+                    message="WorkBuddy 状态接口未返回可识别的签到状态字段，为避免误提交本次未签到。",
+                    biz_date=biz_date,
+                    snapshot=pre_snapshot,
+                    duration_ms=elapsed_ms(),
+                    raw_error_type="UnknownCheckinState",
+                )
+
             if log:
                 log("info", f"正在向 {active_url} 提交今日签到...")
 
@@ -1227,12 +1332,12 @@ class WorkBuddyProvider(BaseProvider):
                 checkin_resp = await self._post_api(
                     client, creds, active_url, "/v2/billing/meter/daily-checkin"
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 return CheckinResult(
                     provider_id=self.id,
                     display_name=self.display_name,
                     status=CheckinStatus.FAILED,
-                    message=f"签到请求发生网络异常：{exc}",
+                    message=f"签到请求发生网络异常：{type(exc).__name__}",
                     biz_date=biz_date,
                     snapshot=pre_snapshot,
                     duration_ms=elapsed_ms(),
@@ -1254,17 +1359,18 @@ class WorkBuddyProvider(BaseProvider):
                 if browser_creds is not None:
                     if log:
                         log("info", "提交签到返回未授权，切换受控浏览器会话重试...")
+                    fallback_url = self._resolve_base_urls(config, browser_creds)[0]
                     return await self._checkin_via_browser(
                         config,
                         biz_date,
                         uid=browser_creds.uid,
-                        base_url=active_url,
+                        base_url=fallback_url,
                         dry_run=dry_run,
                         log=log,
                         started=started,
                     )
 
-            if checkin_resp.status_code in (401, 403, 500) or checkin_resp.status_code >= 500:
+            if not (200 <= checkin_resp.status_code < 300):
                 return self._interpret_checkin_payload(
                     None,
                     checkin_resp.status_code,
@@ -1288,7 +1394,7 @@ class WorkBuddyProvider(BaseProvider):
                 )
 
             post_snap: Optional[CreditSnapshot] = None
-            if isinstance(body, dict) and (body.get("code") in (None, 0)):
+            if isinstance(body, dict) and (_to_int(body.get("code")) in (None, 0)):
                 _, post_payload, post_code = await self._query_status(
                     client, creds, [active_url], None
                 )

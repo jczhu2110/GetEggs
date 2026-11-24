@@ -1,6 +1,7 @@
 import { $, escapeHtml } from "./utils.js";
 
 const signatures = new WeakMap();
+const delegatedContainers = new WeakSet();
 
 /**
  * 通用柱状趋势图渲染器，同时服务总览「近 14 天」与历史页「近 30 天」。
@@ -21,11 +22,18 @@ function renderBarTrend({
   if (!container) return;
   if (fromCache && !series) return;
 
+  if (tooltip) {
+    tooltip.classList.remove("visible");
+    tooltip.setAttribute("aria-hidden", "true");
+    tooltip.style.left = "0px";
+    tooltip.style.top = "0px";
+  }
+
+  if (fromCache && container.clientWidth === 0) return;
+
   const sig = JSON.stringify(series);
   const unchanged = sig === signatures.get(container);
   signatures.set(container, sig);
-
-  if (fromCache && container.clientWidth === 0) return;
   container.classList.toggle("no-anim", fromCache || unchanged);
 
   if (!series || !series.length) {
@@ -79,12 +87,12 @@ function renderBarTrend({
     })
     .join("");
 
-  const firstDate = escapeHtml(series[0].date.slice(5));
-  const midDate = escapeHtml(series[Math.floor(series.length / 2)].date.slice(5));
-  const lastDate = escapeHtml(series[series.length - 1].date.slice(5));
+  const firstDate = escapeHtml(String(series[0]?.date ?? "").slice(5));
+  const midDate = escapeHtml(String(series[Math.floor(series.length / 2)]?.date ?? "").slice(5));
+  const lastDate = escapeHtml(String(series[series.length - 1]?.date ?? "").slice(5));
 
   container.innerHTML = `
-    <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" role="img" aria-label="${escapeHtml(ariaLabel)}">
+    <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" role="group" aria-label="${escapeHtml(ariaLabel)}">
       <line x1="${padX}" y1="${padTop}" x2="${w - padX}" y2="${padTop}" stroke="var(--chart-grid, var(--border))" stroke-width="1" stroke-dasharray="3 4" />
       <line x1="${padX}" y1="${midY}" x2="${w - padX}" y2="${midY}" stroke="var(--chart-grid, var(--border))" stroke-width="1" stroke-dasharray="3 4" />
       <line x1="${padX}" y1="${padTop + chartH}" x2="${w - padX}" y2="${padTop + chartH}" stroke="var(--chart-axis-line, var(--border-strong))" stroke-width="1" />
@@ -95,17 +103,23 @@ function renderBarTrend({
     </svg>
   `;
 
-  if (!tooltip) return;
+  if (!tooltip || delegatedContainers.has(container)) return;
+  delegatedContainers.add(container);
   const wrap = container.closest(".trend-chart-wrap");
 
   const showTip = (rect) => {
     if (!wrap) return;
     const wrapBox = wrap.getBoundingClientRect();
     const barBox = rect.getBoundingClientRect();
-    const date = rect.dataset.date;
+    const date = rect.dataset.date || "";
     const delta = Number(rect.dataset.delta) || 0;
     tooltip.textContent = `${date} · ${delta > 0 ? `+${delta} 积分` : "无新增"}`;
-    tooltip.style.left = `${barBox.left - wrapBox.left + barBox.width / 2}px`;
+    const halfWidth = (tooltip.offsetWidth || 100) / 2;
+    const rawLeft = barBox.left - wrapBox.left + barBox.width / 2;
+    const minLeft = halfWidth + 8;
+    const maxLeft = Math.max(minLeft, wrapBox.width - halfWidth - 8);
+    const clampedLeft = Math.min(maxLeft, Math.max(minLeft, rawLeft));
+    tooltip.style.left = `${clampedLeft}px`;
     tooltip.style.top = `${Math.max(4, barBox.top - wrapBox.top)}px`;
     tooltip.setAttribute("aria-hidden", "false");
     tooltip.classList.add("visible");
@@ -118,11 +132,21 @@ function renderBarTrend({
     tooltip.style.top = "0px";
   };
 
-  container.querySelectorAll(".trend-bar").forEach((bar) => {
-    bar.addEventListener("mouseenter", () => showTip(bar));
-    bar.addEventListener("focus", () => showTip(bar));
-    bar.addEventListener("mouseleave", hideTip);
-    bar.addEventListener("blur", hideTip);
+  container.addEventListener("pointerover", (ev) => {
+    const bar = ev.target.closest?.(".trend-bar");
+    if (bar) showTip(bar);
+  });
+  container.addEventListener("pointerout", (ev) => {
+    const bar = ev.target.closest?.(".trend-bar");
+    if (bar && !bar.contains(ev.relatedTarget)) hideTip();
+  });
+  container.addEventListener("focusin", (ev) => {
+    const bar = ev.target.closest?.(".trend-bar");
+    if (bar) showTip(bar);
+  });
+  container.addEventListener("focusout", (ev) => {
+    const bar = ev.target.closest?.(".trend-bar");
+    if (bar) hideTip();
   });
 }
 

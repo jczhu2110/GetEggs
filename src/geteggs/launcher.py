@@ -105,6 +105,7 @@ class SplashState:
     def __init__(self) -> None:
         self.nonce = secrets.token_urlsafe(16)
         self.started_at = time.monotonic()
+        self.lock = threading.Lock()
         self.url: Optional[str] = None
         self.error: Optional[str] = None
         self.redirect_seen = threading.Event()
@@ -136,30 +137,38 @@ class _SplashHandler(BaseHTTPRequestHandler):
 
     def _ready_payload(self) -> dict:
         state = self.state
-        if state.url:
-            return {"ready": True, "url": state.url}
-        if state.error:
-            return {"ready": False, "error": state.error}
+        with state.lock:
+            if state.url:
+                return {"ready": True, "url": state.url}
+            if state.error:
+                return {"ready": False, "error": state.error}
+            proc = state.proc
+            started_at = state.started_at
         existing = existing_ui_url()
         if existing:
-            state.url = existing
+            with state.lock:
+                state.url = existing
             return {"ready": True, "url": existing}
         if (
-            state.proc is not None
-            and state.proc.poll() is not None
-            and time.monotonic() - state.started_at > 5.0
+            proc is not None
+            and proc.poll() is not None
+            and time.monotonic() - started_at > 5.0
         ):
-            state.error = (
+            msg = (
                 "GetEggs Web 服务启动失败，请查看日志："
                 f"{get_data_dir() / 'geteggs-ui.log'}"
             )
-            return {"ready": False, "error": state.error}
-        if time.monotonic() - state.started_at > SPLASH_TOTAL_TIMEOUT:
-            state.error = (
+            with state.lock:
+                state.error = msg
+            return {"ready": False, "error": msg}
+        if time.monotonic() - started_at > SPLASH_TOTAL_TIMEOUT:
+            msg = (
                 "GetEggs Web 服务启动超时，请查看日志："
                 f"{get_data_dir() / 'geteggs-ui.log'}"
             )
-            return {"ready": False, "error": state.error}
+            with state.lock:
+                state.error = msg
+            return {"ready": False, "error": msg}
         return {"ready": False}
 
     def _send_json(self, payload: dict) -> None:
@@ -472,23 +481,29 @@ def main() -> None:
     try:
         proc = spawn_ui_server(open_when_ready=False)
     except OSError as exc:
-        state.error = f"启动 GetEggs Web 服务失败：{exc}"
+        with state.lock:
+            state.error = f"启动 GetEggs Web 服务失败：{exc}"
     else:
-        state.proc = proc
+        with state.lock:
+            state.proc = proc
         if wait_for_state(proc):
             url = existing_ui_url()
-            if url:
-                state.url = url
-            else:
-                state.error = "GetEggs Web 服务已启动，但无法读取控制台地址。"
+            with state.lock:
+                if url:
+                    state.url = url
+                else:
+                    state.error = "GetEggs Web 服务已启动，但无法读取控制台地址。"
         else:
             _terminate_process(proc)
-            state.error = (
-                "GetEggs Web 服务启动失败或超时，请查看日志："
-                f"{get_data_dir() / 'geteggs-ui.log'}"
-            )
+            with state.lock:
+                state.error = (
+                    "GetEggs Web 服务启动失败或超时，请查看日志："
+                    f"{get_data_dir() / 'geteggs-ui.log'}"
+                )
 
-    if state.url:
+    with state.lock:
+        has_url = bool(state.url)
+    if has_url:
         state.redirect_seen.wait(SPLASH_REDIRECT_TIMEOUT)
     else:
         state.error_seen.wait(SPLASH_ERROR_TIMEOUT)

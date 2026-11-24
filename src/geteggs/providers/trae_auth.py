@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from typing import Any, Optional
 from geteggs.core.config import get_trae_auth_path
 from geteggs.core.models import ProviderConfig
 from geteggs.core.secure_store import load_secure_json, save_secure_json
-from geteggs.providers.base import mask_secret
+from geteggs.providers.base import mask_secret, parse_timestamp
 
 DEFAULT_BASE_URL = "https://api.trae.cn"
 CLOUDIDE_KEY = "iCubeAuthInfo://icube.cloudide"
@@ -103,9 +104,17 @@ def sign_ecdsa_p256(private_key_pem: str, data: bytes) -> str:
             "缺少 cryptography 依赖，无法续期 Trae 登录态；请执行 uv sync。"
         ) from exc
     try:
+        pem_text = normalize_pem(private_key_pem)
+        if not pem_text:
+            raise TraeCredentialError("Trae 设备私钥为空。")
         private_key = serialization.load_pem_private_key(
-            normalize_pem(private_key_pem).encode("utf-8"), password=None
+            pem_text.encode("utf-8"), password=None
         )
+        if not (
+            isinstance(private_key, ec.EllipticCurvePrivateKey)
+            and isinstance(private_key.curve, ec.SECP256R1)
+        ):
+            raise TraeCredentialError("Trae 设备私钥不是有效的 P-256 椭圆曲线密钥。")
         der = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
         r, s = utils.decode_dss_signature(der)
         order = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -166,11 +175,11 @@ def decrypt_icube_value(value: str) -> dict[str, Any]:
     stored_hash = decrypted[:64]
     plaintext = decrypted[64:]
     pad = plaintext[-1] if plaintext else 0
-    if 1 <= pad <= 16:
+    if 1 <= pad <= 16 and len(plaintext) >= pad and plaintext[-pad:] == bytes([pad]) * pad:
         plaintext = plaintext[:-pad]
     else:
         plaintext = plaintext.rstrip(b"\x00").rstrip()
-    if stored_hash != hashlib.sha512(plaintext).digest():
+    if not hmac.compare_digest(stored_hash, hashlib.sha512(plaintext).digest()):
         raise TraeCredentialError("Trae 登录态解密校验失败，格式可能已变更。")
     try:
         parsed = json.loads(plaintext.decode("utf-8"))
@@ -283,26 +292,7 @@ def _load_device_info(
 
 
 def _parse_time(value: Any) -> Optional[datetime]:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        seconds = float(value) / 1000.0 if float(value) > 10_000_000_000 else float(value)
-        try:
-            return datetime.fromtimestamp(seconds, tz=timezone.utc)
-        except (OSError, OverflowError, ValueError):
-            return None
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if text.isdigit():
-        return _parse_time(float(text))
-    if text.endswith("Z"):
-        text = f"{text[:-1]}+00:00"
-    try:
-        moment = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
+    return parse_timestamp(value)
 
 
 def _iso(value: Any) -> Optional[str]:
@@ -326,7 +316,7 @@ def jwt_expiry(token: Optional[str]) -> Optional[str]:
     claims = _jwt_claims(token)
     for key in ("exp", "TokenExpireAt", "tokenExpireAt"):
         raw = claims.get(key)
-        if raw is None or raw == "":
+        if raw is None or raw == "" or isinstance(raw, bool):
             continue
         try:
             value = float(str(raw))
@@ -334,9 +324,9 @@ def jwt_expiry(token: Optional[str]) -> Optional[str]:
             continue
         if value <= 0:
             continue
-        if value > 100_000_000_000:
-            value /= 1000.0
-        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+        moment = parse_timestamp(value)
+        if moment is not None:
+            return moment.isoformat()
     return None
 
 
@@ -428,18 +418,25 @@ def _merge_cache(creds: TraeCredentials, cache: Optional[dict[str, Any]]) -> Tra
     cached_access = str(cache.get("access_token") or "").strip() or None
     if not cached_access:
         return creds
+    cached_refresh = str(cache.get("refresh_token") or "").strip() or None
     cached_expiry = _parse_time(cache.get("access_expires_at")) or _parse_time(
         jwt_expiry(cached_access)
     )
+    now_utc = datetime.now(timezone.utc)
     current_expiry = _parse_time(token_expires_at(creds))
     if creds.access_token and current_expiry and cached_expiry:
         if cached_expiry <= current_expiry:
             return creds
     elif creds.access_token and not cached_expiry:
         return creds
+    elif creds.access_token and current_expiry is None:
+        if cached_expiry is not None and cached_expiry <= now_utc:
+            return creds
+    elif not creds.access_token and not cached_refresh:
+        if cached_expiry is not None and cached_expiry <= now_utc:
+            return creds
 
     creds.access_token = cached_access
-    cached_refresh = str(cache.get("refresh_token") or "").strip()
     if cached_refresh:
         creds.refresh_token = cached_refresh
     creds.access_expires_at = _iso(cache.get("access_expires_at")) or jwt_expiry(cached_access)
@@ -455,7 +452,13 @@ def _merge_cache(creds: TraeCredentials, cache: Optional[dict[str, Any]]) -> Tra
 
 def _load_from_storage_path(storage_path: Path) -> TraeCredentials:
     try:
+        if storage_path.stat().st_size > 10_000_000:
+            raise TraeCredentialError(
+                f"Trae 登录态文件体积异常过大：{storage_path}"
+            )
         storage = json.loads(storage_path.read_text(encoding="utf-8"))
+    except TraeCredentialError:
+        raise
     except (OSError, ValueError) as exc:
         raise TraeCredentialError(
             f"无法读取 Trae 登录态文件 {storage_path}：{type(exc).__name__}"

@@ -5,7 +5,141 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+CUSTOM_CONFIG_ENV = "GETEGGS_ALLOW_CUSTOM_CONFIG"
+MAX_CONFIG_STR_LENGTH = 1024
+
+PROVIDER_ALLOWED_HOSTS: dict[str, tuple[str, ...]] = {
+    "workbuddy": ("codebuddy.cn", "workbuddy.cn", "copilot.tencent.com"),
+    "qoder": ("qoder.com", "qoder.com.cn"),
+    "trae": ("trae.cn", "trae.com.cn"),
+}
+
+
+def allow_custom_config() -> bool:
+    """Whether relaxed validation for custom base URLs and local paths is enabled."""
+    raw = (os.environ.get(CUSTOM_CONFIG_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def is_allowed_provider_host(provider_id: str, hostname: str) -> bool:
+    """Check whether a hostname matches a provider's official domain allowlist."""
+    allowed = PROVIDER_ALLOWED_HOSTS.get(provider_id)
+    if not allowed:
+        return True
+    host = hostname.strip().lower().rstrip(".")
+    return any(host == domain or host.endswith(f".{domain}") for domain in allowed)
+
+
+def _has_control_chars(text: str) -> bool:
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in text)
+
+
+def is_unc_path(path_text: str) -> bool:
+    """Return True when a path string targets a UNC/SMB network share."""
+    cleaned = path_text.strip()
+    return cleaned.replace("/", "\\").startswith("\\\\")
+
+
+def validate_provider_base_url(
+    provider_id: str,
+    value: str,
+    *,
+    allow_custom: Optional[bool] = None,
+) -> str:
+    """Validate and normalize a provider API base URL."""
+    cleaned = (value or "").strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if len(cleaned) > MAX_CONFIG_STR_LENGTH:
+        raise ValueError(f"API Base URL 长度不能超过 {MAX_CONFIG_STR_LENGTH} 个字符。")
+    if _has_control_chars(cleaned) or any(ch.isspace() for ch in cleaned):
+        raise ValueError("API Base URL 不能包含空白或控制字符。")
+
+    relaxed = allow_custom_config() if allow_custom is None else allow_custom
+    parsed = urlparse(cleaned)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("API Base URL 缺少有效主机名，请使用完整 URL（例如 https://...）。")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("API Base URL 不能包含内嵌凭据。")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("API Base URL 端口号无效。") from exc
+    if parsed.query or parsed.fragment:
+        raise ValueError("API Base URL 不能包含查询参数或锚点。")
+    if relaxed:
+        if scheme not in {"http", "https"}:
+            raise ValueError("API Base URL 协议必须为 http 或 https。")
+        return cleaned
+
+    if scheme != "https":
+        raise ValueError(
+            f"API Base URL 必须使用 https://（如需允许自定义调试地址，请设置环境变量 {CUSTOM_CONFIG_ENV}=1）。"
+        )
+    if not is_allowed_provider_host(provider_id, hostname):
+        allowed = "、".join(PROVIDER_ALLOWED_HOSTS.get(provider_id, ()))
+        raise ValueError(
+            f"API Base URL 域名不在 {provider_id} 官方白名单（{allowed}）内"
+            f"（如需允许自定义地址，请设置环境变量 {CUSTOM_CONFIG_ENV}=1）。"
+        )
+    return cleaned
+
+
+def validate_local_file_path(
+    value: str,
+    *,
+    field_label: str,
+    require_exe_on_windows: bool = False,
+    restrict_to_data_dir: bool = False,
+    require_json: bool = False,
+    allow_custom: Optional[bool] = None,
+) -> str:
+    """Validate a local filesystem path supplied via configuration."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) > MAX_CONFIG_STR_LENGTH:
+        raise ValueError(f"{field_label} 长度不能超过 {MAX_CONFIG_STR_LENGTH} 个字符。")
+    if _has_control_chars(cleaned):
+        raise ValueError(f"{field_label} 包含非法控制字符。")
+    if is_unc_path(cleaned):
+        raise ValueError(f"{field_label} 不允许使用网络共享（UNC）路径。")
+
+    relaxed = allow_custom_config() if allow_custom is None else allow_custom
+    if relaxed:
+        return cleaned
+
+    expanded = Path(cleaned).expanduser()
+    if require_exe_on_windows and os.name == "nt":
+        if not expanded.is_absolute() or expanded.suffix.lower() != ".exe":
+            raise ValueError(
+                f"{field_label} 必须是本机绝对 .exe 路径"
+                f"（如需允许自定义路径，请设置环境变量 {CUSTOM_CONFIG_ENV}=1）。"
+            )
+    if restrict_to_data_dir:
+        resolved = expanded.resolve(strict=False)
+        data_dir = get_data_dir().resolve(strict=False)
+        if not resolved.is_relative_to(data_dir):
+            raise ValueError(
+                f"{field_label} 必须位于本地数据目录（{data_dir}）内"
+                f"（如需允许目录外路径，请设置环境变量 {CUSTOM_CONFIG_ENV}=1）。"
+            )
+        if require_json and resolved.suffix.lower() != ".json":
+            raise ValueError(
+                f"{field_label} 必须是 .json 文件路径"
+                f"（如需允许其他扩展名，请设置环境变量 {CUSTOM_CONFIG_ENV}=1）。"
+            )
+        if not expanded.is_absolute() or ".." in expanded.parts:
+            return str(resolved)
+    elif require_json and expanded.suffix.lower() != ".json":
+        raise ValueError(f"{field_label} 必须是 .json 文件路径。")
+    return cleaned
 
 
 def get_data_dir() -> Path:
@@ -63,6 +197,22 @@ def get_timezone(tz_name: str = "Asia/Shanghai") -> timezone | ZoneInfo:
         if tz_name == "Asia/Shanghai":
             return timezone(timedelta(hours=8), name="Asia/Shanghai")
         return timezone.utc
+
+
+def validate_timezone_name(tz_name: str) -> str:
+    """Validate that a timezone name can be resolved on this system."""
+    cleaned = (tz_name or "").strip()
+    if not cleaned:
+        raise ValueError("时区不能为空。")
+    if cleaned in {"Asia/Shanghai", "UTC"}:
+        return cleaned
+    try:
+        ZoneInfo(cleaned)
+    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+        raise ValueError(
+            f"无效或当前系统不支持的时区：{cleaned}（默认支持 Asia/Shanghai 或 UTC；如需更多 IANA 时区请安装 tzdata）。"
+        ) from exc
+    return cleaned
 
 
 def today_biz_date(tz_name: str = "Asia/Shanghai") -> str:

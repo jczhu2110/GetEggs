@@ -793,3 +793,219 @@ def test_trae_response_parsing_prefers_root() -> None:
     assert info.enable is True
     assert info.checked_in is False
     assert _payload_amount({"credits": 500, "data": {"points": 100}}) == 100
+
+
+def test_trae_detect_client_exe_skips_registry_when_custom_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from geteggs.providers import trae as trae_mod
+
+    exe = tmp_path / "Trae CN.exe"
+    exe.write_bytes(b"MZ")
+    called = {"registry": False}
+
+    def fail_registry():
+        called["registry"] = True
+        return []
+
+    monkeypatch.setattr(trae_mod, "_registry_install_locations", fail_registry)
+    found = TraeProvider().detect_client_exe(_config(client_exe_path=str(exe)))
+    assert found == str(exe.resolve())
+    assert called["registry"] is False
+
+
+def test_trae_bad_device_key_during_refresh_returns_auth_expired(
+    tmp_path: Path,
+) -> None:
+    payload = _storage_payload(
+        access_expires=datetime.now(timezone.utc) - timedelta(hours=1),
+        include_keys=False,
+    )
+    payload[f"{DEVICE_KEY_PREFIX}{DEVICE_ID}"] = _encrypt_value(
+        {"privateKeyPEM": "NOT-A-VALID-PEM", "publicKeyPEM": "NOT-A-VALID-PEM"}
+    )
+    path = tmp_path / "bad_key_storage.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"should not call network on bad PEM: {request.url}")
+
+    result = asyncio.run(_provider(handler).checkin(_config(path), BIZ_DATE))
+    assert result.status == CheckinStatus.AUTH_EXPIRED
+
+
+def test_trae_decrypt_rejects_corrupt_padding_and_sign_validates_curve() -> None:
+    import base64
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from geteggs.providers.trae_auth import decrypt_icube_value, sign_ecdsa_p256
+
+    # Flipping last byte breaks PKCS#7 padding -> must raise ValueError
+    raw_enc = _encrypt_value({"ok": True})
+    raw_bytes = bytearray(base64.b64decode(raw_enc))
+    raw_bytes[-1] ^= 0xFF
+    corrupted = base64.b64encode(bytes(raw_bytes)).decode("ascii")
+    with pytest.raises(ValueError):
+        decrypt_icube_value(corrupted)
+
+    # Empty key or non-P-256 curve must raise ValueError
+    with pytest.raises(ValueError):
+        sign_ecdsa_p256("", "payload")
+
+    p384_key = ec.generate_private_key(ec.SECP384R1())
+    p384_pem = p384_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+    with pytest.raises(ValueError):
+        sign_ecdsa_p256(p384_pem, "payload")
+
+
+def test_trae_merge_cache_ignores_expired_cached_token(tmp_path: Path) -> None:
+    path = _write_storage(tmp_path)
+    save_secure_json(
+        get_trae_auth_path(),
+        {
+            "access_token": "expired-cache-token",
+            "refresh_token": "expired-cache-refresh",
+            "access_expires_at": (
+                datetime.now(timezone.utc) - timedelta(hours=2)
+            ).isoformat(),
+            "user_id": "user-123",
+            "host": "https://api.trae.cn",
+            "device_id": DEVICE_ID,
+        },
+    )
+    creds = load_trae_credentials(_config(path), use_cache=True)
+    assert creds.access_token == "test-access-token"
+
+
+def test_trae_claim_amount_precedence_and_verify_retries_transient(
+    tmp_path: Path,
+) -> None:
+    path = _write_storage(tmp_path)
+    status_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal status_calls
+        if request.url.path.endswith("/checkin_credits/status"):
+            status_calls += 1
+            if status_calls == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "enable": True,
+                        "checked_in": False,
+                        "credits": 100,
+                    },
+                )
+            if status_calls == 2:
+                # Transient server error on first verification attempt
+                return httpx.Response(503, json={"code": 503})
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "enable": True,
+                    "checked_in": True,
+                    "credits": 100,
+                },
+            )
+        if request.url.path.endswith("/checkin_credits/claim"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"points": 250}},
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    result = asyncio.run(_provider(handler).checkin(_config(path), BIZ_DATE))
+    assert result.status == CheckinStatus.SUCCESS
+    assert status_calls == 3
+    assert result.snapshot is not None
+    assert result.snapshot.delta == 250
+
+
+def test_trae_merge_cache_keeps_newer_expired_rotated_refresh_token() -> None:
+    from geteggs.providers.trae_auth import TraeCredentials, _merge_cache
+
+    now = datetime.now(timezone.utc)
+    creds = TraeCredentials(
+        access_token="old-storage-access",
+        refresh_token="revoked-storage-refresh",
+        access_expires_at=(now - timedelta(days=5)).isoformat(),
+        user_id="user-123",
+        device_id=DEVICE_ID,
+        req_source=1,
+    )
+    cache = {
+        "access_token": "rotated-access-expired-today",
+        "refresh_token": "valid-rotated-refresh",
+        "access_expires_at": (now - timedelta(hours=1)).isoformat(),
+        "user_id": "user-123",
+        "device_id": DEVICE_ID,
+        "req_source": 1,
+    }
+    merged = _merge_cache(creds, cache)
+    assert merged.refresh_token == "valid-rotated-refresh"
+    assert merged.access_token == "rotated-access-expired-today"
+
+
+def test_trae_oversized_storage_error_preserved_and_cjk_display_re(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from geteggs.providers.trae import _TRAE_DISPLAY_RE
+    from geteggs.providers.trae_auth import _load_from_storage_path
+
+    assert _TRAE_DISPLAY_RE.search("Trae国内版") is not None
+    assert _TRAE_DISPLAY_RE.search("字节Trae") is not None
+    assert _TRAE_DISPLAY_RE.search("Portrait Editor") is None
+
+    big = tmp_path / "storage.json"
+    big.write_text("{}", encoding="utf-8")
+
+    class _FakeStat:
+        st_size = 10_000_001
+
+    monkeypatch.setattr(Path, "stat", lambda self, *a, **kw: _FakeStat() if self == big else os.stat(self))
+    with pytest.raises(TraeCredentialError, match="体积异常过大"):
+        _load_from_storage_path(big)
+
+
+def test_trae_refresh_retries_pascalcase_volcengine_error_code(tmp_path: Path) -> None:
+    path = _write_storage(
+        tmp_path,
+        access_expires=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    exchange_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal exchange_calls
+        if request.url.path.endswith("/oauth/ExchangeToken"):
+            exchange_calls += 1
+            if exchange_calls == 1:
+                return httpx.Response(
+                    400,
+                    json={"ResponseMetadata": {"Error": {"CodeN": 10101, "Code": "InvalidClient"}}},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "Result": {
+                        "Token": "refreshed-access-tok",
+                        "RefreshToken": "refreshed-refresh-tok",
+                        "TokenExpireAt": int((datetime.now(timezone.utc) + timedelta(hours=12)).timestamp()),
+                    }
+                },
+            )
+        if request.url.path.endswith("/checkin_credits/status"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "enable": True, "checked_in": True, "credits": 100},
+            )
+        raise AssertionError(f"unexpected: {request.url}")
+
+    result = asyncio.run(_provider(handler).checkin(_config(path), BIZ_DATE))
+    assert exchange_calls == 2
+    assert result.status == CheckinStatus.ALREADY_DONE

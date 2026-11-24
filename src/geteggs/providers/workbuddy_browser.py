@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
-from geteggs.core.config import get_data_dir
+from geteggs.core.config import allow_custom_config, get_data_dir, is_unc_path
 from geteggs.core.models import ProviderConfig
 from geteggs.core.secure_store import load_secure_json, save_secure_json
 
@@ -18,11 +20,58 @@ DEFAULT_PORTAL_URL = "https://www.codebuddy.cn/profile/usage"
 PORTAL_HOSTS = ("codebuddy.cn", "workbuddy.cn", "copilot.tencent.com")
 
 
+def _is_portal_host(hostname: str) -> bool:
+    host = (hostname or "").strip().lower().lstrip(".").rstrip(".")
+    if not host:
+        return False
+    return any(host == allowed or host.endswith(f".{allowed}") for allowed in PORTAL_HOSTS)
+
+
+def _is_portal_origin(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() == "https" and _is_portal_host(parsed.hostname or "")
+
+
+def _is_login_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        path = (urlparse(url).path or "").lower()
+    except ValueError:
+        return False
+    return "/login" in path or "/signin" in path
+
+
 def _is_portal_url(url: str) -> bool:
     """Whether a URL is a logged-in portal page rather than a sign-in page."""
-    if not url or "/login" in url or "/signin" in url:
+    if not _is_portal_origin(url):
         return False
-    return any(host in url for host in PORTAL_HOSTS)
+    return not _is_login_url(url)
+
+
+def _matches_active_portal(page_url: str, base_url: str) -> bool:
+    if not page_url or _is_login_url(page_url):
+        return False
+    if _is_portal_url(page_url):
+        return True
+    if allow_custom_config():
+        try:
+            page_parsed = urlparse(page_url)
+            base_parsed = urlparse(base_url)
+        except ValueError:
+            return False
+        return (
+            page_parsed.scheme.lower() in {"http", "https"}
+            and bool(page_parsed.hostname)
+            and (page_parsed.hostname or "").lower()
+            == (base_parsed.hostname or "").lower()
+        )
+    return False
 
 
 def get_browser_state_path(config: ProviderConfig) -> Path:
@@ -32,7 +81,9 @@ def get_browser_state_path(config: ProviderConfig) -> Path:
         or os.environ.get("GETEGGS_WORKBUDDY_BROWSER_STATE")
     )
     if custom:
-        return Path(str(custom)).expanduser().resolve(strict=False)
+        cleaned = str(custom).strip()
+        if cleaned and "\x00" not in cleaned and not is_unc_path(cleaned):
+            return Path(cleaned).expanduser().resolve(strict=False)
     return (get_data_dir() / "workbuddy_browser_state.json").resolve(strict=False)
 
 
@@ -84,30 +135,40 @@ def _scan_json_for_auth(obj: Any, depth: int = 0) -> dict[str, Any]:
     return found
 
 
-def parse_storage_state(state_path: Path) -> Optional[dict[str, Any]]:
-    """Extract tokens, uid, and domain cookies from a Playwright storageState file."""
-    if not state_path.is_file():
-        return None
-    try:
-        data = load_secure_json(state_path)
-    except (OSError, ValueError):
-        return None
+def parse_storage_state_dict(data: Any) -> Optional[dict[str, Any]]:
+    """Extract tokens, uid, and scoped portal cookies from an in-memory storageState."""
     if not isinstance(data, dict):
         return None
 
+    now = time.time()
     cookies: dict[str, str] = {}
+    cookie_entries: list[dict[str, Any]] = []
     for item in data.get("cookies") or []:
         if not isinstance(item, dict):
             continue
-        domain = str(item.get("domain") or "")
+        domain = str(item.get("domain") or "").strip()
         name = item.get("name")
         value = item.get("value")
+        expires = item.get("expires")
         if (
-            name
-            and isinstance(value, str)
-            and any(host in domain for host in ("codebuddy.cn", "tencent.com", "workbuddy"))
+            isinstance(expires, (int, float))
+            and not isinstance(expires, bool)
+            and expires > 0
+            and expires < now
         ):
-            cookies[str(name)] = value
+            continue
+        if name and isinstance(value, str) and _is_portal_host(domain):
+            name_str = str(name)
+            cookies[name_str] = value
+            cookie_entries.append(
+                {
+                    "name": name_str,
+                    "value": value,
+                    "domain": domain,
+                    "path": str(item.get("path") or "/"),
+                    "secure": bool(item.get("secure", False)),
+                }
+            )
 
     auth_info: dict[str, Any] = {}
     has_portal_origin = False
@@ -116,10 +177,11 @@ def parse_storage_state(state_path: Path) -> Optional[dict[str, Any]]:
         if not isinstance(origin, dict):
             continue
         origin_url = str(origin.get("origin") or "")
-        if any(host in origin_url for host in ("codebuddy.cn", "copilot.tencent.com", "workbuddy")):
-            has_portal_origin = True
-            if portal_origin is None:
-                portal_origin = origin_url
+        if not _is_portal_origin(origin_url):
+            continue
+        has_portal_origin = True
+        if portal_origin is None:
+            portal_origin = origin_url
         for entry in origin.get("localStorage") or []:
             if not isinstance(entry, dict):
                 continue
@@ -146,8 +208,20 @@ def parse_storage_state(state_path: Path) -> Optional[dict[str, Any]]:
         "domain": auth_info.get("domain"),
         "expires_at": auth_info.get("expires_at"),
         "cookies": cookies,
+        "cookie_entries": cookie_entries,
         "has_session_cookies": bool(cookies),
     }
+
+
+def parse_storage_state(state_path: Path) -> Optional[dict[str, Any]]:
+    """Extract tokens, uid, and domain cookies from a Playwright storageState file."""
+    if not state_path.is_file():
+        return None
+    try:
+        data = load_secure_json(state_path)
+    except (OSError, ValueError):
+        return None
+    return parse_storage_state_dict(data)
 
 
 async def _launch_edge(playwright: Any, *, headless: bool) -> Any:
@@ -191,49 +265,46 @@ async def interactive_browser_login(
     state_path.parent.mkdir(parents=True, exist_ok=True)
     async with async_playwright() as p:
         browser = await _launch_edge(p, headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
+        context: Any = None
         pending_path = state_path.with_suffix(state_path.suffix + ".pending")
         try:
+            context = await browser.new_context()
+            page = await context.new_page()
             await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(2000)
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout_sec
-            saw_login = False
+            saw_auth_step = False
             portal_since: Optional[float] = None
-            verify_attempted = False
+            next_verify_at = 0.0
 
             while loop.time() < deadline:
                 if page.is_closed():
                     return False, "浏览器窗口已关闭，未完成登录授权。"
                 current_url = page.url or ""
-                if "/login" in current_url or "/signin" in current_url:
-                    saw_login = True
+                if _is_login_url(current_url) or not _is_portal_origin(current_url):
+                    saw_auth_step = True
                     portal_since = None
-                elif _is_portal_url(current_url) and saw_login:
+                elif _is_portal_url(current_url):
+                    now = loop.time()
                     if portal_since is None:
-                        portal_since = loop.time()
-                    elif loop.time() - portal_since >= 2.0 and not verify_attempted:
+                        portal_since = now
+                    elif now - portal_since >= 2.0 and now >= next_verify_at:
                         await page.wait_for_timeout(1500)
                         if not _is_portal_url(page.url or ""):
                             portal_since = None
-                            saw_login = bool(
-                                "/login" in (page.url or "")
-                                or "/signin" in (page.url or "")
-                            )
+                            saw_auth_step = True
                             continue
                         state = await context.storage_state()
-                        save_secure_json(pending_path, state)
-                        parsed = parse_storage_state(pending_path)
-                        verify_attempted = True
-                        if parsed and await _verify_saved_state(browser, state, login_url):
+                        parsed = parse_storage_state_dict(state)
+                        can_verify = bool(parsed and (saw_auth_step or parsed.get("access_token")))
+                        if can_verify and await _verify_saved_state(browser, state, login_url):
+                            save_secure_json(pending_path, state)
                             os.replace(pending_path, state_path)
                             return True, f"已完成浏览器授权并保存加密会话状态至 {state_path}"
-                        pending_path.unlink(missing_ok=True)
-                        return False, (
-                            "登录页已跳转回个人中心，但保存的会话仍无法通过校验。"
-                            "请确认已在弹出窗口中完成登录（扫码后需在手机上确认），然后重试。"
-                        )
+                        next_verify_at = loop.time() + 4.0
+                        if saw_auth_step:
+                            portal_since = None
                 else:
                     portal_since = None
                 await asyncio.sleep(1.0)
@@ -246,6 +317,11 @@ async def interactive_browser_login(
                 pending_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:  # noqa: BLE001
+                    pass
             await browser.close()
 
 
@@ -258,7 +334,13 @@ async def browser_checkin_session(
     log: Optional[LogCallback] = None,
 ) -> dict[str, Any]:
     """Run check-in API calls inside a headless Edge context backed by saved storageState."""
-    from playwright.async_api import async_playwright
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {
+            "authenticated": False,
+            "reason": "未安装 playwright 依赖，请先执行 `uv sync`。",
+        }
 
     target_url = f"{base_url.rstrip('/')}/profile/usage"
     try:
@@ -271,27 +353,26 @@ async def browser_checkin_session(
 
     async with async_playwright() as p:
         browser = await _launch_edge(p, headless=True)
-        context = await browser.new_context(storage_state=state)
-        page = await context.new_page()
+        context: Any = None
         try:
+            context = await browser.new_context(storage_state=state)
+            page = await context.new_page()
             if log:
                 log("info", f"正在通过受控无头浏览器访问 {target_url} ...")
             await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
             await page.wait_for_timeout(2200)
 
-            if "/login" in (page.url or ""):
+            if not _matches_active_portal(page.url or "", base_url):
                 return {
                     "authenticated": False,
-                    "reason": "受控浏览器登录态已过期（重定向至登录页），请重新授权登录。",
+                    "reason": "受控浏览器登录态已过期（重定向至登录页或非门户页面），请重新授权登录。",
                 }
 
-            # Persist sliding cookies / refreshed localStorage tokens (skip on dry-run).
-            if not dry_run:
-                save_secure_json(state_path, await context.storage_state())
-            parsed = parse_storage_state(state_path) or {}
+            live_state = await context.storage_state()
+            parsed = parse_storage_state_dict(live_state) or {}
             token = parsed.get("access_token")
             effective_uid = uid or parsed.get("uid")
-            domain_host = base_url.replace("https://", "").replace("http://", "").split("/")[0]
+            domain_host = (urlparse(base_url).hostname or "").lower()
 
             js_script = """
             async ({ endpoints, checkinEndpoint, token, uid, domainHost, dryRun }) => {
@@ -304,15 +385,35 @@ async def browser_checkin_session(
                 if (uid) headers["X-User-Id"] = uid;
 
                 async function postJson(path) {
-                    const resp = await fetch(path, {
-                        method: "POST",
-                        credentials: "include",
-                        headers,
-                        body: "{}"
-                    });
-                    let data = null;
-                    try { data = await resp.json(); } catch (_) {}
-                    return { status: resp.status, data };
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), 15000);
+                    try {
+                        const resp = await fetch(path, {
+                            method: "POST",
+                            credentials: "include",
+                            headers,
+                            body: "{}",
+                            signal: controller.signal
+                        });
+                        let data = null;
+                        try { data = await resp.json(); } catch (_) {}
+                        return { status: resp.status, data };
+                    } catch (_) {
+                        return { status: 0, data: null };
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }
+
+                function parseBool(val) {
+                    if (typeof val === "boolean") return val;
+                    if (typeof val === "number") return val !== 0;
+                    if (typeof val === "string") {
+                        const t = val.trim().toLowerCase();
+                        if (t === "true" || t === "1" || t === "yes" || t === "checked" || t === "done" || t === "signed") return true;
+                        if (t === "false" || t === "0" || t === "no" || t === "unchecked" || t === "pending" || t === "unsigned") return false;
+                    }
+                    return null;
                 }
 
                 let statusRes = { status: 0, data: null };
@@ -324,20 +425,26 @@ async def browser_checkin_session(
                     return { statusRes, checkinRes: null, postStatusRes: null };
                 }
 
-                const d = (statusRes.data && statusRes.data.data) ? statusRes.data.data : (statusRes.data || {});
+                const rootObj = (statusRes.data && typeof statusRes.data === "object") ? statusRes.data : {};
+                const nestedObj = (rootObj.data && typeof rootObj.data === "object") ? rootObj.data : {};
                 const stateKeys = [
                     "checkedIn", "checked_in", "todayCheckedIn", "today_checked_in",
                     "isCheckedIn", "is_checked_in", "signed"
                 ];
-                const hasState = stateKeys.some(
-                    (key) => Object.prototype.hasOwnProperty.call(d, key)
-                );
-                if (!hasState) {
+                let rawState = undefined;
+                for (const src of [nestedObj, rootObj]) {
+                    for (const key of stateKeys) {
+                        if (Object.prototype.hasOwnProperty.call(src, key) && src[key] !== null && src[key] !== undefined) {
+                            rawState = src[key];
+                            break;
+                        }
+                    }
+                    if (rawState !== undefined) break;
+                }
+                const already = parseBool(rawState);
+                if (already === null) {
                     return { statusRes, checkinRes: null, postStatusRes: null };
                 }
-                const already = Boolean(
-                    d.checkedIn ?? d.checked_in ?? d.todayCheckedIn ?? d.today_checked_in ?? d.isCheckedIn ?? d.signed
-                );
                 if (already) {
                     return { statusRes, checkinRes: null, postStatusRes: null };
                 }
@@ -346,8 +453,9 @@ async def browser_checkin_session(
                 let postStatusRes = null;
                 if (checkinRes.status === 200) {
                     for (const ep of endpoints) {
-                        postStatusRes = await postJson(ep);
-                        if (postStatusRes.status !== 404) break;
+                        const candidate = await postJson(ep);
+                        postStatusRes = candidate;
+                        if (candidate.status !== 404) break;
                     }
                 }
                 return { statusRes, checkinRes, postStatusRes };
@@ -367,6 +475,15 @@ async def browser_checkin_session(
                     "dryRun": dry_run,
                 },
             )
+            # Only persist refreshed sliding cookies after confirming an authenticated response.
+            status_code = (result.get("statusRes") or {}).get("status")
+            if not dry_run and status_code == 200 and _matches_active_portal(page.url or "", base_url):
+                save_secure_json(state_path, await context.storage_state())
             return {"authenticated": True, "active_url": base_url.rstrip("/"), **result}
         finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:  # noqa: BLE001
+                    pass
             await browser.close()

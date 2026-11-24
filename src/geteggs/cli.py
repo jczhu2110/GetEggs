@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import socket
+import tempfile
 import threading
 import time
 import webbrowser
@@ -15,6 +16,7 @@ from typing import Optional
 import typer
 import uvicorn
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from geteggs import __version__, launcher
@@ -77,7 +79,11 @@ def doctor(
 ) -> None:
     """只读检查本机客户端安装状态与本地登录态健康度。"""
     storage = Storage()
-    targets = [get_provider(provider)] if provider else list_providers()
+    try:
+        targets = [get_provider(provider)] if provider else list_providers()
+    except KeyError as exc:
+        console.print(f"[red]{rich_escape(str(exc.args[0] if exc.args else exc))}[/red]")
+        raise typer.Exit(code=1)
 
     table = Table(title="GetEggs 本地环境体检")
     table.add_column("工具", style="bold")
@@ -190,7 +196,7 @@ def run(
     def _print_event(ev: LogEvent) -> None:
         style = {"warning": "yellow", "error": "red"}.get(ev.level, "cyan")
         prefix = f"[{ev.provider_id}] " if ev.provider_id else ""
-        console.print(f"[{style}]{prefix}{ev.message}[/{style}]")
+        console.print(f"[{style}]{rich_escape(prefix + ev.message)}[/{style}]")
 
     try:
         summary = asyncio.run(
@@ -204,8 +210,11 @@ def run(
                 event_sink=_print_event,
             )
         )
+    except KeyError as exc:
+        console.print(f"[red]{rich_escape(str(exc.args[0] if exc.args else exc))}[/red]")
+        raise typer.Exit(code=1)
     except RunLockBusyError as exc:
-        console.print(f"[yellow]{exc}[/yellow]")
+        console.print(f"[yellow]{rich_escape(str(exc))}[/yellow]")
         raise typer.Exit(code=2)
 
     has_error = any(not r.status.is_done_for_today for r in summary.results)
@@ -218,7 +227,11 @@ def auth(
     provider: str = typer.Argument("workbuddy", help="需要打开受控浏览器完成登录授权的插件 ID"),
 ) -> None:
     """打开 Edge 受控浏览器完成一次网页登录授权，保存本地会话供后续静默签到使用。"""
-    p = get_provider(provider)
+    try:
+        p = get_provider(provider)
+    except KeyError as exc:
+        console.print(f"[red]{rich_escape(str(exc.args[0] if exc.args else exc))}[/red]")
+        raise typer.Exit(code=1)
     if not p.supports_browser_auth:
         console.print(f"[yellow]{p.display_name} 暂不支持受控浏览器授权。[/yellow]")
         raise typer.Exit(code=1)
@@ -285,18 +298,27 @@ def _run_ui(
 
     state_path = get_ui_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "port": chosen_port,
-                "url": url,
-                "started_at": utc_now_iso(),
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    state_payload = json.dumps(
+        {
+            "pid": os.getpid(),
+            "port": chosen_port,
+            "url": url,
+            "started_at": utc_now_iso(),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=state_path.parent, prefix=".ui-state.", suffix=".tmp"
     )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(state_payload)
+            handle.flush()
+        os.replace(tmp_path, state_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     if quiet:
         console.print(f"[dim]GetEggs 本地控制台已启动（端口 {chosen_port}）。[/dim]")
@@ -311,6 +333,7 @@ def _run_ui(
             pass
 
     web_app.state.ui_state_cleanup = _cleanup_state
+    browser_timer: Optional[threading.Timer] = None
     try:
         if open_when_ready:
             threading.Thread(
@@ -319,9 +342,18 @@ def _run_ui(
                 daemon=True,
             ).start()
         elif not no_browser:
-            threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-        uvicorn.run(web_app, host="127.0.0.1", port=chosen_port, log_level="warning")
+            browser_timer = threading.Timer(0.6, lambda: webbrowser.open(url))
+            browser_timer.daemon = True
+            browser_timer.start()
+        config = uvicorn.Config(
+            web_app, host="127.0.0.1", port=chosen_port, log_level="warning"
+        )
+        server = uvicorn.Server(config)
+        web_app.state.uvicorn_server = server
+        server.run()
     finally:
+        if browser_timer is not None:
+            browser_timer.cancel()
         _cleanup_state()
 
 
@@ -373,24 +405,68 @@ def schedule_install_cmd(
     result_file: Optional[Path] = typer.Option(
         None, "--result-file", hidden=True, help="内部使用：写入安装结果 JSON"
     ),
+    params_file: Optional[Path] = typer.Option(
+        None, "--params-file", hidden=True, help="内部使用：从 JSON 读取提权安装参数"
+    ),
 ) -> None:
     """安装或更新 Windows 每日定时 + 开机漏签补跑任务。"""
-    storage = Storage()
-    settings = storage.get_settings()
-    target_time = time or settings.schedule_time
-    if time:
-        settings.schedule_time = target_time
-        storage.save_settings(settings)
+    params: dict[str, object] = {}
+    if params_file is not None:
+        try:
+            loaded = json.loads(params_file.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict) or not loaded:
+                raise ValueError("提权安装参数文件不是有效的非空 JSON 对象。")
+            params = loaded
+        except (OSError, ValueError) as exc:
+            msg = f"读取提权安装参数失败：{exc}"
+            if result_file:
+                try:
+                    result_file.parent.mkdir(parents=True, exist_ok=True)
+                    result_file.write_text(
+                        json.dumps({"ok": False, "message": msg}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            console.print(f"[red]{rich_escape(msg)}[/red]")
+            raise typer.Exit(1)
 
-    configs = [storage.get_provider_config(p.id) for p in list_providers()]
+    if params:
+        target_time = str(params.get("schedule_time") or time or "10:15")
+        catchup_on_logon = bool(params.get("catchup_on_logon", True))
+        raw_work_dir = params.get("working_dir")
+        working_dir = Path(str(raw_work_dir)) if raw_work_dir else None
+        timeout_minutes = int(params.get("timeout_minutes") or 25)
+        raw_user = params.get("target_user")
+        target_user = str(raw_user).strip() if raw_user else None
+    else:
+        storage = Storage()
+        settings = storage.get_settings()
+        target_time = time or settings.schedule_time
+        if time:
+            try:
+                settings = settings.model_copy(update={"schedule_time": target_time})
+                settings = type(settings).model_validate(settings.model_dump())
+            except ValueError as exc:
+                console.print(f"[red]定时时间格式无效：{rich_escape(str(exc))}[/red]")
+                raise typer.Exit(1)
+            storage.save_settings(settings)
+        configs = [storage.get_provider_config(p.id) for p in list_providers()]
+        catchup_on_logon = settings.auto_catchup_on_logon
+        working_dir = None
+        timeout_minutes = CheckinRunner.estimate_task_timeout_minutes(
+            settings, configs
+        )
+        target_user = None
+
     try:
         ok, msg = install_schedule(
             target_time,
-            catchup_on_logon=settings.auto_catchup_on_logon,
-            timeout_minutes=CheckinRunner.estimate_task_timeout_minutes(
-                settings, configs
-            ),
+            catchup_on_logon=catchup_on_logon,
+            working_dir=working_dir,
+            timeout_minutes=timeout_minutes,
             elevate=not no_elevate,
+            target_user=target_user,
         )
     except Exception as exc:  # noqa: BLE001
         ok, msg = False, f"注册计划任务失败：{exc}"
@@ -413,9 +489,30 @@ def schedule_install_cmd(
 
 
 @schedule_app.command("uninstall")
-def schedule_uninstall_cmd() -> None:
+def schedule_uninstall_cmd(
+    no_elevate: bool = typer.Option(
+        False, "--no-elevate", hidden=True, help="内部使用：跳过管理员提权包装"
+    ),
+    result_file: Optional[Path] = typer.Option(
+        None, "--result-file", hidden=True, help="内部使用：写入卸载结果 JSON"
+    ),
+) -> None:
     """卸载 Windows 计划任务。"""
-    ok, msg = uninstall_schedule()
+    try:
+        ok, msg = uninstall_schedule(elevate=not no_elevate)
+    except Exception as exc:  # noqa: BLE001
+        ok, msg = False, f"移除计划任务失败：{exc}"
+
+    if result_file:
+        try:
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            result_file.write_text(
+                json.dumps({"ok": ok, "message": msg}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
     if ok:
         console.print(f"[green]{msg}[/green]")
     else:

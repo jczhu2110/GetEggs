@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import posixpath
 import signal
 import time
 import uuid
+from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -19,8 +22,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
 from geteggs import __version__
-from geteggs.core.config import get_qoder_pat_path, today_biz_date
-from geteggs.core.lock import RunLockBusyError, acquire_run_lock
+from geteggs.core.config import (
+    get_qoder_pat_path,
+    today_biz_date,
+    validate_local_file_path,
+    validate_provider_base_url,
+)
+from geteggs.core.lock import RunLockBusyError, acquire_run_lock, is_lock_busy
 from geteggs.core.models import (
     MAX_CHECKIN_CREDITS,
     GlobalSettings,
@@ -107,7 +115,7 @@ class QoderPatRequest(BaseModel):
 @dataclass
 class ActiveRunState:
     run_id: str
-    events: list[dict[str, Any]] = field(default_factory=list)
+    events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=2000))
     subscribers: list[asyncio.Queue[Optional[dict[str, Any]]]] = field(default_factory=list)
     finished: bool = False
     summary: Optional[dict[str, Any]] = None
@@ -115,12 +123,29 @@ class ActiveRunState:
     created_at: float = field(default_factory=time.monotonic)
     task: Optional[asyncio.Task[None]] = None
 
+    @staticmethod
+    def _enqueue(
+        q: asyncio.Queue[Optional[dict[str, Any]]],
+        item: Optional[dict[str, Any]],
+    ) -> None:
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                q.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+
     def publish(self, event_type: str, payload: dict[str, Any]) -> None:
         self.seq += 1
         item = {"id": self.seq, "type": event_type, "data": payload}
         self.events.append(item)
         for q in list(self.subscribers):
-            q.put_nowait(item)
+            self._enqueue(q, item)
 
     def complete(
         self,
@@ -138,18 +163,22 @@ class ActiveRunState:
         else:
             self.publish("done", summary or {})
         for q in list(self.subscribers):
-            q.put_nowait(None)
+            self._enqueue(q, None)
 
     def subscribe(
         self, last_event_id: int = 0
-    ) -> tuple[list[dict[str, Any]], asyncio.Queue[Optional[dict[str, Any]]]]:
-        q: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue()
-        self.subscribers.append(q)
+    ) -> tuple[list[dict[str, Any]], Optional[asyncio.Queue[Optional[dict[str, Any]]]], bool]:
         history = [item for item in self.events if item["id"] > last_event_id]
-        return history, q
+        if self.finished:
+            return history, None, True
+        q: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue(maxsize=256)
+        self.subscribers.append(q)
+        return history, q, False
 
-    def unsubscribe(self, q: asyncio.Queue[Optional[dict[str, Any]]]) -> None:
-        if q in self.subscribers:
+    def unsubscribe(
+        self, q: Optional[asyncio.Queue[Optional[dict[str, Any]]]]
+    ) -> None:
+        if q is not None and q in self.subscribers:
             self.subscribers.remove(q)
 
 
@@ -178,7 +207,12 @@ def create_app(
     active_runs: dict[str, ActiveRunState] = {}
     auth_tasks: dict[str, AuthTaskState] = {}
     app_providers = list(providers) if providers is not None else list_providers()
-    schedule_cache: dict[str, Any] = {"value": None, "expires_at": 0.0}
+    schedule_cache: dict[str, Any] = {"value": None, "expires_at": 0.0, "gen": 0}
+    schedule_lock = asyncio.Lock()
+    config_lock = asyncio.Lock()
+    shutdown_lock = asyncio.Lock()
+    shutting_down = False
+    index_html_cache: Optional[str] = None
 
     def resolve_provider(provider_id: str) -> BaseProvider:
         for provider in app_providers:
@@ -204,24 +238,53 @@ def create_app(
 
     async def schedule_status_cached() -> dict[str, Any]:
         now = time.monotonic()
-        if schedule_cache["value"] is None or now >= schedule_cache["expires_at"]:
-            schedule_cache["value"] = await run_in_threadpool(get_schedule_status)
-            schedule_cache["expires_at"] = now + 45.0
-        return schedule_cache["value"]
+        cached_val = schedule_cache["value"]
+        if cached_val is not None and now < schedule_cache["expires_at"]:
+            return cached_val
+        async with schedule_lock:
+            now = time.monotonic()
+            cached_val = schedule_cache["value"]
+            if cached_val is not None and now < schedule_cache["expires_at"]:
+                return cached_val
+            gen_before = schedule_cache["gen"]
+            result = await run_in_threadpool(get_schedule_status)
+            if schedule_cache["gen"] == gen_before:
+                ttl = 3.0 if result.get("query_failed") else 45.0
+                schedule_cache["value"] = result
+                schedule_cache["expires_at"] = time.monotonic() + ttl
+            return result
 
     def runner_lock_busy() -> bool:
         """Return True when a check-in run (including scheduled ones) holds the lock."""
+        return is_lock_busy(app_runner.lock_path)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
         try:
-            with acquire_run_lock(app_runner.lock_path):
-                return False
-        except RunLockBusyError:
-            return True
+            yield
+        finally:
+            for run_state in list(active_runs.values()):
+                for q in list(run_state.subscribers):
+                    ActiveRunState._enqueue(q, None)
+            pending: list[asyncio.Task[None]] = []
+            for run_state in list(active_runs.values()):
+                if run_state.task is not None and not run_state.task.done():
+                    run_state.task.cancel()
+                    pending.append(run_state.task)
+            for auth_state in list(auth_tasks.values()):
+                if auth_state.task is not None and not auth_state.task.done():
+                    auth_state.task.cancel()
+                    pending.append(auth_state.task)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     app = FastAPI(
         title="GetEggs Local Console",
         version=__version__,
         docs_url=None,
         redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
     )
     app.state.auth_manager = auth_mgr
     app.state.storage = app_storage
@@ -229,14 +292,45 @@ def create_app(
     app.state.providers = app_providers
     app.state.auth_tasks = auth_tasks
 
+    _CSP_POLICY = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "font-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'"
+    )
+
     @app.middleware("http")
     async def local_origin_guard(request: Request, call_next: Any) -> Any:
         if not is_local_origin(request):
-            return JSONResponse(
+            resp: Any = JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
                 content={"detail": "仅允许本机来源访问 GetEggs 控制台。"},
             )
-        return await call_next(request)
+        elif auth_mgr.enabled and posixpath.normpath(request.url.path).lower() == "/static/index.html":
+            try:
+                auth_mgr.verify_request(request)
+            except HTTPException as exc:
+                resp = JSONResponse(
+                    status_code=exc.status_code,
+                    content={"detail": exc.detail},
+                )
+            else:
+                resp = await call_next(request)
+        else:
+            resp = await call_next(request)
+
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        resp.headers.setdefault("Content-Security-Policy", _CSP_POLICY)
+        if request.url.path == "/auth" or request.url.path.startswith("/api/"):
+            resp.headers.setdefault("Cache-Control", "no-store")
+        return resp
 
     def require_auth(request: Request) -> None:
         auth_mgr.verify_request(request)
@@ -262,6 +356,7 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
+        nonlocal index_html_cache
         if auth_mgr.enabled:
             try:
                 auth_mgr.verify_request(request)
@@ -276,15 +371,14 @@ def create_app(
                     ),
                     status_code=status.HTTP_401_UNAUTHORIZED,
                 )
-        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(content=html)
+        if index_html_cache is None:
+            index_html_cache = await run_in_threadpool(
+                (STATIC_DIR / "index.html").read_text, encoding="utf-8"
+            )
+        return HTMLResponse(content=index_html_cache)
 
     @app.get("/api/overview", dependencies=[Depends(require_auth)])
     async def api_overview() -> dict[str, Any]:
-        settings = app_storage.get_settings()
-        biz_date = today_biz_date(settings.timezone)
-        cards: list[dict[str, Any]] = []
-        today_delta = 0
         # Never block the first paint on a Task Scheduler query. The UI fetches
         # /api/schedule asynchronously when no cached value is available yet.
         schedule_info = schedule_cache["value"]
@@ -293,45 +387,53 @@ def create_app(
             and time.monotonic() >= schedule_cache["expires_at"]
         )
 
-        for provider in app_providers:
-            cfg = app_storage.get_provider_config(provider.id)
-            # Align the card with the provider's own business day (Qoder resets
-            # at 10:00), so early-morning runs show the previous business day.
-            provider_biz_date = provider.business_date(cfg, settings.timezone)
-            today_rec = app_storage.get_today_summary(provider.id, provider_biz_date)
-            latest_rec = app_storage.get_latest_snapshot_record(
-                provider.id
-            ) or app_storage.get_latest_record(provider.id)
-            if today_rec and today_rec.get("delta"):
-                today_delta += int(today_rec["delta"])
+        def _build_overview() -> dict[str, Any]:
+            settings = app_storage.get_settings()
+            biz_date = today_biz_date(settings.timezone)
+            cards: list[dict[str, Any]] = []
+            today_delta = 0
 
-            cards.append(
-                {
-                    "provider_id": provider.id,
-                    "display_name": provider.display_name,
-                    "description": provider.description,
-                    "enabled": cfg.enabled,
-                    "earliest_time": cfg.earliest_time,
-                    "jitter_minutes": cfg.jitter_minutes,
-                    "extra": cfg.extra,
-                    "client_installed": provider.detect_client_exe(cfg) is not None,
-                    "supports_browser_auth": provider.supports_browser_auth,
-                    "supports_streak": provider.supports_streak,
-                    "fixed_business_day_start": provider.fixed_business_day_start,
-                    "today_record": today_rec,
-                    "latest_record": latest_rec,
-                }
-            )
+            for provider in app_providers:
+                cfg = app_storage.get_provider_config(provider.id)
+                # Align the card with the provider's own business day (Qoder resets
+                # at 10:00), so early-morning runs show the previous business day.
+                provider_biz_date = provider.business_date(cfg, settings.timezone)
+                today_rec = app_storage.get_today_summary(provider.id, provider_biz_date)
+                latest_rec = app_storage.get_latest_snapshot_record(
+                    provider.id
+                ) or app_storage.get_latest_record(provider.id)
+                if today_rec and today_rec.get("delta"):
+                    today_delta += int(today_rec["delta"])
 
-        return {
-            "version": __version__,
-            "biz_date": biz_date,
-            "today_delta": today_delta,
-            "providers": cards,
-            "trend_30d": app_storage.get_trend_30_days(settings.timezone),
-            "schedule": schedule_info,
-            "schedule_stale": schedule_stale,
-        }
+                cards.append(
+                    {
+                        "provider_id": provider.id,
+                        "display_name": provider.display_name,
+                        "description": provider.description,
+                        "enabled": cfg.enabled,
+                        "earliest_time": cfg.earliest_time,
+                        "jitter_minutes": cfg.jitter_minutes,
+                        "extra": cfg.extra,
+                        "client_installed": provider.detect_client_exe(cfg) is not None,
+                        "supports_browser_auth": provider.supports_browser_auth,
+                        "supports_streak": provider.supports_streak,
+                        "fixed_business_day_start": provider.fixed_business_day_start,
+                        "today_record": today_rec,
+                        "latest_record": latest_rec,
+                    }
+                )
+
+            return {
+                "version": __version__,
+                "biz_date": biz_date,
+                "today_delta": today_delta,
+                "providers": cards,
+                "trend_30d": app_storage.get_trend_30_days(settings.timezone),
+                "schedule": schedule_info,
+                "schedule_stale": schedule_stale,
+            }
+
+        return await run_in_threadpool(_build_overview)
 
     @app.post("/api/doctor", dependencies=[Depends(require_auth)])
     async def api_doctor(provider_id: Optional[str] = Query(default=None)) -> dict[str, Any]:
@@ -351,6 +453,10 @@ def create_app(
 
     @app.post("/api/runs", dependencies=[Depends(require_auth)])
     async def api_start_run(req: TriggerRunRequest) -> dict[str, Any]:
+        if shutting_down:
+            raise HTTPException(
+                status_code=503, detail="本地 Web 服务正在关闭，无法启动新的签到任务。"
+            )
         requested_ids = req.provider_ids
         if requested_ids is None and req.provider_id:
             requested_ids = [req.provider_id]
@@ -413,7 +519,7 @@ def create_app(
             last_event_id = int(request.headers.get("last-event-id") or 0)
         except ValueError:
             last_event_id = 0
-        history_events, queue = state.subscribe(last_event_id)
+        history_events, queue, was_finished = state.subscribe(last_event_id)
 
         async def event_generator():
             try:
@@ -422,7 +528,7 @@ def create_app(
                         f"id: {item['id']}\nevent: {item['type']}\n"
                         f"data: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
                     )
-                if state.finished:
+                if was_finished or queue is None:
                     return
                 while True:
                     try:
@@ -439,22 +545,30 @@ def create_app(
             finally:
                 state.unsubscribe(queue)
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/api/runs", dependencies=[Depends(require_auth)])
     async def api_list_runs(
         limit: int = Query(default=30, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
+        runs = await run_in_threadpool(app_storage.get_runs, limit=limit, offset=offset)
         return {
-            "runs": app_storage.get_runs(limit=limit, offset=offset),
+            "runs": runs,
             "limit": limit,
             "offset": offset,
         }
 
     @app.get("/api/runs/{run_id}", dependencies=[Depends(require_auth)])
     async def api_run_detail(run_id: str) -> dict[str, Any]:
-        detail = app_storage.get_run_detail(run_id)
+        detail = await run_in_threadpool(app_storage.get_run_detail, run_id)
         if not detail:
             raise HTTPException(status_code=404, detail="未找到对应的执行批次。")
         return detail
@@ -462,12 +576,22 @@ def create_app(
     @app.get("/api/history", dependencies=[Depends(require_auth)])
     async def api_history(
         provider_id: Optional[str] = Query(default=None),
-        month: Optional[str] = Query(default=None),
+        month: Optional[str] = Query(
+            default=None, pattern=r"^\d{4}-(?:0[1-9]|1[0-2])$"
+        ),
+        biz_date: Optional[str] = Query(
+            default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"
+        ),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
-        return app_storage.get_history(
-            limit=limit, provider_id=provider_id, month=month, offset=offset
+        return await run_in_threadpool(
+            app_storage.get_history,
+            limit=limit,
+            provider_id=provider_id,
+            month=month,
+            offset=offset,
+            biz_date=biz_date,
         )
 
     @app.get("/api/notifications", dependencies=[Depends(require_auth)])
@@ -475,8 +599,11 @@ def create_app(
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
+        items = await run_in_threadpool(
+            app_storage.get_notifications, limit=limit, offset=offset
+        )
         return {
-            "notifications": app_storage.get_notifications(limit=limit, offset=offset),
+            "notifications": items,
             "limit": limit,
             "offset": offset,
         }
@@ -489,6 +616,10 @@ def create_app(
     async def api_maintenance_cleanup(
         req: MaintenanceCleanupRequest,
     ) -> dict[str, Any]:
+        if shutting_down:
+            raise HTTPException(
+                status_code=503, detail="本地 Web 服务正在关闭，无法执行数据清理。"
+            )
         if any(not state.finished for state in active_runs.values()):
             raise HTTPException(
                 status_code=409,
@@ -514,29 +645,33 @@ def create_app(
 
     @app.get("/api/settings", dependencies=[Depends(require_auth)])
     async def api_get_settings() -> dict[str, Any]:
-        providers = []
-        for p in app_providers:
-            cfg = app_storage.get_provider_config(p.id)
-            providers.append(
-                {
-                    "provider_id": p.id,
-                    "display_name": p.display_name,
-                    "description": p.description,
-                    "supports_browser_auth": p.supports_browser_auth,
-                    "supports_streak": p.supports_streak,
-                    "fixed_business_day_start": p.fixed_business_day_start,
-                    **cfg.model_dump(),
-                }
-            )
+        def _load() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            providers = []
+            for p in app_providers:
+                cfg = app_storage.get_provider_config(p.id)
+                providers.append(
+                    {
+                        "provider_id": p.id,
+                        "display_name": p.display_name,
+                        "description": p.description,
+                        "supports_browser_auth": p.supports_browser_auth,
+                        "supports_streak": p.supports_streak,
+                        "fixed_business_day_start": p.fixed_business_day_start,
+                        **cfg.model_dump(),
+                    }
+                )
+            return app_storage.get_settings().model_dump(), providers
+
+        global_cfg, providers = await run_in_threadpool(_load)
         return {
-            "global": app_storage.get_settings().model_dump(),
+            "global": global_cfg,
             "providers": providers,
             "schedule": await schedule_status_cached(),
         }
 
     @app.put("/api/settings", dependencies=[Depends(require_auth)])
     async def api_put_settings(payload: GlobalSettings) -> dict[str, Any]:
-        saved = app_storage.save_settings(payload)
+        saved = await run_in_threadpool(app_storage.save_settings, payload)
         return {"global": saved.model_dump()}
 
     @app.put("/api/providers/{provider_id}/config", dependencies=[Depends(require_auth)])
@@ -548,63 +683,83 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-        cfg = app_storage.get_provider_config(provider_id)
-        if req.enabled is not None:
-            cfg.enabled = req.enabled
-        if req.earliest_time is not None:
-            cfg.earliest_time = req.earliest_time.strip()
-        if req.business_day_start is not None:
-            requested_start = req.business_day_start.strip()
-            if (
-                provider.fixed_business_day_start
-                and requested_start != provider.fixed_business_day_start
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"{provider.display_name} 的业务日起始时间固定为 "
-                        f"{provider.fixed_business_day_start}，不可修改。"
-                    ),
-                )
-            cfg.business_day_start = requested_start
-        if req.checkin_credits is not None:
-            cfg.checkin_credits = req.checkin_credits
+        async with config_lock:
+            cfg = await run_in_threadpool(app_storage.get_provider_config, provider_id)
+            if req.enabled is not None:
+                cfg.enabled = req.enabled
+            if req.earliest_time is not None:
+                cfg.earliest_time = req.earliest_time.strip()
+            if req.business_day_start is not None:
+                requested_start = req.business_day_start.strip()
+                if (
+                    provider.fixed_business_day_start
+                    and requested_start != provider.fixed_business_day_start
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"{provider.display_name} 的业务日起始时间固定为 "
+                            f"{provider.fixed_business_day_start}，不可修改。"
+                        ),
+                    )
+                cfg.business_day_start = requested_start
+            if req.checkin_credits is not None:
+                cfg.checkin_credits = req.checkin_credits
 
-        extra = dict(cfg.extra)
-        if req.jitter_override is False:
-            extra.pop("jitter_override", None)
-        if req.jitter_minutes is not None:
-            cfg.jitter_minutes = req.jitter_minutes
-            extra["jitter_override"] = True
-        elif req.jitter_override is True:
-            extra["jitter_override"] = True
-        for field_name in (
-            "auth_file_path",
-            "client_exe_path",
-            "browser_state_path",
-            "base_url",
-        ):
-            val = getattr(req, field_name)
-            if val is not None:
-                cleaned = val.strip()
-                if cleaned:
-                    extra[field_name] = cleaned
+            extra = dict(cfg.extra)
+            if req.jitter_minutes is not None:
+                cfg.jitter_minutes = req.jitter_minutes
+            if req.jitter_override is False:
+                extra.pop("jitter_override", None)
+            elif req.jitter_override is True or req.jitter_minutes is not None:
+                extra["jitter_override"] = True
+            path_specs: dict[str, tuple[str, dict[str, bool]]] = {
+                "auth_file_path": ("登录态文件路径", {}),
+                "client_exe_path": ("客户端可执行文件路径", {"require_exe_on_windows": True}),
+                "browser_state_path": (
+                    "浏览器会话文件路径",
+                    {"restrict_to_data_dir": True, "require_json": True},
+                ),
+            }
+            for field_name, (label, opts) in path_specs.items():
+                val = getattr(req, field_name)
+                if val is not None:
+                    try:
+                        cleaned = validate_local_file_path(val, field_label=label, **opts)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
+                    if cleaned:
+                        extra[field_name] = cleaned
+                    else:
+                        extra.pop(field_name, None)
+
+            if req.base_url is not None:
+                try:
+                    cleaned_url = validate_provider_base_url(provider_id, req.base_url)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                if cleaned_url:
+                    extra["base_url"] = cleaned_url
                 else:
-                    extra.pop(field_name, None)
-        if req.allow_token_refresh is not None:
-            extra["allow_token_refresh"] = bool(req.allow_token_refresh)
-        cfg.extra = extra
+                    extra.pop("base_url", None)
+            if req.allow_token_refresh is not None:
+                extra["allow_token_refresh"] = bool(req.allow_token_refresh)
+            cfg.extra = extra
 
-        saved = app_storage.save_provider_config(cfg)
-        return {"provider": saved.model_dump()}
+            saved = await run_in_threadpool(app_storage.save_provider_config, cfg)
+            return {"provider": saved.model_dump()}
 
     @app.get(
         "/api/providers/qoder/pat/status", dependencies=[Depends(require_auth)]
     )
     async def api_qoder_pat_status() -> dict[str, Any]:
         provider = resolve_qoder_provider()
-        cfg = app_storage.get_provider_config("qoder")
-        return {"ok": True, **provider.pat_status(cfg)}
+
+        def _status() -> dict[str, Any]:
+            cfg = app_storage.get_provider_config("qoder")
+            return {"ok": True, **provider.pat_status(cfg)}
+
+        return await run_in_threadpool(_status)
 
     @app.put("/api/providers/qoder/pat", dependencies=[Depends(require_auth)])
     async def api_save_qoder_pat(req: QoderPatRequest) -> dict[str, Any]:
@@ -624,21 +779,33 @@ def create_app(
             raise HTTPException(
                 status_code=500, detail=f"保存 PAT 失败：{exc}"
             ) from exc
-        cfg = app_storage.get_provider_config("qoder")
-        return {"ok": True, **provider.pat_status(cfg)}
+        if hasattr(provider, "clear_token_cache"):
+            provider.clear_token_cache()
+
+        def _status() -> dict[str, Any]:
+            cfg = app_storage.get_provider_config("qoder")
+            return {"ok": True, **provider.pat_status(cfg)}
+
+        return await run_in_threadpool(_status)
 
     @app.delete("/api/providers/qoder/pat", dependencies=[Depends(require_auth)])
     async def api_clear_qoder_pat() -> dict[str, Any]:
         provider = resolve_qoder_provider()
         path = get_qoder_pat_path()
         try:
-            path.unlink(missing_ok=True)
+            await run_in_threadpool(path.unlink, True)
         except OSError as exc:
             raise HTTPException(
                 status_code=500, detail=f"清除 PAT 失败：{exc}"
             ) from exc
-        cfg = app_storage.get_provider_config("qoder")
-        return {"ok": True, **provider.pat_status(cfg)}
+        if hasattr(provider, "clear_token_cache"):
+            provider.clear_token_cache()
+
+        def _status() -> dict[str, Any]:
+            cfg = app_storage.get_provider_config("qoder")
+            return {"ok": True, **provider.pat_status(cfg)}
+
+        return await run_in_threadpool(_status)
 
     @app.post("/api/providers/{provider_id}/launch-client", dependencies=[Depends(require_auth)])
     async def api_launch_client(provider_id: str) -> dict[str, Any]:
@@ -646,18 +813,31 @@ def create_app(
             provider = resolve_provider(provider_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        cfg = app_storage.get_provider_config(provider_id)
-        ok, msg = provider.launch_client(cfg)
+
+        def _launch() -> tuple[bool, str]:
+            cfg = app_storage.get_provider_config(provider_id)
+            return provider.launch_client(cfg)
+
+        ok, msg = await run_in_threadpool(_launch)
         if not ok:
             raise HTTPException(status_code=400, detail=msg)
         return {"ok": True, "message": msg}
 
     @app.post("/api/providers/{provider_id}/auth-browser", dependencies=[Depends(require_auth)])
     async def api_auth_browser(provider_id: str) -> dict[str, Any]:
+        if shutting_down:
+            raise HTTPException(
+                status_code=503, detail="本地 Web 服务正在关闭，无法启动浏览器授权。"
+            )
         try:
             provider = resolve_provider(provider_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not provider.supports_browser_auth:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{provider.display_name} 暂不支持受控浏览器授权。",
+            )
 
         existing = auth_tasks.get(provider_id)
         if existing and existing.status == "running":
@@ -667,7 +847,7 @@ def create_app(
                 "message": existing.message,
             }
 
-        cfg = app_storage.get_provider_config(provider_id)
+        cfg = await run_in_threadpool(app_storage.get_provider_config, provider_id)
         state = AuthTaskState(provider_id=provider_id)
         auth_tasks[provider_id] = state
 
@@ -713,19 +893,25 @@ def create_app(
 
     @app.post("/api/notifiers/test", dependencies=[Depends(require_auth)])
     async def api_test_notifier() -> dict[str, Any]:
-        ok, err = app_runner.notifier.send(
-            "GetEggs 通知测试",
-            "Windows 系统弹窗通知已连通，后续签到结果将通过此方式提醒。",
-            level="info",
-        )
-        app_storage.save_notification(
-            channel=app_runner.notifier.channel_id,
-            level="info",
-            title="GetEggs 通知测试",
-            message="手动触发弹窗测试",
-            success=ok,
-            error_message=err,
-        )
+        def _send() -> tuple[bool, Optional[str]]:
+            ok, err = app_runner.notifier.send(
+                "GetEggs 通知测试",
+                "Windows 系统弹窗通知已连通，后续签到结果将通过此方式提醒。",
+                level="info",
+            )
+            tz = app_storage.get_settings().timezone
+            app_storage.save_notification(
+                channel=app_runner.notifier.channel_id,
+                level="info",
+                title="GetEggs 通知测试",
+                message="手动触发弹窗测试",
+                success=ok,
+                biz_date=today_biz_date(tz),
+                error_message=err,
+            )
+            return ok, err
+
+        ok, err = await run_in_threadpool(_send)
         if not ok:
             raise HTTPException(status_code=500, detail=err or "发送弹窗通知失败。")
         return {"ok": True, "message": "已发送 Windows 系统弹窗，请留意右下角通知中心。"}
@@ -736,23 +922,33 @@ def create_app(
 
     @app.post("/api/schedule/install", dependencies=[Depends(require_auth)])
     async def api_schedule_install() -> dict[str, Any]:
-        settings = app_storage.get_settings()
-        configs = [app_storage.get_provider_config(p.id) for p in app_providers]
-        timeout_minutes = CheckinRunner.estimate_task_timeout_minutes(
-            settings, configs
-        )
-        try:
-            ok, msg = await run_in_threadpool(
-                install_schedule,
-                settings.schedule_time,
-                catchup_on_logon=settings.auto_catchup_on_logon,
-                timeout_minutes=timeout_minutes,
+        async with schedule_lock:
+            def _load_schedule_args() -> tuple[str, bool, int]:
+                settings = app_storage.get_settings()
+                configs = [app_storage.get_provider_config(p.id) for p in app_providers]
+                return (
+                    settings.schedule_time,
+                    settings.auto_catchup_on_logon,
+                    CheckinRunner.estimate_task_timeout_minutes(settings, configs),
+                )
+
+            schedule_time, catchup_on_logon, timeout_minutes = await run_in_threadpool(
+                _load_schedule_args
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not ok:
-            raise HTTPException(status_code=500, detail=msg)
-        schedule_cache["value"] = None
+            try:
+                ok, msg = await run_in_threadpool(
+                    install_schedule,
+                    schedule_time,
+                    catchup_on_logon=catchup_on_logon,
+                    timeout_minutes=timeout_minutes,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if not ok:
+                raise HTTPException(status_code=500, detail=msg)
+            schedule_cache["gen"] += 1
+            schedule_cache["value"] = None
+            schedule_cache["expires_at"] = 0.0
         return {
             "ok": True,
             "message": msg,
@@ -761,10 +957,13 @@ def create_app(
 
     @app.delete("/api/schedule", dependencies=[Depends(require_auth)])
     async def api_schedule_uninstall() -> dict[str, Any]:
-        ok, msg = await run_in_threadpool(uninstall_schedule)
-        if not ok:
-            raise HTTPException(status_code=500, detail=msg)
-        schedule_cache["value"] = None
+        async with schedule_lock:
+            ok, msg = await run_in_threadpool(uninstall_schedule)
+            if not ok:
+                raise HTTPException(status_code=500, detail=msg)
+            schedule_cache["gen"] += 1
+            schedule_cache["value"] = None
+            schedule_cache["expires_at"] = 0.0
         return {
             "ok": True,
             "message": msg,
@@ -773,21 +972,40 @@ def create_app(
 
     @app.post("/api/system/shutdown", dependencies=[Depends(require_auth)])
     async def api_shutdown() -> dict[str, Any]:
-        busy = any(not state.finished for state in active_runs.values())
-        if not busy:
-            busy = await run_in_threadpool(runner_lock_busy)
-        if busy:
-            raise HTTPException(
-                status_code=409,
-                detail="已有签到任务正在执行（含计划任务），请等待完成后再关闭 Web 服务。",
-            )
-        cleanup = getattr(app.state, "ui_state_cleanup", None)
-        if callable(cleanup):
-            cleanup()
+        nonlocal shutting_down
+        async with shutdown_lock:
+            if shutting_down:
+                return {"ok": True, "message": "本地 Web 服务正在关闭中。"}
+            busy = any(not state.finished for state in active_runs.values())
+            if not busy:
+                busy = any(state.status == "running" for state in auth_tasks.values())
+            if not busy:
+                busy = await run_in_threadpool(runner_lock_busy)
+            if not busy:
+                busy = any(not state.finished for state in active_runs.values()) or any(
+                    state.status == "running" for state in auth_tasks.values()
+                )
+            if busy:
+                raise HTTPException(
+                    status_code=409,
+                    detail="已有签到或授权任务正在执行（含计划任务），请等待完成后再关闭 Web 服务。",
+                )
+            shutting_down = True
+            cleanup = getattr(app.state, "ui_state_cleanup", None)
+            if callable(cleanup):
+                cleanup()
 
         async def _stop() -> None:
             await asyncio.sleep(0.3)
-            os.kill(os.getpid(), signal.SIGINT)
+            for run_state in list(active_runs.values()):
+                for q in list(run_state.subscribers):
+                    ActiveRunState._enqueue(q, None)
+            server = getattr(app.state, "uvicorn_server", None)
+            if server is not None:
+                server.should_exit = True
+                return
+            if os.name != "nt":
+                os.kill(os.getpid(), signal.SIGTERM)
 
         app.state.shutdown_task = asyncio.create_task(_stop())
         return {"ok": True, "message": "正在关闭本地 Web 服务，定时计划任务不受影响。"}

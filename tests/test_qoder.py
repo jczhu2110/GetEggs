@@ -656,3 +656,107 @@ def test_qoder_claim_not_confirmed(monkeypatch: pytest.MonkeyPatch) -> None:
     result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
 
     assert result.status == CheckinStatus.FAILED
+
+
+def test_qoder_claim_401_evicts_cached_job_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _campaigns_response([_campaign("CLAIMABLE")])
+        return httpx.Response(401, json={"error": "expired"})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    cfg = _cfg()
+    provider._remember_job_token(cfg, PAT, "stale-job-token", 3600)
+    assert provider._cached_job_token(cfg, PAT) == "stale-job-token"
+
+    result = asyncio.run(provider.checkin(cfg, BIZ_DATE))
+    assert result.status == CheckinStatus.AUTH_EXPIRED
+    assert provider._cached_job_token(cfg, PAT) is None
+
+
+def test_qoder_parse_time_and_fixed_business_day_start() -> None:
+    from datetime import datetime, timezone
+    from geteggs.providers.base import parse_timestamp
+
+    for bad in (True, False, "²", float("nan"), float("inf"), 1e20, -1e20):
+        assert parse_timestamp(bad) is None
+        assert QoderProvider._parse_time(bad) is None
+
+    # Fixed 10:00 business day must override ProviderConfig.business_day_start="00:00"
+    provider = QoderProvider()
+    cfg = _cfg()
+    cfg.business_day_start = "00:00"
+    before_reset = datetime(2026, 11, 24, 0, 30, tzinfo=timezone.utc)  # 08:30 Asia/Shanghai
+    after_reset = datetime(2026, 11, 24, 2, 30, tzinfo=timezone.utc)   # 10:30 Asia/Shanghai
+    assert provider.business_date(cfg, "Asia/Shanghai", now=before_reset) == "2026-11-23"
+    assert provider.business_date(cfg, "Asia/Shanghai", now=after_reset) == "2026-11-24"
+
+
+def test_qoder_pat_env_file_ignores_unrelated_keys_and_handles_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("QODERCN_PERSONAL_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("QODER_PERSONAL_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("CUSTOM_QODER_PAT", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# comment\nFOO=bar\nexport CUSTOM_QODER_PAT=\"qdr_live_token_123456\"\n",
+        encoding="utf-8",
+    )
+    cfg = _cfg(pat_env="CUSTOM_QODER_PAT", pat_file=str(env_file))
+    provider = QoderProvider()
+    pat, source = provider._resolve_pat(cfg)
+    assert pat == "qdr_live_token_123456"
+    assert source and str(env_file) in source
+
+
+def test_qoder_429_preserves_cached_job_token_and_doctor_400_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+
+    def handler_429(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "rate limited"})
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler_429))
+    cfg = _cfg()
+    provider._remember_job_token(cfg, PAT, "keep-me-token", 3600)
+    res = asyncio.run(provider.checkin(cfg, BIZ_DATE))
+    assert res.status == CheckinStatus.FAILED
+    assert provider._cached_job_token(cfg, PAT) == "keep-me-token"
+
+    def handler_400(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "bad request"})
+
+    provider_400 = QoderProvider(transport=httpx.MockTransport(handler_400))
+    doc = asyncio.run(provider_400.doctor(_cfg()))
+    assert doc.healthy is False
+    assert "400" in doc.message
+
+
+def test_base_build_http_client_falls_back_on_invalid_proxy_and_huge_int_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from geteggs.providers.base import BaseProvider, parse_timestamp
+
+    assert parse_timestamp(10**400) is None
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:abc")
+    client = BaseProvider.build_http_client()
+    asyncio.run(client.aclose())
+
+
+def test_qoder_pat_file_accepts_raw_token_with_equals_padding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("QODERCN_PERSONAL_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("QODER_PERSONAL_ACCESS_TOKEN", raising=False)
+    pat_file = tmp_path / "raw_pat.txt"
+    pat_file.write_text("pt-base64token==\n", encoding="utf-8")
+    provider = QoderProvider()
+    pat, _source = provider._resolve_pat(_cfg(pat_file=str(pat_file)))
+    assert pat == "pt-base64token=="

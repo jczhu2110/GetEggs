@@ -9,9 +9,11 @@ export const REDUCED_MOTION =
 export const appState = {
   providers: [],
   trend30d: null,
+  bizDate: null,
   activeRun: false,
   authBusy: false,
   historyDirty: true,
+  stopped: false,
 };
 
 export function escapeHtml(text) {
@@ -51,12 +53,17 @@ export function formatBytes(bytes) {
 }
 
 export function localTodayStr() {
+  if (appState.bizDate && /^\d{4}-\d{2}-\d{2}$/.test(appState.bizDate)) {
+    return appState.bizDate;
+  }
   const d = new Date();
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
+
+let bannerTimer = null;
 
 export function providerInitial(name) {
   return (name || "?").trim().slice(0, 1).toUpperCase();
@@ -76,14 +83,14 @@ export function showBanner(msg, isError = false) {
   el.setAttribute("role", isError ? "alert" : "status");
   el.classList.remove("toast-success", "toast-error");
   el.classList.add(isError ? "toast-error" : "toast-success", "show");
-  clearTimeout(window.__bannerTimer);
+  clearTimeout(bannerTimer);
   if (!isError) {
-    window.__bannerTimer = setTimeout(() => el.classList.remove("show"), 3600);
+    bannerTimer = setTimeout(() => el.classList.remove("show"), 3600);
   }
 }
 
 $("#toast-close")?.addEventListener("click", () => {
-  clearTimeout(window.__bannerTimer);
+  clearTimeout(bannerTimer);
   $("#toast-banner")?.classList.remove("show");
 });
 
@@ -98,36 +105,53 @@ export async function copyText(text, okMessage = "已复制到剪贴板") {
 }
 
 export async function apiFetch(url, options = {}) {
+  const { headers = {}, ...rest } = options;
   const resp = await fetch(url, {
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
+    ...rest,
+    headers: {
+      "Content-Type": "application/json",
+      "X-GetEggs-Request": "1",
+      ...headers,
+    },
   });
   const payload = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new Error(payload.detail || `请求失败 (${resp.status})`);
+    const detail = Array.isArray(payload.detail)
+      ? payload.detail.map((item) => item?.msg || JSON.stringify(item)).join("；")
+      : payload.detail;
+    throw new Error(detail || `请求失败 (${resp.status})`);
   }
   return payload;
 }
 
-export function statusPill(status) {
+export function statusPill(status, { historical = false } = {}) {
+  const doneLabel = historical ? "已签" : "今日已签";
+  const pendingLabel = historical ? "待签" : "今日待签";
   const map = {
     running: ["执行中", "pill-running"],
-    success: ["今日已签", "pill-ok"],
-    already_done: ["今日已签", "pill-ok"],
+    success: [doneLabel, "pill-ok"],
+    already_done: [doneLabel, "pill-ok"],
     auth_expired: ["登录态失效", "pill-err"],
     needs_manual: ["需手动处理", "pill-warn"],
     schema_changed: ["接口可能改版", "pill-err"],
     unavailable: ["未就绪", "pill-warn"],
     failed: ["执行异常", "pill-err"],
   };
-  const [label, cls] = map[status] || ["今日待签", "pill-muted"];
+  const [label, cls] = map[status] || [pendingLabel, "pill-muted"];
   const dot = status === "running" ? `<span class="status-dot running"></span>` : "";
   return `<span class="pill ${cls}">${dot}${label}</span>`;
 }
 
+const numberAnimFrames = new WeakMap();
+
 export function animateNumber(el, targetValue, prefix = "") {
   if (!el) return;
+  const existingFrame = numberAnimFrames.get(el);
+  if (existingFrame !== undefined) {
+    cancelAnimationFrame(existingFrame);
+    numberAnimFrames.delete(el);
+  }
   const numericTarget = Number(targetValue);
   if (!Number.isFinite(numericTarget)) {
     el.textContent = String(targetValue ?? "--");
@@ -151,12 +175,13 @@ export function animateNumber(el, targetValue, prefix = "") {
     const current = Math.round(prev + (numericTarget - prev) * eased);
     el.textContent = `${prefix}${current}`;
     if (progress < 1) {
-      requestAnimationFrame(step);
+      numberAnimFrames.set(el, requestAnimationFrame(step));
     } else {
+      numberAnimFrames.delete(el);
       el.textContent = `${prefix}${numericTarget}`;
     }
   };
-  requestAnimationFrame(step);
+  numberAnimFrames.set(el, requestAnimationFrame(step));
 }
 
 /**
@@ -174,6 +199,9 @@ export function confirmAction({
   if (!dialog || typeof dialog.showModal !== "function") {
     const extra = impacts.length ? `\n\n影响：\n- ${impacts.join("\n- ")}` : "";
     return Promise.resolve(window.confirm(`${message}${extra}`));
+  }
+  if (dialog.open) {
+    return Promise.resolve(false);
   }
 
   const titleEl = $("#confirm-title");

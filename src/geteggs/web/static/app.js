@@ -15,9 +15,12 @@ import {
   isSettingsFetched,
   loadMaintenanceInfo,
   loadSettings,
+  refreshProviderDoctor,
+  refreshScheduleStatus,
 } from "./settings.js";
 
 let activeTab = "overview";
+let trendResizeTimer = null;
 
 function positionNavIndicator() {
   const nav = $(".nav");
@@ -72,6 +75,7 @@ function activateTab(tab) {
       loadSettings({ autoDoctor: true });
     } else {
       loadMaintenanceInfo();
+      refreshScheduleStatus();
     }
   }
 }
@@ -118,12 +122,14 @@ $$("[data-goto-tab]").forEach((el) => {
     }
   };
   el.addEventListener("click", go);
-  el.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      go();
-    }
-  });
+  if (el.tagName !== "BUTTON" && el.tagName !== "A") {
+    el.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        go();
+      }
+    });
+  }
 });
 
 $$("[data-hero-action]").forEach((el) => {
@@ -152,13 +158,17 @@ document.addEventListener("click", (ev) => {
 });
 
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") closeMoreMenus();
+  if (ev.key === "Escape") {
+    const openMenu = $(".more-menu[open]");
+    closeMoreMenus();
+    openMenu?.querySelector("summary")?.focus();
+  }
 });
 
 window.addEventListener("resize", () => {
   positionNavIndicator();
-  clearTimeout(window.__trendResizeTimer);
-  window.__trendResizeTimer = setTimeout(() => {
+  clearTimeout(trendResizeTimer);
+  trendResizeTimer = setTimeout(() => {
     if (activeTab === "overview") renderMiniTrendChart(appState.trend30d, true);
     if (activeTab === "history") renderFullTrendChart(appState.trend30d, true);
   }, 150);
@@ -188,6 +198,9 @@ initOverview({
   onOpenHistory: () => {
     activateTab("history");
   },
+  onAuthComplete: (providerId) => {
+    refreshProviderDoctor(providerId);
+  },
 });
 
 initHistory();
@@ -207,7 +220,11 @@ document.body.dataset.tab = "overview";
 requestAnimationFrame(positionNavIndicator);
 loadOverview();
 
-setInterval(() => {
+const pollTimer = setInterval(() => {
+  if (appState.stopped) {
+    clearInterval(pollTimer);
+    return;
+  }
   if (!appState.activeRun && !appState.authBusy && document.visibilityState === "visible") {
     loadOverview(true);
   }

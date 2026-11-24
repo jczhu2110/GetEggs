@@ -26,14 +26,23 @@ const historyState = {
 
 let activeAuditSubtab = "runs";
 let openRunId = null;
+let historyRequestSeq = 0;
+let historyController = null;
+let historyLoading = false;
 
 function currentMonthLocal() {
+  const today = localTodayStr();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(today)) {
+    return today.slice(0, 7);
+  }
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 }
 
 function shiftMonth(monthStr, deltaMonths) {
-  const [y, m] = (monthStr || currentMonthLocal()).split("-").map(Number);
+  const parts = String(monthStr || currentMonthLocal()).split("-").map(Number);
+  const y = Number.isInteger(parts[0]) && parts[0] > 1900 ? parts[0] : new Date().getFullYear();
+  const m = Number.isInteger(parts[1]) && parts[1] >= 1 && parts[1] <= 12 ? parts[1] : new Date().getMonth() + 1;
   const dt = new Date(y, m - 1 + deltaMonths, 1);
   return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
 }
@@ -55,7 +64,7 @@ function historyRowHtml(r) {
     <tr>
       <td>${escapeHtml(r.biz_date)}</td>
       <td>${escapeHtml(r.display_name)}</td>
-      <td>${statusPill(r.status)}</td>
+      <td>${statusPill(r.status, { historical: true })}</td>
       <td>${r.delta > 0 ? `+${r.delta}` : "0"}</td>
       <td>${escapeHtml(streakText(r))}</td>
       <td>${escapeHtml(r.message)}</td>
@@ -94,12 +103,15 @@ function renderLedgerRows() {
       statusEl.textContent = "";
     } else if (historyState.hasMore) {
       statusEl.textContent = `已加载 ${historyState.loadedRecords.length} 条`;
+    } else if (historyState.selectedDate) {
+      statusEl.textContent = `已显示 ${historyState.selectedDate} 全部 ${historyState.loadedRecords.length} 条记录`;
     } else {
       statusEl.textContent = `已显示本月全部 ${historyState.loadedRecords.length} 条记录`;
     }
   }
   if (loadMoreBtn) {
     loadMoreBtn.hidden = !historyState.hasMore;
+    loadMoreBtn.disabled = historyLoading;
   }
 
   const rows = filtered.map(historyRowHtml).join("");
@@ -138,11 +150,12 @@ function renderCalendar(monthStr, calItems) {
       cls = "future";
     }
     if (dateKey === todayKey) cls += " today";
-    if (dateKey === historyState.selectedDate) cls += " selected-day";
+    const isSelected = dateKey === historyState.selectedDate;
+    if (isSelected) cls += " selected-day";
 
     if (item) {
       cells += `
-        <button type="button" class="cal-day ${cls.trim()}" data-cal-date="${escapeHtml(dateKey)}" title="${escapeHtml(dateKey)} ${escapeHtml(badge)}">
+        <button type="button" class="cal-day ${cls.trim()}" data-cal-date="${escapeHtml(dateKey)}" aria-pressed="${isSelected ? "true" : "false"}" title="${escapeHtml(dateKey)} ${escapeHtml(badge)}">
           <span class="cal-num">${d}</span>
           <span class="cal-delta">${escapeHtml(badge)}</span>
         </button>
@@ -159,9 +172,13 @@ function renderCalendar(monthStr, calItems) {
   grid.innerHTML = weekdays + cells;
 }
 
-export async function loadHistory(reset = true) {
+export async function loadHistory(
+  reset = true,
+  { keepSelectedDate = false, skipCalendarRender = false } = {}
+) {
   const monthInput = $("#history-month");
   if (!monthInput) return;
+  if (!reset && historyLoading) return;
   if (!monthInput.value) {
     monthInput.value = currentMonthLocal();
   }
@@ -169,33 +186,63 @@ export async function loadHistory(reset = true) {
   const provider = $("#history-provider")?.value || "";
   if (reset) {
     historyState.offset = 0;
-    historyState.selectedDate = null;
+    if (!keepSelectedDate) {
+      historyState.selectedDate = null;
+    }
     historyState.loadedRecords = [];
+    if (historyController) {
+      historyController.abort();
+    }
   }
+  const reqSeq = ++historyRequestSeq;
+  const controller = new AbortController();
+  historyController = controller;
+  historyLoading = true;
+  const loadMoreBtn = $("#btn-load-more-history");
+  if (loadMoreBtn) loadMoreBtn.disabled = true;
+
   const params = new URLSearchParams({
     month,
     limit: String(historyState.limit),
     offset: String(historyState.offset),
   });
   if (provider) params.set("provider_id", provider);
+  if (historyState.selectedDate) params.set("biz_date", historyState.selectedDate);
 
   try {
-    const data = await apiFetch(`/api/history?${params.toString()}`);
+    const data = await apiFetch(`/api/history?${params.toString()}`, {
+      signal: controller.signal,
+    });
+    if (reqSeq !== historyRequestSeq) return;
     const records = data.records || [];
     if (reset) {
+      const sameMonth = historyState.activeMonth === month;
       historyState.activeMonth = month;
       historyState.calendarItems = data.calendar || [];
-      renderCalendar(month, historyState.calendarItems);
+      if (!(skipCalendarRender && sameMonth)) {
+        renderCalendar(month, historyState.calendarItems);
+      } else {
+        updateCalendarSelectionInPlace();
+      }
       historyState.loadedRecords = records;
     } else {
       historyState.loadedRecords = historyState.loadedRecords.concat(records);
     }
     historyState.offset += records.length;
-    historyState.hasMore = records.length >= historyState.limit;
+    historyState.hasMore =
+      typeof data.has_more === "boolean"
+        ? data.has_more
+        : records.length >= historyState.limit;
     renderLedgerRows();
   } catch (err) {
+    if (err?.name === "AbortError" || reqSeq !== historyRequestSeq) return;
     appState.historyDirty = true;
     showBanner(err.message, true);
+  } finally {
+    if (reqSeq === historyRequestSeq) {
+      historyLoading = false;
+      if (loadMoreBtn) loadMoreBtn.disabled = false;
+    }
   }
 }
 
@@ -271,7 +318,7 @@ async function toggleRunDetail(runId, triggerBtn) {
           (r) => `
             <tr>
               <td>${escapeHtml(providerDisplayName(r.provider_id, r.display_name))}</td>
-              <td>${statusPill(r.status)}</td>
+              <td>${statusPill(r.status, { historical: true })}</td>
               <td>${r.delta > 0 ? `+${r.delta}` : "0"}</td>
               <td>${escapeHtml(streakText(r))}</td>
               <td>${r.duration_ms ?? 0} ms</td>
@@ -404,14 +451,22 @@ export function renderHistoryTrend(fromCache = true) {
   renderFullTrendChart(appState.trend30d, fromCache);
 }
 
+function updateCalendarSelectionInPlace() {
+  $$("#calendar-grid [data-cal-date]").forEach((btn) => {
+    const selected = btn.dataset.calDate === historyState.selectedDate;
+    btn.classList.toggle("selected-day", selected);
+    btn.setAttribute("aria-pressed", selected ? "true" : "false");
+  });
+}
+
 export function initHistory() {
   $("#calendar-grid")?.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-cal-date]");
     if (!btn) return;
     const clicked = btn.dataset.calDate;
     historyState.selectedDate = historyState.selectedDate === clicked ? null : clicked;
-    renderCalendar(historyState.activeMonth, historyState.calendarItems);
-    renderLedgerRows();
+    updateCalendarSelectionInPlace();
+    loadHistory(true, { keepSelectedDate: true, skipCalendarRender: true });
   });
 
   $("#runs-tbody")?.addEventListener("click", (ev) => {
@@ -460,7 +515,7 @@ export function initHistory() {
   });
   $("#btn-clear-date-filter")?.addEventListener("click", () => {
     historyState.selectedDate = null;
-    renderCalendar(historyState.activeMonth, historyState.calendarItems);
-    renderLedgerRows();
+    updateCalendarSelectionInPlace();
+    loadHistory(true, { keepSelectedDate: true });
   });
 }

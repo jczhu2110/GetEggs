@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import os
@@ -15,6 +16,39 @@ from typing import Any, Optional
 from geteggs.core.config import get_data_dir
 
 TASK_NAME = "GetEggs-DailyCheckin"
+
+
+def _ps_b64_expr(value: str) -> str:
+    """Encode an arbitrary string into a safe PowerShell UTF-8 expression.
+
+    Base64 contains only ASCII [A-Za-z0-9+/=], preventing ASCII or Unicode
+    single-quote breakouts and ANSI code-page mangling.
+    """
+    b64 = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64}'))"
+
+
+def _current_windows_user() -> Optional[str]:
+    username = (os.environ.get("USERNAME") or "").strip()
+    if not username:
+        return None
+    domain = (os.environ.get("USERDOMAIN") or "").strip()
+    return f"{domain}\\{username}" if domain else username
+
+
+def _is_access_denied_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered or marker in text
+        for marker in (
+            "access is denied",
+            "access denied",
+            "unauthorizedaccess",
+            "0x80070005",
+            "拒绝访问",
+            "权限",
+        )
+    )
 
 
 def _resolve_python_executable() -> str:
@@ -63,7 +97,6 @@ def _validate_hhmm(time_str: str) -> str:
 def _run_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
     kwargs: dict[str, Any] = {
         "capture_output": True,
-        "text": True,
         "timeout": timeout,
     }
     if os.name == "nt":
@@ -72,7 +105,11 @@ def _run_ps(script: str, timeout: float = 15) -> tuple[int, str, str]:
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
         **kwargs,
     )
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    return (
+        proc.returncode,
+        _decode_output(proc.stdout).strip(),
+        _decode_output(proc.stderr).strip(),
+    )
 
 
 _MISSING_MARKERS = (
@@ -153,7 +190,7 @@ try {{
 }} catch {{
     $errorId = [string]$_.FullyQualifiedErrorId
     $errorText = [string]$_.Exception.Message
-    if ($errorId -match 'NotFound' -or $errorText -match 'No MSFT_ScheduledTask objects found') {{
+    if ($errorId -match 'NotFound|ObjectNotFound' -or $errorText -match 'No MSFT_ScheduledTask objects found|0x80070002') {{
         @{{ installed = $false }} | ConvertTo-Json -Compress
     }} else {{
         @{{ error = $errorText }} | ConvertTo-Json -Compress
@@ -191,9 +228,19 @@ $info = Get-ScheduledTaskInfo -TaskName '{TASK_NAME}'
             "message": f"查询计划任务失败：{err or out}",
         }
     try:
-        data = json.loads(out) if out else {}
+        data = json.loads(out) if out else None
     except ValueError:
-        data = {}
+        data = None
+
+    if not isinstance(data, dict):
+        return {
+            "supported": True,
+            "installed": False,
+            "query_failed": True,
+            "elevated": _is_elevated(),
+            "task_name": TASK_NAME,
+            "message": "查询计划任务失败：返回结果无法解析为 JSON。",
+        }
 
     if data.get("error"):
         return {
@@ -212,7 +259,7 @@ $info = Get-ScheduledTaskInfo -TaskName '{TASK_NAME}'
         message = "尚未安装系统计划任务。"
     elif state and str(state).lower() not in ("ready", "running", "queued"):
         message = f"计划任务已安装，但当前状态为 {state}。"
-    elif last_task_result not in (None, 0, 267011, 267009):
+    elif last_task_result not in (None, 0, 267008, 267009, 267011):
         message = f"计划任务已安装，但上次执行返回异常代码 {last_task_result}。"
     else:
         message = "计划任务已安装并就绪。"
@@ -240,7 +287,13 @@ def _is_elevated() -> bool:
 
 
 def _install_schedule_elevated(
-    python_exe: str, work_dir: str
+    python_exe: str,
+    work_dir: str,
+    *,
+    schedule_time: str,
+    catchup_on_logon: bool,
+    timeout_minutes: int,
+    target_user: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Re-run the install command through UAC when the current token is filtered."""
     fd, result_name = tempfile.mkstemp(
@@ -248,13 +301,33 @@ def _install_schedule_elevated(
     )
     os.close(fd)
     result_path = Path(result_name)
-    py_exe = python_exe.replace("'", "''")
-    ps_work_dir = work_dir.replace("'", "''")
-    ps_result = str(result_path).replace("'", "''")
+    pfd, params_name = tempfile.mkstemp(
+        prefix="geteggs-elevated-params-", suffix=".json"
+    )
+    os.close(pfd)
+    params_path = Path(params_name)
+    params_path.write_text(
+        json.dumps(
+            {
+                "schedule_time": schedule_time,
+                "catchup_on_logon": bool(catchup_on_logon),
+                "working_dir": work_dir,
+                "timeout_minutes": int(timeout_minutes),
+                "target_user": target_user,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     ps = f"""
 $ErrorActionPreference = 'Stop'
-$p = Start-Process -FilePath '{py_exe}' -ArgumentList @('-m','geteggs','schedule','install','--no-elevate','--result-file','{ps_result}') -WorkingDirectory '{ps_work_dir}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+$pyExe = {_ps_b64_expr(python_exe)}
+$workDir = {_ps_b64_expr(work_dir)}
+$resultFile = {_ps_b64_expr(str(result_path))}
+$paramsFile = {_ps_b64_expr(str(params_path))}
+$argList = @('-m', 'geteggs', 'schedule', 'install', '--no-elevate', '--result-file', ('"' + $resultFile + '"'), '--params-file', ('"' + $paramsFile + '"'))
+$p = Start-Process -FilePath $pyExe -ArgumentList $argList -WorkingDirectory $workDir -Verb RunAs -Wait -PassThru -WindowStyle Hidden
 exit $p.ExitCode
 """.strip()
 
@@ -286,6 +359,7 @@ exit $p.ExitCode
         return False, f"提权安装计划任务失败：{text or '未知错误'}"
     finally:
         result_path.unlink(missing_ok=True)
+        params_path.unlink(missing_ok=True)
 
 
 def install_schedule(
@@ -295,6 +369,7 @@ def install_schedule(
     working_dir: Optional[Path] = None,
     timeout_minutes: int = 25,
     elevate: bool = True,
+    target_user: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Register daily + logon catch-up scheduled task in Windows Task Scheduler."""
     if os.name != "nt":
@@ -305,8 +380,7 @@ def install_schedule(
     python_exe = _resolve_python_executable()
     probe_exe = _resolve_probe_executable()
     work_dir_raw = str((working_dir or get_data_dir()).resolve())
-    py_exe = python_exe.replace("'", "''")
-    work_dir = work_dir_raw.replace("'", "''")
+    effective_user = (target_user or _current_windows_user() or "").strip() or None
 
     imported, probe_error = _probe_package_import(probe_exe, work_dir_raw)
     if not imported:
@@ -318,17 +392,35 @@ def install_schedule(
 
     if elevate and not _is_elevated():
         try:
-            return _install_schedule_elevated(probe_exe, work_dir_raw)
+            return _install_schedule_elevated(
+                probe_exe,
+                work_dir_raw,
+                schedule_time=hhmm,
+                catchup_on_logon=catchup_on_logon,
+                timeout_minutes=timeout,
+                target_user=effective_user,
+            )
         except OSError as exc:
             return False, f"请求管理员权限失败：{exc}"
 
-    triggers_block = f"$triggers = @((New-ScheduledTaskTrigger -Daily -At '{hhmm}'))"
+    user_expr = (
+        _ps_b64_expr(effective_user)
+        if effective_user
+        else 'if ($env:USERDOMAIN) { "$env:USERDOMAIN\\$env:USERNAME" } else { $env:USERNAME }'
+    )
+    triggers_block = "$triggers = @((New-ScheduledTaskTrigger -Daily -At $scheduleAt))"
     if catchup_on_logon:
-        triggers_block += "\n$triggers += (New-ScheduledTaskTrigger -AtLogOn)"
+        triggers_block += "\n$triggers += (New-ScheduledTaskTrigger -AtLogOn -User $userId)"
 
     ps = f"""
 $ErrorActionPreference = 'Stop'
-$action = New-ScheduledTaskAction -Execute '{py_exe}' -Argument '-m geteggs run --missed-only --jitter' -WorkingDirectory '{work_dir}'
+$pyExe = {_ps_b64_expr(python_exe)}
+$workDir = {_ps_b64_expr(work_dir_raw)}
+$scheduleAt = {_ps_b64_expr(hhmm)}
+$taskName = {_ps_b64_expr(TASK_NAME)}
+$executeCmd = if ($pyExe -match '\\s') {{ '"' + $pyExe + '"' }} else {{ $pyExe }}
+$userId = {user_expr}
+$action = New-ScheduledTaskAction -Execute $executeCmd -Argument '-m geteggs run --missed-only --jitter' -WorkingDirectory $workDir
 {triggers_block}
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -336,9 +428,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Minutes {timeout}) `
     -MultipleInstances IgnoreNew
-$userId = if ($env:USERDOMAIN) {{ "$env:USERDOMAIN\\$env:USERNAME" }} else {{ $env:USERNAME }}
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
 Write-Output 'OK'
 """.strip()
 
@@ -356,15 +447,73 @@ Write-Output 'OK'
     return False, f"注册计划任务失败：{err or out}"
 
 
-def uninstall_schedule() -> tuple[bool, str]:
+def _uninstall_schedule_elevated(python_exe: str, work_dir: str) -> tuple[bool, str]:
+    """Re-run the uninstall command through UAC when direct removal is denied."""
+    fd, result_name = tempfile.mkstemp(
+        prefix="geteggs-elevated-uninstall-", suffix=".json"
+    )
+    os.close(fd)
+    result_path = Path(result_name)
+
+    ps = f"""
+$ErrorActionPreference = 'Stop'
+$pyExe = {_ps_b64_expr(python_exe)}
+$workDir = {_ps_b64_expr(work_dir)}
+$resultFile = {_ps_b64_expr(str(result_path))}
+$argList = @('-m', 'geteggs', 'schedule', 'uninstall', '--no-elevate', '--result-file', ('"' + $resultFile + '"'))
+$p = Start-Process -FilePath $pyExe -ArgumentList $argList -WorkingDirectory $workDir -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+exit $p.ExitCode
+""".strip()
+
+    try:
+        try:
+            code, out, err = _run_ps(ps, timeout=120)
+        except subprocess.TimeoutExpired:
+            status = get_schedule_status()
+            if not status.get("installed") and not status.get("query_failed"):
+                return True, f"管理员授权等待超时，但检测到计划任务 {TASK_NAME} 已移除。"
+            return False, "等待管理员授权超时，计划任务未移除。"
+        payload: dict[str, Any] = {}
+        try:
+            if result_path.is_file() and result_path.stat().st_size > 0:
+                parsed = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    payload = parsed
+        except (OSError, ValueError):
+            payload = {}
+        if payload:
+            return bool(payload.get("ok")), str(payload.get("message") or "")
+        if code == 0:
+            return True, f"已通过管理员权限移除计划任务 {TASK_NAME}。"
+        text = f"{err}\n{out}".strip()
+        lowered = text.lower()
+        if "取消" in text or "cancelled" in lowered or "0x800704c7" in lowered:
+            return False, "已取消管理员授权，计划任务未移除。"
+        return False, f"提权移除计划任务失败：{text or '未知错误'}"
+    finally:
+        result_path.unlink(missing_ok=True)
+
+
+def uninstall_schedule(*, elevate: bool = True) -> tuple[bool, str]:
     """Remove the GetEggs scheduled task from Windows Task Scheduler."""
     if os.name != "nt":
         return False, "当前非 Windows 系统。"
 
     ps = f"""
-$t = Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue
+$ErrorActionPreference = 'Stop'
+$taskName = {_ps_b64_expr(TASK_NAME)}
+$t = $null
+try {{
+    $t = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+}} catch {{
+    $errorId = [string]$_.FullyQualifiedErrorId
+    $errorText = [string]$_.Exception.Message
+    if (-not ($errorId -match 'NotFound|ObjectNotFound' -or $errorText -match 'No MSFT_ScheduledTask objects found|0x80070002')) {{
+        throw
+    }}
+}}
 if ($t) {{
-    Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
 }}
 Write-Output 'OK'
 """.strip()
@@ -374,4 +523,12 @@ Write-Output 'OK'
         return False, f"移除计划任务失败：{exc}"
     if code == 0:
         return True, f"已移除计划任务 {TASK_NAME}。"
+    combined = f"{err}\n{out}".strip()
+    if elevate and not _is_elevated() and _is_access_denied_text(combined):
+        try:
+            return _uninstall_schedule_elevated(
+                _resolve_probe_executable(), str(get_data_dir().resolve())
+            )
+        except OSError as exc:
+            return False, f"请求管理员权限失败：{exc}"
     return False, f"移除计划任务失败：{err or out}"

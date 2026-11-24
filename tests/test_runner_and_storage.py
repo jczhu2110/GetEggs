@@ -907,3 +907,156 @@ def test_storage_get_runs_includes_summary_counts(tmp_path: Path) -> None:
     assert runs["run-dry"]["ok_count"] == 1
     assert runs["run-dry"]["total_delta"] == 0
     assert runs["run-dry"]["dry_run"] == 1
+
+
+def test_models_validate_assignment_and_timezone() -> None:
+    from pydantic import ValidationError
+
+    settings = GlobalSettings()
+    with pytest.raises(ValidationError):
+        settings.schedule_time = "invalid"
+    with pytest.raises(ValidationError):
+        GlobalSettings(timezone="Mars/Olympus")
+    assert GlobalSettings(timezone="UTC").timezone == "UTC"
+
+    cfg = ProviderConfig(provider_id="workbuddy")
+    with pytest.raises(ValidationError):
+        cfg.earliest_time = "9:00"
+    with pytest.raises(ValidationError):
+        cfg.jitter_minutes = 999
+
+
+def test_storage_run_id_index_history_biz_date_and_has_more(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "history_filter.db")
+    with storage._connect() as conn:
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+    assert "idx_records_run_id" in indexes
+
+    for idx, day in enumerate(("2026-11-17", "2026-11-18", "2026-11-18")):
+        storage.save_checkin_result(
+            f"run-{idx}",
+            CheckinResult(
+                provider_id="workbuddy",
+                display_name="WorkBuddy",
+                status=CheckinStatus.SUCCESS,
+                message=f"rec-{idx}",
+                biz_date=day,
+                snapshot=CreditSnapshot(delta=10),
+            ),
+        )
+
+    page1 = storage.get_history(limit=2, month="2026-11", offset=0)
+    assert len(page1["records"]) == 2
+    assert page1["has_more"] is True
+
+    page2 = storage.get_history(limit=2, month="2026-11", offset=2)
+    assert len(page2["records"]) == 1
+    assert page2["has_more"] is False
+
+    exact_page = storage.get_history(limit=3, month="2026-11", offset=0)
+    assert exact_page["has_more"] is False
+
+    day_only = storage.get_history(
+        limit=10, month="2026-11", biz_date="2026-11-17"
+    )
+    assert [r["biz_date"] for r in day_only["records"]] == ["2026-11-17"]
+    assert {c["biz_date"] for c in day_only["calendar"]} == {
+        "2026-11-17",
+        "2026-11-18",
+    }
+
+
+def test_storage_count_consecutive_failures_only_counts_action_required(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(tmp_path / "streak_fail.db")
+    storage.save_checkin_result(
+        "r1",
+        CheckinResult(
+            provider_id="workbuddy",
+            display_name="WorkBuddy",
+            status=CheckinStatus.FAILED,
+            message="transient network error",
+            biz_date="2026-11-18",
+        ),
+    )
+    storage.save_checkin_result(
+        "r2",
+        CheckinResult(
+            provider_id="workbuddy",
+            display_name="WorkBuddy",
+            status=CheckinStatus.AUTH_EXPIRED,
+            message="auth expired",
+            biz_date="2026-11-18",
+        ),
+    )
+    assert storage.count_consecutive_failures("workbuddy") == 1
+
+    storage.save_checkin_result(
+        "r3",
+        CheckinResult(
+            provider_id="workbuddy",
+            display_name="WorkBuddy",
+            status=CheckinStatus.NEEDS_MANUAL,
+            message="captcha",
+            biz_date="2026-11-18",
+        ),
+    )
+    assert storage.count_consecutive_failures("workbuddy") == 2
+
+
+def test_config_security_mixed_unc_port_and_resolved_data_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from geteggs.core.config import (
+        is_unc_path,
+        validate_local_file_path,
+        validate_provider_base_url,
+    )
+
+    for unc in (r"\/attacker\share\evil.exe", r"/\attacker\share\evil.exe"):
+        assert is_unc_path(unc) is True
+        with pytest.raises(ValueError, match="UNC"):
+            validate_local_file_path(
+                unc, field_label="exe", require_exe_on_windows=True, allow_custom=False
+            )
+        with pytest.raises(ValueError, match="UNC"):
+            validate_local_file_path(unc, field_label="exe", allow_custom=True)
+
+    with pytest.raises(ValueError, match="端口"):
+        validate_provider_base_url("qoder", "https://openapi.qoder.com.cn:abc")
+    with pytest.raises(ValueError, match="查询参数"):
+        validate_provider_base_url("qoder", "https://openapi.qoder.com.cn?x=1")
+
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    resolved = validate_local_file_path(
+        "session.json",
+        field_label="browser_state_path",
+        restrict_to_data_dir=True,
+        require_json=True,
+        allow_custom=False,
+    )
+    assert Path(resolved).is_absolute()
+    assert Path(resolved) == (tmp_path / "session.json").resolve()
+
+
+def test_storage_get_settings_falls_back_on_unavailable_persisted_timezone(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    storage = Storage(tmp_path / "tz_compat.db")
+    with storage._connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings(key, value_json, updated_at) "
+            "VALUES('global', ?, '2026-01-01T00:00:00Z')",
+            (json.dumps({"timezone": "Invalid/NoSuchZone"}),),
+        )
+    loaded = storage.get_settings()
+    assert loaded.timezone == "Asia/Shanghai"
