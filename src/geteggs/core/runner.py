@@ -15,7 +15,6 @@ from geteggs.core.lock import acquire_run_lock
 from geteggs.core.models import (
     CheckinResult,
     CheckinStatus,
-    CreditSnapshot,
     GlobalSettings,
     LogEvent,
     ProviderConfig,
@@ -166,10 +165,7 @@ class CheckinRunner:
             )
 
         if success_items:
-            lines = []
-            for r in success_items:
-                delta_str = f" +{r.snapshot.delta}" if r.snapshot and r.snapshot.delta > 0 else ""
-                lines.append(f"{r.display_name} 签到成功{delta_str}")
+            lines = [f"{r.display_name} 签到成功" for r in success_items]
             # 业务日可能不同于批次日期（例如补领上一周期），纳入去重键避免
             # 吞掉同一天后续新业务日的成功通知。
             provider_key = ",".join(
@@ -289,10 +285,6 @@ class CheckinRunner:
                                     status=CheckinStatus.ALREADY_DONE,
                                     message="本业务日已完成签到（本地账本缓存命中）。",
                                     biz_date=provider_biz_date,
-                                    snapshot=CreditSnapshot(
-                                        delta=0,
-                                        streak_days=existing.get("streak_days"),
-                                    ),
                                     dry_run=dry_run,
                                 )
                             )

@@ -30,7 +30,6 @@ from geteggs.core.config import (
 )
 from geteggs.core.lock import RunLockBusyError, acquire_run_lock, is_lock_busy
 from geteggs.core.models import (
-    MAX_CHECKIN_CREDITS,
     GlobalSettings,
     LogEvent,
     TriggerType,
@@ -63,7 +62,6 @@ class ProviderConfigUpdateRequest(BaseModel):
     earliest_time: Optional[str] = None
     business_day_start: Optional[str] = None
     jitter_minutes: Optional[int] = None
-    checkin_credits: Optional[int] = None
     jitter_override: Optional[bool] = None
     auth_file_path: Optional[str] = None
     client_exe_path: Optional[str] = None
@@ -92,15 +90,6 @@ class ProviderConfigUpdateRequest(BaseModel):
             return value
         if not 0 <= value <= 120:
             raise ValueError("Provider 随机抖动窗口必须在 0-120 分钟之间。")
-        return value
-
-    @field_validator("checkin_credits")
-    @classmethod
-    def _validate_checkin_credits(cls, value: Optional[int]) -> Optional[int]:
-        if value is None:
-            return value
-        if not 0 <= value <= MAX_CHECKIN_CREDITS:
-            raise ValueError(f"签到积分必须在 0-{MAX_CHECKIN_CREDITS} 之间。")
         return value
 
 
@@ -391,7 +380,6 @@ def create_app(
             settings = app_storage.get_settings()
             biz_date = today_biz_date(settings.timezone)
             cards: list[dict[str, Any]] = []
-            today_delta = 0
 
             for provider in app_providers:
                 cfg = app_storage.get_provider_config(provider.id)
@@ -399,11 +387,7 @@ def create_app(
                 # at 10:00), so early-morning runs show the previous business day.
                 provider_biz_date = provider.business_date(cfg, settings.timezone)
                 today_rec = app_storage.get_today_summary(provider.id, provider_biz_date)
-                latest_rec = app_storage.get_latest_snapshot_record(
-                    provider.id
-                ) or app_storage.get_latest_record(provider.id)
-                if today_rec and today_rec.get("delta"):
-                    today_delta += int(today_rec["delta"])
+                latest_rec = app_storage.get_latest_record(provider.id)
 
                 cards.append(
                     {
@@ -416,7 +400,6 @@ def create_app(
                         "extra": cfg.extra,
                         "client_installed": provider.detect_client_exe(cfg) is not None,
                         "supports_browser_auth": provider.supports_browser_auth,
-                        "supports_streak": provider.supports_streak,
                         "fixed_business_day_start": provider.fixed_business_day_start,
                         "today_record": today_rec,
                         "latest_record": latest_rec,
@@ -426,9 +409,7 @@ def create_app(
             return {
                 "version": __version__,
                 "biz_date": biz_date,
-                "today_delta": today_delta,
                 "providers": cards,
-                "trend_30d": app_storage.get_trend_30_days(settings.timezone),
                 "schedule": schedule_info,
                 "schedule_stale": schedule_stale,
             }
@@ -655,7 +636,6 @@ def create_app(
                         "display_name": p.display_name,
                         "description": p.description,
                         "supports_browser_auth": p.supports_browser_auth,
-                        "supports_streak": p.supports_streak,
                         "fixed_business_day_start": p.fixed_business_day_start,
                         **cfg.model_dump(),
                     }
@@ -703,8 +683,6 @@ def create_app(
                         ),
                     )
                 cfg.business_day_start = requested_start
-            if req.checkin_credits is not None:
-                cfg.checkin_credits = req.checkin_credits
 
             extra = dict(cfg.extra)
             if req.jitter_minutes is not None:

@@ -1,4 +1,4 @@
-"""Qoder CN daily Credits provider (Personal Access Token route)."""
+"""Qoder CN daily check-in provider (Personal Access Token route)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import hashlib
 import os
 import shutil
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import quote
@@ -21,11 +21,8 @@ from geteggs.core.config import (
     validate_provider_base_url,
 )
 from geteggs.core.models import (
-    DEFAULT_CHECKIN_CREDITS,
-    MAX_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
-    CreditSnapshot,
     DoctorResult,
     ProviderConfig,
 )
@@ -40,7 +37,7 @@ MAX_JOB_TOKEN_TTL_SECONDS = 86_400.0
 
 
 class QoderProvider(BaseProvider):
-    """Qoder CN daily 100 Credits claim using a PAT.
+    """Qoder CN daily check-in using a PAT.
 
     The campaign API is not officially documented. Failures are surfaced as
     normal provider results and never contain the PAT.
@@ -48,9 +45,8 @@ class QoderProvider(BaseProvider):
 
     id = "qoder"
     display_name = "Qoder"
-    description = "Qoder CN 每日 100 Credits 自动领取（PAT）"
+    description = "Qoder CN 每日自动签到（PAT）"
     supports_browser_auth = False
-    supports_streak = False
     fixed_business_day_start = "10:00"
 
     def __init__(self, transport: Optional[httpx.AsyncBaseTransport] = None) -> None:
@@ -225,11 +221,11 @@ class QoderProvider(BaseProvider):
                     for campaign in active
                 )
                 if claimable:
-                    message = "PAT 在线校验通过，当前有可领取的 Qoder CN 每日 Credits。"
+                    message = "PAT 在线校验通过，当前有可参与的 Qoder CN 每日签到活动。"
                 elif claimed:
-                    message = "PAT 在线校验通过，今日 Qoder Credits 已领取。"
+                    message = "PAT 在线校验通过，今日 Qoder CN 已完成签到。"
                 else:
-                    message = "PAT 在线校验通过，当前没有可领取的 Qoder CN 每日 Credits 活动。"
+                    message = "PAT 在线校验通过，当前没有可参与的 Qoder CN 每日签到活动。"
                 return result(
                     True,
                     message,
@@ -270,7 +266,7 @@ class QoderProvider(BaseProvider):
                 dry_run=dry_run,
             )
 
-        emit("info", f"正在查询 Qoder CN 每日 Credits 活动（凭证来源：{source or '未知'}）...")
+        emit("info", f"正在查询 Qoder CN 每日签到活动（凭证来源：{source or '未知'}）...")
         try:
             async with self.build_http_client(self._transport) as client:
                 response, payload, access_token = await self._fetch_campaigns_with_auth(
@@ -362,18 +358,17 @@ class QoderProvider(BaseProvider):
 
                 if claimable is None:
                     if claimed is not None:
-                        emit("info", "Qoder CN 今日 Credits 已领取。")
+                        emit("info", "Qoder CN 今日已完成签到。")
                         return self._result(
                             CheckinStatus.ALREADY_DONE,
-                            "今日 Qoder Credits 已领取。",
+                            "今日 Qoder CN 已完成签到。",
                             biz_date,
                             started=started,
                             dry_run=dry_run,
-                            snapshot=CreditSnapshot(delta=0),
                         )
                     return self._result(
                         CheckinStatus.UNAVAILABLE,
-                        "当前没有可领取的 Qoder CN 每日 Credits 活动。",
+                        "当前没有可参与的 Qoder CN 每日签到活动。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -390,12 +385,11 @@ class QoderProvider(BaseProvider):
                         raw_error_type="QoderSchemaError",
                     )
 
-                amount = self._benefit_amount(claimable, config.checkin_credits)
                 if dry_run:
-                    emit("info", f"Dry-Run：检测到可领取 {amount} Credits，未提交领取。")
+                    emit("info", "Dry-Run：检测到今日可签到活动，未提交签到。")
                     return self._result(
                         CheckinStatus.SUCCESS,
-                        f"Dry-Run：今日可领取 {amount} Qoder Credits（未提交）。",
+                        "Dry-Run：今日可签到（未提交）。",
                         biz_date,
                         started=started,
                         dry_run=True,
@@ -414,7 +408,7 @@ class QoderProvider(BaseProvider):
                     self._forget_job_token(config, pat)
                     return self._result(
                         CheckinStatus.AUTH_EXPIRED,
-                        "Qoder CN 领取凭证已失效，请更新 PAT。",
+                        "Qoder CN 签到凭证已失效，请更新 PAT。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -423,7 +417,7 @@ class QoderProvider(BaseProvider):
                 if claim_response.status_code in (404, 410):
                     return self._result(
                         CheckinStatus.SCHEMA_CHANGED,
-                        f"Qoder CN 领取接口返回 HTTP {claim_response.status_code}，接口可能已变更。",
+                        f"Qoder CN 签到接口返回 HTTP {claim_response.status_code}，接口可能已变更。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -432,7 +426,7 @@ class QoderProvider(BaseProvider):
                 if claim_response.status_code == 429:
                     return self._result(
                         CheckinStatus.FAILED,
-                        "Qoder CN 领取请求频率受限（HTTP 429），请稍后重试。",
+                        "Qoder CN 签到请求频率受限（HTTP 429），请稍后重试。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -441,7 +435,7 @@ class QoderProvider(BaseProvider):
                 if not claim_response.is_success:
                     return self._result(
                         CheckinStatus.FAILED,
-                        f"Qoder CN Credits 领取失败（HTTP {claim_response.status_code}）。",
+                        f"Qoder CN 签到失败（HTTP {claim_response.status_code}）。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -452,29 +446,20 @@ class QoderProvider(BaseProvider):
                 if claim_status != "CLAIMED":
                     return self._result(
                         CheckinStatus.FAILED,
-                        "Qoder CN 未确认 Credits 领取成功。",
+                        "Qoder CN 未确认签到成功。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
                         raw_error_type="QoderClaimUnconfirmed",
                     )
 
-                emit("info", f"已领取 Qoder CN 每日 {amount} Credits。")
-                validity_days = self._benefit_validity_days(claimable)
-                expiring_at = (
-                    datetime.now(timezone.utc) + timedelta(days=validity_days)
-                ).isoformat()
+                emit("info", "已完成 Qoder CN 今日签到。")
                 return self._result(
                     CheckinStatus.SUCCESS,
-                    f"已领取 Qoder CN 每日 {amount} Credits。",
+                    "已完成 Qoder CN 今日签到。",
                     biz_date,
                     started=started,
                     dry_run=dry_run,
-                    snapshot=CreditSnapshot(
-                        delta=amount,
-                        expiring_soon=amount,
-                        expiring_at=expiring_at,
-                    ),
                 )
         except ValueError as exc:
             return self._result(
@@ -748,36 +733,6 @@ class QoderProvider(BaseProvider):
         return parse_timestamp(value)
 
     @staticmethod
-    def _benefit_amount(
-        campaign: dict[str, Any],
-        default_credits: int = DEFAULT_CHECKIN_CREDITS,
-    ) -> int:
-        benefit = campaign.get("benefit")
-        if isinstance(benefit, dict):
-            amount = benefit.get("amount")
-            if isinstance(amount, int) and not isinstance(amount, bool):
-                return min(max(amount, 0), MAX_CHECKIN_CREDITS)
-        return min(max(default_credits, 0), MAX_CHECKIN_CREDITS)
-
-    @staticmethod
-    def _benefit_validity_days(
-        campaign: dict[str, Any], default_days: int = 30
-    ) -> int:
-        benefit = campaign.get("benefit")
-        validity = benefit.get("validity") if isinstance(benefit, dict) else None
-        if isinstance(validity, dict):
-            mode = str(validity.get("mode") or "").upper()
-            days = validity.get("days")
-            if (
-                mode in ("", "RELATIVE_DAYS")
-                and isinstance(days, int)
-                and not isinstance(days, bool)
-                and 1 <= days <= 3650
-            ):
-                return days
-        return default_days
-
-    @staticmethod
     def _claim_status(payload: dict[str, Any]) -> str:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         statuses = (
@@ -800,7 +755,6 @@ class QoderProvider(BaseProvider):
         *,
         started: float,
         dry_run: bool,
-        snapshot: Optional[CreditSnapshot] = None,
         raw_error_type: Optional[str] = None,
     ) -> CheckinResult:
         return CheckinResult(
@@ -809,7 +763,6 @@ class QoderProvider(BaseProvider):
             status=status,
             message=message,
             biz_date=biz_date,
-            snapshot=snapshot,
             duration_ms=int((time.perf_counter() - started) * 1000),
             dry_run=dry_run,
             raw_error_type=raw_error_type,

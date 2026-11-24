@@ -37,9 +37,6 @@ const RETENTION_PRESETS = {
   },
 };
 
-const DEFAULT_CHECKIN_CREDITS = 100;
-const MAX_CHECKIN_CREDITS = 1000000;
-
 const PROVIDER_EXTRA_FIELDS = {
   workbuddy: [
     {
@@ -364,15 +361,6 @@ function buildProviderAdvancedForm(provider) {
     ? `固定为 ${escapeHtml(fixedBusinessStart)}，由活动周期决定`
     : "跨过该时间才计入新一天";
   const jitterVal = extra.jitter_override ? escapeHtml(String(provider.jitter_minutes ?? 0)) : "";
-  const creditsVal = escapeHtml(
-    String(provider.checkin_credits ?? DEFAULT_CHECKIN_CREDITS)
-  );
-  const creditsHint =
-    pid === "qoder"
-      ? "Qoder 以活动返回金额为准，此项仅作兜底"
-      : pid === "trae"
-        ? "Trae 以接口返回积分为准，此项仅作兜底"
-        : "接口未返回奖励时按此计入";
   const allowRefresh = extra.allow_token_refresh !== false;
   const refreshToggle =
     pid === "trae"
@@ -402,10 +390,6 @@ function buildProviderAdvancedForm(provider) {
     <form class="subgrid-form" data-provider-form="${pidEsc}">
       ${extraInputs}
       ${refreshToggle}
-      <label class="field">
-        <span>签到积分（${creditsHint}，默认 ${DEFAULT_CHECKIN_CREDITS}）</span>
-        <input name="checkin_credits" type="number" min="0" max="${MAX_CHECKIN_CREDITS}" step="1" class="input" value="${creditsVal}" />
-      </label>
       <label class="field">
         <span>业务日起始时间（${businessStartHint}）</span>
         <input name="business_day_start" type="time" class="input" value="${businessStart}" ${fixedBusinessStart ? "disabled" : ""} />
@@ -742,7 +726,6 @@ function resetProviderForm(providerId) {
   const earliestInput = form.querySelector("[name='earliest_time']");
   const businessStartInput = form.querySelector("[name='business_day_start']");
   const jitterInput = form.querySelector("[name='jitter_minutes']");
-  const creditsInput = form.querySelector("[name='checkin_credits']");
   const allowRefreshInput = form.querySelector("[name='allow_token_refresh']");
   if (earliestInput) earliestInput.value = provider.earliest_time || "00:00";
   if (businessStartInput) {
@@ -751,9 +734,6 @@ function resetProviderForm(providerId) {
   }
   if (jitterInput) {
     jitterInput.value = extra.jitter_override ? String(provider.jitter_minutes ?? 0) : "";
-  }
-  if (creditsInput) {
-    creditsInput.value = String(provider.checkin_credits ?? DEFAULT_CHECKIN_CREDITS);
   }
   if (allowRefreshInput) {
     allowRefreshInput.checked = extra.allow_token_refresh !== false;
@@ -783,14 +763,6 @@ async function submitProviderForm(form) {
     if (businessStartInput && !businessStartInput.disabled && businessStartInput.value) {
       payload.business_day_start = businessStartInput.value;
     }
-    const creditsValue = (form.querySelector("[name='checkin_credits']")?.value ?? "").trim();
-    const checkinCredits =
-      creditsValue === "" ? DEFAULT_CHECKIN_CREDITS : Number(creditsValue);
-    if (!Number.isInteger(checkinCredits) || checkinCredits < 0 || checkinCredits > MAX_CHECKIN_CREDITS) {
-      showBanner(`签到积分必须是 0-${MAX_CHECKIN_CREDITS} 之间的整数。`, true);
-      return;
-    }
-    payload.checkin_credits = checkinCredits;
     const jitterValue = (form.querySelector("[name='jitter_minutes']")?.value ?? "").trim();
     if (jitterValue !== "") {
       const jitterNum = Number(jitterValue);

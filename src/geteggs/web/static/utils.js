@@ -8,7 +8,6 @@ export const REDUCED_MOTION =
 // 跨模块共享的轻量运行态，避免页面模块之间循环引用。
 export const appState = {
   providers: [],
-  trend30d: null,
   bizDate: null,
   activeRun: false,
   authBusy: false,
@@ -141,47 +140,6 @@ export function statusPill(status, { historical = false } = {}) {
   const [label, cls] = map[status] || [pendingLabel, "pill-muted"];
   const dot = status === "running" ? `<span class="status-dot running"></span>` : "";
   return `<span class="pill ${cls}">${dot}${label}</span>`;
-}
-
-const numberAnimFrames = new WeakMap();
-
-export function animateNumber(el, targetValue, prefix = "") {
-  if (!el) return;
-  const existingFrame = numberAnimFrames.get(el);
-  if (existingFrame !== undefined) {
-    cancelAnimationFrame(existingFrame);
-    numberAnimFrames.delete(el);
-  }
-  const numericTarget = Number(targetValue);
-  if (!Number.isFinite(numericTarget)) {
-    el.textContent = String(targetValue ?? "--");
-    delete el.dataset.numVal;
-    return;
-  }
-  const prevRaw = el.dataset.numVal;
-  const prev = prevRaw !== undefined ? Number(prevRaw) : null;
-  el.dataset.numVal = String(numericTarget);
-
-  if (REDUCED_MOTION || prev === null || !Number.isFinite(prev) || prev === numericTarget) {
-    el.textContent = `${prefix}${numericTarget}`;
-    return;
-  }
-
-  const duration = 320;
-  const start = performance.now();
-  const step = (now) => {
-    const progress = Math.min(1, (now - start) / duration);
-    const eased = 1 - Math.pow(1 - progress, 3);
-    const current = Math.round(prev + (numericTarget - prev) * eased);
-    el.textContent = `${prefix}${current}`;
-    if (progress < 1) {
-      numberAnimFrames.set(el, requestAnimationFrame(step));
-    } else {
-      numberAnimFrames.delete(el);
-      el.textContent = `${prefix}${numericTarget}`;
-    }
-  };
-  numberAnimFrames.set(el, requestAnimationFrame(step));
 }
 
 /**

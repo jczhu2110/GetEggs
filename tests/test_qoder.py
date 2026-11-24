@@ -7,7 +7,7 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 import pytest
@@ -50,10 +50,6 @@ def _campaigns_response(campaigns: list[dict[str, Any]]) -> httpx.Response:
     return httpx.Response(200, json={"data": {"campaigns": campaigns}})
 
 
-def test_qoder_reports_no_streak_support() -> None:
-    assert QoderProvider().supports_streak is False
-
-
 def test_qoder_already_claimed(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_pat(monkeypatch)
 
@@ -67,11 +63,9 @@ def test_qoder_already_claimed(monkeypatch: pytest.MonkeyPatch) -> None:
     result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
 
     assert result.status == CheckinStatus.ALREADY_DONE
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 0
 
 
-def test_qoder_claims_daily_credits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qoder_claims_daily_checkin(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_pat(monkeypatch)
     claimed = {"value": False}
 
@@ -84,16 +78,10 @@ def test_qoder_claims_daily_credits(monkeypatch: pytest.MonkeyPatch) -> None:
         return httpx.Response(200, json={"status": "CLAIMED"})
 
     provider = QoderProvider(transport=httpx.MockTransport(handler))
-    cfg = _cfg()
-    cfg.checkin_credits = 250
-    result = asyncio.run(provider.checkin(cfg, BIZ_DATE))
+    result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
 
     assert claimed["value"] is True
     assert result.status == CheckinStatus.SUCCESS
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 100
-    assert result.snapshot.expiring_soon == 100
-    assert result.snapshot.expiring_at
 
 
 def test_qoder_accepts_claim_status_field(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,99 +97,6 @@ def test_qoder_accepts_claim_status_field(monkeypatch: pytest.MonkeyPatch) -> No
     result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
 
     assert result.status == CheckinStatus.SUCCESS
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 100
-
-
-def test_qoder_uses_campaign_validity_days(monkeypatch: pytest.MonkeyPatch) -> None:
-    _set_pat(monkeypatch)
-    campaign = _campaign("CLAIMABLE")
-    campaign["benefit"] = {
-        "amount": 100,
-        "validity": {"mode": "RELATIVE_DAYS", "days": 7},
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            return _campaigns_response([campaign])
-        return httpx.Response(200, json={"status": "CLAIMED"})
-
-    provider = QoderProvider(transport=httpx.MockTransport(handler))
-    result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
-
-    assert result.status == CheckinStatus.SUCCESS
-    assert result.snapshot is not None
-    assert result.snapshot.expiring_at is not None
-    expiry = datetime.fromisoformat(result.snapshot.expiring_at)
-    remaining = expiry - datetime.now(timezone.utc)
-    assert timedelta(days=6, hours=23) < remaining <= timedelta(days=7, minutes=1)
-
-
-def test_qoder_invalid_validity_days_falls_back_to_30() -> None:
-    campaign = {"benefit": {"validity": {"mode": "RELATIVE_DAYS", "days": 0}}}
-    assert QoderProvider._benefit_validity_days(campaign) == 30
-
-
-def test_qoder_uses_configured_credits_when_benefit_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _set_pat(monkeypatch)
-    campaign = _campaign("CLAIMABLE")
-    campaign.pop("benefit")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            return _campaigns_response([campaign])
-        return httpx.Response(200, json={"status": "CLAIMED"})
-
-    provider = QoderProvider(transport=httpx.MockTransport(handler))
-    cfg = _cfg()
-    cfg.checkin_credits = 250
-    result = asyncio.run(provider.checkin(cfg, BIZ_DATE))
-
-    assert result.status == CheckinStatus.SUCCESS
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 250
-
-
-def test_qoder_clamps_excessive_benefit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _set_pat(monkeypatch)
-    campaign = _campaign("CLAIMABLE")
-    campaign["benefit"] = {"amount": 2_000_000}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            return _campaigns_response([campaign])
-        return httpx.Response(200, json={"status": "CLAIMED"})
-
-    provider = QoderProvider(transport=httpx.MockTransport(handler))
-    result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
-
-    assert result.status == CheckinStatus.SUCCESS
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 1_000_000
-
-
-def test_qoder_explicit_zero_benefit_stays_zero(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _set_pat(monkeypatch)
-    campaign = _campaign("CLAIMABLE")
-    campaign["benefit"] = {"amount": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            return _campaigns_response([campaign])
-        return httpx.Response(200, json={"status": "CLAIMED"})
-
-    provider = QoderProvider(transport=httpx.MockTransport(handler))
-    result = asyncio.run(provider.checkin(_cfg(), BIZ_DATE))
-
-    assert result.status == CheckinStatus.SUCCESS
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 0
 
 
 def test_qoder_dry_run_does_not_claim(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,7 +114,6 @@ def test_qoder_dry_run_does_not_claim(monkeypatch: pytest.MonkeyPatch) -> None:
     assert posted["value"] is False
     assert result.status == CheckinStatus.SUCCESS
     assert result.dry_run is True
-    assert result.snapshot is None
 
 
 def test_qoder_no_campaign(monkeypatch: pytest.MonkeyPatch) -> None:

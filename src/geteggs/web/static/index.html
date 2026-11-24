@@ -34,7 +34,7 @@
             <h1>geteggs</h1>
             <span class="brand-env-pill">AGENT STUDIO</span>
           </div>
-          <p class="subtitle">AI Agent 每日自动签到与积分手账</p>
+          <p class="subtitle">AI Agent 每日自动签到控制台</p>
         </div>
       </div>
 
@@ -144,7 +144,7 @@
             </div>
             <div class="aux-hero-copy-wrap">
               <p class="aux-hero-desc">
-                GetEggs 在本机串联多工具登录态体检、错峰防重与增量积分入账，让每一次每日签到稳定落袋。
+                GetEggs 在本机串联多工具登录态体检、错峰防重与本地账本记录，让每一次每日签到稳定落袋。
               </p>
               <div class="aux-hero-actions">
                 <button type="button" class="btn btn-primary" data-hero-action="run-all">立即一键签到</button>
@@ -158,10 +158,10 @@
         <div class="metrics-grid">
           <article class="metric-card metric-card-dark">
             <div class="metric-top">
-              <span class="metric-label">TODAY'S YIELD · 今日总收益</span>
+              <span class="metric-label">TODAY'S CHECK-IN · 今日签到进度</span>
               <span class="metric-chip" id="metric-completion-chip">--</span>
             </div>
-            <strong id="metric-today-delta" class="metric-value accent">+0</strong>
+            <strong id="metric-today-progress" class="metric-value accent">0 / 0</strong>
             <div class="metric-dark-foot">
               <span>● IDEMPOTENT LEDGER</span>
               <span>REAL-TIME SSE</span>
@@ -218,21 +218,6 @@
 
         <div id="providers-grid" class="providers-grid"></div>
 
-        <div class="panel compact-trend-panel">
-          <div class="section-header">
-            <div class="section-title-group">
-              <span class="section-index">02 // TELEMETRY</span>
-              <h2>近 14 天领取走势</h2>
-              <span id="trend-14d-total" class="muted-meta">合计 +0</span>
-            </div>
-            <button id="btn-goto-history-trend" type="button" class="btn btn-quiet btn-sm">查看 30 天完整账本 →</button>
-          </div>
-          <div class="trend-chart-wrap">
-            <div id="trend-mini-chart" class="trend-chart"></div>
-            <div id="trend-mini-tooltip" class="chart-tooltip" role="tooltip" aria-hidden="true"></div>
-          </div>
-        </div>
-
         <!-- Auxia-Inspired Dark Event Matrix & Enterprise Local-First Trust Band -->
         <section class="aux-dark-band stack-gap" aria-label="本地安全架构与实时决策流">
           <div class="aux-dark-head">
@@ -262,7 +247,7 @@
                 <span class="aux-matrix-pill">✦ IDEMPOTENT CHECK-IN</span>
               </div>
               <div class="aux-matrix-row">
-                <span class="aux-matrix-event">LEDGER COMMIT · CREDIT SNAPSHOT</span>
+                <span class="aux-matrix-event">LEDGER COMMIT · DAILY CHECK-IN</span>
                 <span class="aux-matrix-line" aria-hidden="true"></span>
                 <span class="aux-matrix-pill">✦ SQLITE WAL RECORD</span>
               </div>
@@ -349,8 +334,6 @@
                     <th>日期</th>
                     <th>工具</th>
                     <th>状态</th>
-                    <th>变动</th>
-                    <th>连签</th>
                     <th>说明</th>
                   </tr>
                 </thead>
@@ -360,48 +343,6 @@
             <div class="ledger-footer">
               <span id="history-loaded-status" class="muted-meta"></span>
               <button id="btn-load-more-history" type="button" class="btn btn-ghost btn-sm" hidden>加载更多</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel stack-gap aux-cobalt-card aux-cobalt-trend-card">
-          <div class="aux-cobalt-top">
-            <div class="section-header">
-              <div class="section-title-group">
-                <span class="section-index aux-index-on-blue">30-DAY WINDOW</span>
-                <h2>近 30 天积分领取趋势</h2>
-                <span class="muted-meta aux-meta-on-blue">按业务自然日聚合</span>
-              </div>
-              <div class="inline-actions">
-                <span id="trend-total-pill" class="btn btn-aux-white btn-sm aux-pill-static">30 日合计 +0</span>
-                <button type="button" class="btn btn-aux-dark btn-sm" data-goto-tab="overview">返回总览看板</button>
-              </div>
-            </div>
-            <div class="trend-chart-wrap">
-              <div id="trend-chart" class="trend-chart"></div>
-              <div id="trend-tooltip" class="chart-tooltip" role="tooltip" aria-hidden="true"></div>
-            </div>
-          </div>
-          <div class="aux-cobalt-bottom">
-            <div class="aux-cobalt-bottom-grid">
-              <div class="aux-cobalt-display-wrap">
-                <span class="aux-cobalt-kicker">30-DAY CUMULATIVE YIELD</span>
-                <strong id="trend-30d-hero" class="aux-cobalt-hero-num">+0</strong>
-              </div>
-              <div class="aux-cobalt-cols">
-                <div class="aux-cobalt-col">
-                  <span>ACTIVE DAYS</span>
-                  <strong id="trend-30d-active-days">0 / 30</strong>
-                </div>
-                <div class="aux-cobalt-col">
-                  <span>PEAK DAILY</span>
-                  <strong id="trend-30d-peak">+0</strong>
-                </div>
-                <div class="aux-cobalt-col">
-                  <span>LEDGER</span>
-                  <strong>SQLite WAL</strong>
-                </div>
-              </div>
             </div>
           </div>
         </div>

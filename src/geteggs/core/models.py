@@ -12,8 +12,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from geteggs.core.config import validate_timezone_name
 
 _HHMM_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-DEFAULT_CHECKIN_CREDITS = 100
-MAX_CHECKIN_CREDITS = 1_000_000
 
 
 def utc_now_iso() -> str:
@@ -65,15 +63,6 @@ class TriggerType(str, Enum):
     MANUAL_WEB = "manual_web"
 
 
-class CreditSnapshot(BaseModel):
-    """Point-in-time credit delta, streak and expiry metrics captured from a provider."""
-
-    delta: int = 0
-    streak_days: Optional[int] = None
-    expiring_soon: Optional[int] = None
-    expiring_at: Optional[str] = None
-
-
 class DoctorResult(BaseModel):
     """Read-only environment and credential health report for a provider."""
 
@@ -99,7 +88,6 @@ class CheckinResult(BaseModel):
     status: CheckinStatus
     message: str
     biz_date: str
-    snapshot: Optional[CreditSnapshot] = None
     duration_ms: int = 0
     dry_run: bool = False
     raw_error_type: Optional[str] = None
@@ -125,9 +113,6 @@ class ProviderConfig(BaseModel):
     earliest_time: str = "00:00"
     business_day_start: str = "00:00"
     jitter_minutes: int = 10
-    checkin_credits: int = Field(
-        default=DEFAULT_CHECKIN_CREDITS, ge=0, le=MAX_CHECKIN_CREDITS
-    )
     extra: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("earliest_time")

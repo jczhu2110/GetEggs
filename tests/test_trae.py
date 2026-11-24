@@ -22,7 +22,6 @@ from geteggs.providers.registry import get_provider
 from geteggs.providers.trae import (
     TraeProvider,
     _parse_business_code,
-    _payload_amount,
     _StatusInfo,
 )
 from geteggs.providers.trae_auth import (
@@ -178,8 +177,6 @@ def test_trae_already_checked_in(tmp_path: Path) -> None:
     result = asyncio.run(_provider(handler).checkin(_config(path), BIZ_DATE))
 
     assert result.status == CheckinStatus.ALREADY_DONE
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 0
     assert calls == ["/trae/api/v2/ug/checkin_credits/status"]
 
 
@@ -213,10 +210,6 @@ def test_trae_claim_success_and_verification(tmp_path: Path) -> None:
     result = asyncio.run(_provider(handler).checkin(_config(path), BIZ_DATE))
 
     assert result.status == CheckinStatus.SUCCESS
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 100
-    assert result.snapshot.expiring_soon == 100
-    assert result.snapshot.expiring_at
     assert claim_calls == 1
     assert status_calls == 2
 
@@ -385,7 +378,6 @@ def test_trae_registered_and_disabled_by_default(tmp_path: Path) -> None:
     provider = get_provider("trae")
     assert provider.display_name == "Trae 国内版"
     assert provider.fixed_business_day_start == "00:00"
-    assert provider.supports_streak is False
 
     storage = Storage(tmp_path / "trae.db")
     cfg = storage.get_provider_config("trae")
@@ -423,7 +415,6 @@ def test_trae_unconfirmed_claim_is_soft_success(tmp_path: Path) -> None:
     assert result.status == CheckinStatus.SUCCESS
     assert result.raw_error_type == "TraeClaimUnconfirmed"
     assert "状态暂未刷新" in result.message
-    assert result.snapshot is not None and result.snapshot.delta == 100
     assert claim_calls == 1
     assert status_calls == 4
 
@@ -792,7 +783,6 @@ def test_trae_response_parsing_prefers_root() -> None:
     )
     assert info.enable is True
     assert info.checked_in is False
-    assert _payload_amount({"credits": 500, "data": {"points": 100}}) == 100
 
 
 def test_trae_detect_client_exe_skips_registry_when_custom_exists(
@@ -881,7 +871,7 @@ def test_trae_merge_cache_ignores_expired_cached_token(tmp_path: Path) -> None:
     assert creds.access_token == "test-access-token"
 
 
-def test_trae_claim_amount_precedence_and_verify_retries_transient(
+def test_trae_verify_retries_transient_error(
     tmp_path: Path,
 ) -> None:
     path = _write_storage(tmp_path)
@@ -922,9 +912,8 @@ def test_trae_claim_amount_precedence_and_verify_retries_transient(
 
     result = asyncio.run(_provider(handler).checkin(_config(path), BIZ_DATE))
     assert result.status == CheckinStatus.SUCCESS
+    assert result.raw_error_type is None
     assert status_calls == 3
-    assert result.snapshot is not None
-    assert result.snapshot.delta == 250
 
 
 def test_trae_merge_cache_keeps_newer_expired_rotated_refresh_token() -> None:

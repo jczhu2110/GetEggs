@@ -284,10 +284,6 @@ def test_workbuddy_checkin_fast_path_from_storage_state_and_fallback_to_browser_
             "active_url": "https://www.codebuddy.cn",
             "statusRes": {"status": 200, "data": {"code": 0, "data": {"checkedIn": False}}},
             "checkinRes": {"status": 200, "data": {"code": 0, "data": {"rewardCredits": 100}}},
-            "postStatusRes": {
-                "status": 200,
-                "data": {"code": 0, "data": {"checkedIn": True, "streakDays": 5}},
-            },
         }
 
     provider = WorkBuddyProvider(
@@ -304,12 +300,9 @@ def test_workbuddy_checkin_fast_path_from_storage_state_and_fallback_to_browser_
     res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
     assert len(browser_calls) == 1
     assert res.status == CheckinStatus.SUCCESS
-    assert res.snapshot is not None
-    assert res.snapshot.delta == 100
-    assert res.snapshot.streak_days == 5
 
 
-def test_workbuddy_browser_uses_configured_credits_when_reward_missing(
+def test_workbuddy_browser_succeeds_when_reward_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("GETEGGS_WORKBUDDY_TOKEN", raising=False)
@@ -337,10 +330,6 @@ def test_workbuddy_browser_uses_configured_credits_when_reward_missing(
             "active_url": "https://www.codebuddy.cn",
             "statusRes": {"status": 200, "data": {"code": 0, "data": {"checkedIn": False}}},
             "checkinRes": {"status": 200, "data": {"code": 0, "data": {}}},
-            "postStatusRes": {
-                "status": 200,
-                "data": {"code": 0, "data": {"checkedIn": True, "streakDays": 5}},
-            },
         }
 
     provider = WorkBuddyProvider(
@@ -349,7 +338,6 @@ def test_workbuddy_browser_uses_configured_credits_when_reward_missing(
     )
     cfg = ProviderConfig(
         provider_id="workbuddy",
-        checkin_credits=250,
         extra={
             "auth_file_path": str(auth_file),
             "browser_state_path": str(state_file),
@@ -358,9 +346,6 @@ def test_workbuddy_browser_uses_configured_credits_when_reward_missing(
     res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
 
     assert res.status == CheckinStatus.SUCCESS
-    assert res.snapshot is not None
-    assert res.snapshot.delta == 250
-    assert res.snapshot.streak_days == 5
 
 
 def test_workbuddy_browser_checkin_returns_auth_expired_when_redirected_to_login(
@@ -407,7 +392,6 @@ def test_workbuddy_browser_refuses_checkin_on_status_error(
             "authenticated": True,
             "statusRes": {"status": 500, "data": None},
             "checkinRes": {"status": 200, "data": {"code": 0, "data": {"rewardCredits": 100}}},
-            "postStatusRes": None,
         }
 
     provider = WorkBuddyProvider(browser_checkin_fn=error_browser)
@@ -440,7 +424,6 @@ def test_workbuddy_browser_dry_run_with_unknown_state_is_unavailable(
             "authenticated": True,
             "statusRes": {"status": 200, "data": {}},
             "checkinRes": None,
-            "postStatusRes": None,
         }
 
     provider = WorkBuddyProvider(browser_checkin_fn=unknown_state_browser)

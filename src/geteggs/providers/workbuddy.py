@@ -19,11 +19,8 @@ from geteggs.core.config import (
     validate_provider_base_url,
 )
 from geteggs.core.models import (
-    DEFAULT_CHECKIN_CREDITS,
-    MAX_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
-    CreditSnapshot,
     DoctorResult,
     ProviderConfig,
 )
@@ -664,8 +661,8 @@ class WorkBuddyProvider(BaseProvider):
                     return base_url, None, resp.status_code
         return last_url, None, last_status
 
-    def _parse_status_payload(self, payload: dict[str, Any]) -> tuple[Optional[bool], CreditSnapshot]:
-        checked_in = _to_bool(
+    def _parse_status_payload(self, payload: dict[str, Any]) -> Optional[bool]:
+        return _to_bool(
             extract_first(
                 payload,
                 "checkedIn",
@@ -677,62 +674,13 @@ class WorkBuddyProvider(BaseProvider):
                 "signed",
             )
         )
-        streak = _to_int(
-            extract_first(
-                payload,
-                "streakDays",
-                "streak_days",
-                "continuousDays",
-                "continuous_days",
-                "consecutiveDays",
-            )
-        )
-        expiring_soon = _to_int(
-            extract_first(
-                payload,
-                "expiringSoon",
-                "expiring_soon",
-                "expiringCredits",
-                "expiring_credits",
-                "expiringPoints",
-                "expiring_points",
-            )
-        )
-        expiring_at: Optional[str] = None
-        raw_expiring_at = extract_first(
-            payload,
-            "expiringAt",
-            "expiring_at",
-            "expireAt",
-            "expire_at",
-            "expiringDate",
-            "expiring_date",
-        )
-        if raw_expiring_at is not None:
-            expiring_at, _ = _parse_expiry(raw_expiring_at)
-            if expiring_at is None and isinstance(raw_expiring_at, str):
-                expiring_at = raw_expiring_at.strip() or None
-
-        # 状态接口在“已签到”场景会返回 0，但这不是有效连签天数；
-        # 统一按未知处理，避免覆盖签到成功时记录的真实连签。
-        if streak is not None and streak <= 0:
-            streak = None
-
-        return checked_in, CreditSnapshot(
-            streak_days=streak,
-            expiring_soon=expiring_soon,
-            expiring_at=expiring_at,
-        )
 
     def _interpret_checkin_payload(
         self,
         body: Any,
         status_code: int,
-        pre_snapshot: CreditSnapshot,
         biz_date: str,
         duration_ms: int,
-        post_snapshot: Optional[CreditSnapshot] = None,
-        default_credits: int = DEFAULT_CHECKIN_CREDITS,
     ) -> CheckinResult:
         """Normalize raw JSON response from either direct API or controlled browser fetch."""
         if status_code in (401, 403):
@@ -823,7 +771,6 @@ class WorkBuddyProvider(BaseProvider):
                 status=CheckinStatus.ALREADY_DONE,
                 message="今日已完成签到。",
                 biz_date=biz_date,
-                snapshot=pre_snapshot,
                 duration_ms=duration_ms,
             )
 
@@ -853,53 +800,18 @@ class WorkBuddyProvider(BaseProvider):
                 provider_id=self.id,
                 display_name=self.display_name,
                 status=CheckinStatus.SCHEMA_CHANGED,
-                message="WorkBuddy 签到接口响应缺少状态码与奖励字段，接口可能已改版。",
+                message="WorkBuddy 签到接口响应缺少状态码与结果字段，接口可能已改版。",
                 biz_date=biz_date,
                 duration_ms=duration_ms,
                 raw_error_type="UnknownCheckinResponse",
             )
 
-        delta = reward if reward is not None else default_credits
-        delta = min(max(delta, 0), MAX_CHECKIN_CREDITS)
-        streak = _to_int(
-            extract_first(body, "streakDays", "streak_days", "continuousDays")
-        )
-        if streak is not None and streak <= 0:
-            streak = None
-
-        if post_snapshot is not None and streak is None:
-            streak = post_snapshot.streak_days
-
-        expiring_soon = (
-            post_snapshot.expiring_soon
-            if post_snapshot is not None and post_snapshot.expiring_soon is not None
-            else pre_snapshot.expiring_soon
-        )
-        expiring_at = (
-            post_snapshot.expiring_at
-            if post_snapshot is not None and post_snapshot.expiring_at is not None
-            else pre_snapshot.expiring_at
-        )
-
-        final_snap = CreditSnapshot(
-            delta=delta,
-            streak_days=streak if streak is not None else pre_snapshot.streak_days,
-            expiring_soon=expiring_soon,
-            expiring_at=expiring_at,
-        )
-        detail_parts = ["WorkBuddy 今日签到成功"]
-        if final_snap.delta > 0:
-            detail_parts.append(f"+{final_snap.delta} 积分")
-        if final_snap.streak_days is not None:
-            detail_parts.append(f"已连续 {final_snap.streak_days} 天")
-
         return CheckinResult(
             provider_id=self.id,
             display_name=self.display_name,
             status=CheckinStatus.SUCCESS,
-            message="，".join(detail_parts) + "。",
+            message="WorkBuddy 今日签到成功。",
             biz_date=biz_date,
-            snapshot=final_snap,
             duration_ms=duration_ms,
         )
 
@@ -1015,9 +927,8 @@ class WorkBuddyProvider(BaseProvider):
             )
 
         pre_checked_in: Optional[bool] = None
-        pre_snapshot = CreditSnapshot()
         if isinstance(status_payload, dict):
-            pre_checked_in, pre_snapshot = self._parse_status_payload(status_payload)
+            pre_checked_in = self._parse_status_payload(status_payload)
 
         if pre_checked_in is True:
             if log:
@@ -1028,7 +939,6 @@ class WorkBuddyProvider(BaseProvider):
                 status=CheckinStatus.ALREADY_DONE,
                 message="今日已完成签到（受控浏览器预检幂等跳过）。",
                 biz_date=biz_date,
-                snapshot=pre_snapshot,
                 duration_ms=elapsed_ms(),
                 dry_run=dry_run,
             )
@@ -1041,7 +951,6 @@ class WorkBuddyProvider(BaseProvider):
                     status=CheckinStatus.UNAVAILABLE,
                     message="[Dry-Run] 状态接口响应中未找到可识别的签到状态字段，可能已改版。",
                     biz_date=biz_date,
-                    snapshot=pre_snapshot,
                     duration_ms=elapsed_ms(),
                     dry_run=True,
                     raw_error_type="UnknownCheckinState",
@@ -1052,7 +961,6 @@ class WorkBuddyProvider(BaseProvider):
                 status=CheckinStatus.SUCCESS,
                 message="[Dry-Run] 受控浏览器会话与状态预检正常，未实际提交签到。",
                 biz_date=biz_date,
-                snapshot=pre_snapshot,
                 duration_ms=elapsed_ms(),
                 dry_run=True,
             )
@@ -1065,24 +973,16 @@ class WorkBuddyProvider(BaseProvider):
                 status=CheckinStatus.SCHEMA_CHANGED,
                 message="受控浏览器状态接口响应中未找到可识别的签到状态字段，本次未提交签到。",
                 biz_date=biz_date,
-                snapshot=pre_snapshot,
                 duration_ms=elapsed_ms(),
                 dry_run=dry_run,
                 raw_error_type="UnknownCheckinState",
             )
-        post_snap: Optional[CreditSnapshot] = None
-        post_status_res = outcome.get("postStatusRes") or {}
-        if isinstance(post_status_res.get("data"), dict):
-            _, post_snap = self._parse_status_payload(post_status_res["data"])
 
         return self._interpret_checkin_payload(
             checkin_res.get("data"),
             int(checkin_res.get("status") or 0),
-            pre_snapshot,
             biz_date,
             elapsed_ms(),
-            post_snapshot=post_snap,
-            default_credits=config.checkin_credits,
         )
 
     async def checkin(
@@ -1271,9 +1171,8 @@ class WorkBuddyProvider(BaseProvider):
                 )
 
             pre_checked_in: Optional[bool] = None
-            pre_snapshot = CreditSnapshot()
             if isinstance(status_payload, dict):
-                pre_checked_in, pre_snapshot = self._parse_status_payload(status_payload)
+                pre_checked_in = self._parse_status_payload(status_payload)
 
             if pre_checked_in is True:
                 if log:
@@ -1284,7 +1183,6 @@ class WorkBuddyProvider(BaseProvider):
                     status=CheckinStatus.ALREADY_DONE,
                     message="今日已完成签到（已通过状态预检，幂等跳过）。",
                     biz_date=biz_date,
-                    snapshot=pre_snapshot,
                     duration_ms=elapsed_ms(),
                     dry_run=dry_run,
                 )
@@ -1297,7 +1195,6 @@ class WorkBuddyProvider(BaseProvider):
                         status=CheckinStatus.UNAVAILABLE,
                         message="[Dry-Run] 状态接口响应中未找到可识别的签到状态字段，可能已改版。",
                         biz_date=biz_date,
-                        snapshot=pre_snapshot,
                         duration_ms=elapsed_ms(),
                         dry_run=True,
                         raw_error_type="UnknownCheckinState",
@@ -1308,7 +1205,6 @@ class WorkBuddyProvider(BaseProvider):
                     status=CheckinStatus.SUCCESS,
                     message="[Dry-Run] 本地登录态与状态预检正常，未实际提交签到请求。",
                     biz_date=biz_date,
-                    snapshot=pre_snapshot,
                     duration_ms=elapsed_ms(),
                     dry_run=True,
                 )
@@ -1320,7 +1216,6 @@ class WorkBuddyProvider(BaseProvider):
                     status=CheckinStatus.SCHEMA_CHANGED,
                     message="WorkBuddy 状态接口未返回可识别的签到状态字段，为避免误提交本次未签到。",
                     biz_date=biz_date,
-                    snapshot=pre_snapshot,
                     duration_ms=elapsed_ms(),
                     raw_error_type="UnknownCheckinState",
                 )
@@ -1339,7 +1234,6 @@ class WorkBuddyProvider(BaseProvider):
                     status=CheckinStatus.FAILED,
                     message=f"签到请求发生网络异常：{type(exc).__name__}",
                     biz_date=biz_date,
-                    snapshot=pre_snapshot,
                     duration_ms=elapsed_ms(),
                     raw_error_type=type(exc).__name__,
                 )
@@ -1374,10 +1268,8 @@ class WorkBuddyProvider(BaseProvider):
                 return self._interpret_checkin_payload(
                     None,
                     checkin_resp.status_code,
-                    pre_snapshot,
                     biz_date,
                     elapsed_ms(),
-                    default_credits=config.checkin_credits,
                 )
 
             try:
@@ -1393,20 +1285,9 @@ class WorkBuddyProvider(BaseProvider):
                     raw_error_type="InvalidJSON",
                 )
 
-            post_snap: Optional[CreditSnapshot] = None
-            if isinstance(body, dict) and (_to_int(body.get("code")) in (None, 0)):
-                _, post_payload, post_code = await self._query_status(
-                    client, creds, [active_url], None
-                )
-                if post_code == 200 and isinstance(post_payload, dict):
-                    _, post_snap = self._parse_status_payload(post_payload)
-
             return self._interpret_checkin_payload(
                 body,
                 checkin_resp.status_code,
-                pre_snapshot,
                 biz_date,
                 elapsed_ms(),
-                post_snapshot=post_snap,
-                default_credits=config.checkin_credits,
             )

@@ -12,7 +12,6 @@ import {
   showBanner,
   statusPill,
 } from "./utils.js";
-import { renderFullTrendChart } from "./charts.js";
 
 const historyState = {
   offset: 0,
@@ -47,26 +46,12 @@ function shiftMonth(monthStr, deltaMonths) {
   return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
 }
 
-function providerSupportsStreak(providerId) {
-  const provider = appState.providers.find(
-    (item) => item.provider_id === providerId
-  );
-  return provider ? provider.supports_streak !== false : true;
-}
-
-function streakText(record) {
-  if (!providerSupportsStreak(record.provider_id)) return "不适用";
-  return record.streak_days || "--";
-}
-
 function historyRowHtml(r) {
   return `
     <tr>
       <td>${escapeHtml(r.biz_date)}</td>
       <td>${escapeHtml(r.display_name)}</td>
       <td>${statusPill(r.status, { historical: true })}</td>
-      <td>${r.delta > 0 ? `+${r.delta}` : "0"}</td>
-      <td>${escapeHtml(streakText(r))}</td>
       <td>${escapeHtml(r.message)}</td>
     </tr>
   `;
@@ -118,7 +103,7 @@ function renderLedgerRows() {
   const emptyText = historyState.selectedDate
     ? `${historyState.selectedDate} 暂无签到流水`
     : "本月暂无签到记录";
-  tbody.innerHTML = rows || `<tr><td colspan="6" class="muted">${escapeHtml(emptyText)}</td></tr>`;
+  tbody.innerHTML = rows || `<tr><td colspan="4" class="muted">${escapeHtml(emptyText)}</td></tr>`;
 }
 
 function renderCalendar(monthStr, calItems) {
@@ -145,7 +130,7 @@ function renderCalendar(monthStr, calItems) {
     let badge = "";
     if (item) {
       cls = item.ok ? "ok" : "fail";
-      badge = item.ok ? (item.delta > 0 ? `+${item.delta}` : "已签") : "异常";
+      badge = item.ok ? "已签" : "异常";
     } else if (dateKey > todayKey) {
       cls = "future";
     }
@@ -272,8 +257,7 @@ function formatRunSummary(r) {
   const total = Number(r.record_count) || 0;
   if (!total) return "--";
   if (r.dry_run) return `预检 ${total} 个工具`;
-  const delta = Number(r.total_delta) || 0;
-  return `${Number(r.ok_count) || 0}/${total} 成功${delta > 0 ? ` · +${delta}` : ""}`;
+  return `${Number(r.ok_count) || 0}/${total} 成功`;
 }
 
 function closeOpenRunDetail() {
@@ -319,14 +303,12 @@ async function toggleRunDetail(runId, triggerBtn) {
             <tr>
               <td>${escapeHtml(providerDisplayName(r.provider_id, r.display_name))}</td>
               <td>${statusPill(r.status, { historical: true })}</td>
-              <td>${r.delta > 0 ? `+${r.delta}` : "0"}</td>
-              <td>${escapeHtml(streakText(r))}</td>
               <td>${r.duration_ms ?? 0} ms</td>
               <td>${escapeHtml(r.message)}</td>
             </tr>
           `
         )
-        .join("") || `<tr><td colspan="6" class="muted">本批次没有工具执行结果</td></tr>`;
+        .join("") || `<tr><td colspan="4" class="muted">本批次没有工具执行结果</td></tr>`;
 
     const logText =
       events
@@ -353,8 +335,6 @@ async function toggleRunDetail(runId, triggerBtn) {
                 <tr>
                   <th>工具</th>
                   <th>状态</th>
-                  <th>变动</th>
-                  <th>连签</th>
                   <th>耗时</th>
                   <th>说明</th>
                 </tr>
@@ -445,10 +425,6 @@ export function loadActiveAuditTab() {
     return loadNotifications();
   }
   return loadRuns();
-}
-
-export function renderHistoryTrend(fromCache = true) {
-  renderFullTrendChart(appState.trend30d, fromCache);
 }
 
 function updateCalendarSelectionInPlace() {

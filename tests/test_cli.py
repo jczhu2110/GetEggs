@@ -897,3 +897,14 @@ def test_uninstall_schedule_script_propagates_access_denied(monkeypatch) -> None
     assert "-ErrorAction SilentlyContinue" not in captured[0]
     assert "Get-ScheduledTask -TaskName $taskName -ErrorAction Stop" in captured[0]
     assert "NotFound|ObjectNotFound" in captured[0]
+
+
+def test_cli_status_renders_without_credit_or_streak_columns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    res = runner.invoke(cli.app, ["status"])
+    assert res.exit_code == 0
+    assert "WorkBuddy" in res.output
+    assert "连签天数" not in res.output
+    assert "今日新增" not in res.output

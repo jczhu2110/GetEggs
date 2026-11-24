@@ -89,7 +89,6 @@ class BaseProvider(ABC):
     display_name: str
     description: str
     supports_browser_auth: bool = False
-    supports_streak: bool = True
     fixed_business_day_start: Optional[str] = None
 
     @abstractmethod

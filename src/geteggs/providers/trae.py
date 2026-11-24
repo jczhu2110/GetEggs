@@ -10,17 +10,13 @@ import re
 import shutil
 import time
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from geteggs.core.config import is_unc_path, validate_provider_base_url
 from geteggs.core.models import (
-    DEFAULT_CHECKIN_CREDITS,
-    MAX_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
-    CreditSnapshot,
     DoctorResult,
     ProviderConfig,
 )
@@ -44,7 +40,6 @@ REFRESH_PATH = "/trae/api/v3/oauth/ExchangeToken"
 CLIENT_ID_IDE = "ono9krqynydwx5"
 CLIENT_ID_LEGACY = "en1oxy7wnw8j9n"
 DEFAULT_IDE_VERSION = "1.107.1"
-DEFAULT_CREDIT_VALIDITY_DAYS = 31
 AUTH_CODES = (1001, 1002, 401, 403)
 
 
@@ -105,16 +100,6 @@ def _parse_message(payload: dict[str, Any]) -> str:
     return str(_root_first(payload, "message", "msg") or "").strip()
 
 
-def _payload_amount(payload: dict[str, Any]) -> Optional[int]:
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    for source in (data, payload):
-        for key in ("points", "credits", "credit", "extra_credits", "extraCredits"):
-            amount = _to_int(source.get(key))
-            if amount is not None and amount > 0:
-                return min(amount, MAX_CHECKIN_CREDITS)
-    return None
-
-
 class _StatusInfo:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.enable = _to_bool(_root_first(payload, "enable", "enabled"))
@@ -129,22 +114,10 @@ class _StatusInfo:
                 self.checked_in = did_checked_in
             elif did_checked_in:
                 self.checked_in = True
-        self.credits = _to_int(_root_first(payload, "credits", "credit"))
-        self.extra_credits = _to_int(
-            _root_first(payload, "extra_credits", "extraCredits")
-        )
 
     @property
     def schema_ok(self) -> bool:
         return self.enable is not None and self.checked_in is not None
-
-    @property
-    def reward_hint(self) -> Optional[int]:
-        if self.credits is not None and self.credits > 0:
-            return min(self.credits, MAX_CHECKIN_CREDITS)
-        if self.extra_credits is not None and self.extra_credits > 0:
-            return min(self.extra_credits, MAX_CHECKIN_CREDITS)
-        return None
 
 
 _TRAE_DISPLAY_RE = re.compile(r"(?<![A-Za-z])trae(?![A-Za-z])", re.IGNORECASE)
@@ -210,13 +183,12 @@ def _registry_install_locations() -> list[Path]:
 
 
 class TraeProvider(BaseProvider):
-    """Trae CN daily credits check-in using the installed desktop login state."""
+    """Trae CN daily check-in using the installed desktop login state."""
 
     id = "trae"
     display_name = "Trae 国内版"
-    description = "字节跳动 Trae CN 每日签到领取积分（读取本地客户端登录态）"
+    description = "字节跳动 Trae CN 每日自动签到（读取本地客户端登录态）"
     supports_browser_auth = False
-    supports_streak = False
     fixed_business_day_start = "00:00"
 
     def __init__(
@@ -672,8 +644,7 @@ class TraeProvider(BaseProvider):
         config: ProviderConfig,
         creds: TraeCredentials,
         version: str,
-    ) -> tuple[Optional[_StatusInfo], str]:
-        last_info: Optional[_StatusInfo] = None
+    ) -> str:
         last_status = "unconfirmed"
         for attempt in range(self._claim_verify_attempts):
             try:
@@ -689,9 +660,8 @@ class TraeProvider(BaseProvider):
                 else:
                     info = _StatusInfo(payload)
                     if info.schema_ok and info.checked_in:
-                        return info, "confirmed"
+                        return "confirmed"
                     if info.schema_ok and not info.checked_in:
-                        last_info = info
                         last_status = "unconfirmed"
                     else:
                         last_status = "unavailable"
@@ -700,7 +670,7 @@ class TraeProvider(BaseProvider):
                 and self._claim_verify_delay_seconds > 0
             ):
                 await asyncio.sleep(self._claim_verify_delay_seconds)
-        return last_info, last_status
+        return last_status
 
     # ---- Doctor ----
 
@@ -834,11 +804,11 @@ class TraeProvider(BaseProvider):
                     healthy = False
                     message = "Trae 设备校验未通过或排队限流，暂时无法在线校验。"
                 elif code == 9004:
-                    message = "本地登录态有效，今日 Trae 积分已领取。"
+                    message = "本地登录态有效，今日 Trae 国内版已完成签到。"
                     details.update(today_checked_in=True, verified=True)
                 elif code == 9095:
                     healthy = False
-                    message = "本机设备今日已签到其他 Trae 账号，当前账号未领取。"
+                    message = "本机设备今日已签到其他 Trae 账号，当前账号未签到。"
                 elif code in (9090, 9102):
                     message = "本地登录态有效，当前 Trae 每日签到活动未开启。"
                     details.update(activity_enabled=False, verified=True)
@@ -854,7 +824,7 @@ class TraeProvider(BaseProvider):
                         message = "本地登录态有效，当前 Trae 每日签到活动未开启。"
                         details.update(activity_enabled=False, verified=True)
                     elif info.checked_in:
-                        message = "本地登录态有效，今日 Trae 积分已领取。"
+                        message = "本地登录态有效，今日 Trae 国内版已完成签到。"
                         details.update(today_checked_in=True, verified=True)
                     else:
                         message = "本地登录态有效，今日可以签到。"
@@ -875,7 +845,6 @@ class TraeProvider(BaseProvider):
         *,
         started: float,
         dry_run: bool,
-        snapshot: Optional[CreditSnapshot] = None,
         raw_error_type: Optional[str] = None,
     ) -> CheckinResult:
         return CheckinResult(
@@ -884,7 +853,6 @@ class TraeProvider(BaseProvider):
             status=status,
             message=message,
             biz_date=biz_date,
-            snapshot=snapshot,
             duration_ms=int((time.perf_counter() - started) * 1000),
             dry_run=dry_run,
             raw_error_type=raw_error_type,
@@ -1070,7 +1038,7 @@ class TraeProvider(BaseProvider):
                 if code == 9074:
                     return self._result(
                         CheckinStatus.FAILED,
-                        "Trae 设备校验或排队限流（code=9074），本次未领取，稍后重试。",
+                        "Trae 设备校验或排队限流（code=9074），本次未签到，稍后重试。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -1079,7 +1047,7 @@ class TraeProvider(BaseProvider):
                 if code == 9095:
                     return self._result(
                         CheckinStatus.NEEDS_MANUAL,
-                        "本机设备今日已签到其他 Trae 账号，当前账号未领取；请更换设备或明日再试。",
+                        "本机设备今日已签到其他 Trae 账号，当前账号未签到；请更换设备或明日再试。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -1088,11 +1056,10 @@ class TraeProvider(BaseProvider):
                 if code == 9004:
                     return self._result(
                         CheckinStatus.ALREADY_DONE,
-                        "今日 Trae 积分已领取。",
+                        "今日 Trae 国内版已完成签到。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
-                        snapshot=CreditSnapshot(delta=0),
                     )
                 if code in (9090, 9102):
                     return self._result(
@@ -1134,18 +1101,16 @@ class TraeProvider(BaseProvider):
                 if info.checked_in:
                     return self._result(
                         CheckinStatus.ALREADY_DONE,
-                        "今日 Trae 积分已领取。",
+                        "今日 Trae 国内版已完成签到。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
-                        snapshot=CreditSnapshot(delta=0),
                     )
 
-                amount_hint = info.reward_hint or config.checkin_credits
                 if dry_run:
                     return self._result(
                         CheckinStatus.SUCCESS,
-                        f"Dry-Run：今日可签到（预计 {amount_hint} 积分，未提交）。",
+                        "Dry-Run：今日可签到（未提交）。",
                         biz_date,
                         started=started,
                         dry_run=True,
@@ -1178,9 +1143,9 @@ class TraeProvider(BaseProvider):
                         claim_code = _parse_business_code(claim_payload)
                     if self._is_auth_status(claim_response.status_code, claim_code):
                         message = (
-                            "Trae 领取凭证已失效，自动续期已关闭；请打开客户端重新登录。"
+                            "Trae 签到凭证已失效，自动续期已关闭；请打开客户端重新登录。"
                             if not allow_refresh
-                            else "Trae 领取凭证已失效，请打开客户端重新登录。"
+                            else "Trae 签到凭证已失效，请打开客户端重新登录。"
                         )
                         return self._result(
                             CheckinStatus.AUTH_EXPIRED,
@@ -1194,13 +1159,13 @@ class TraeProvider(BaseProvider):
                 claim_http = self._http_error_status(claim_response.status_code)
                 if claim_http is not None:
                     if claim_http == CheckinStatus.SCHEMA_CHANGED:
-                        message = f"Trae 领取接口返回 HTTP {claim_response.status_code}，接口可能已变更。"
+                        message = f"Trae 签到接口返回 HTTP {claim_response.status_code}，接口可能已变更。"
                     elif claim_response.status_code == 429:
                         message = "Trae 请求过于频繁，请稍后重试。"
                     elif claim_response.status_code >= 500:
                         message = f"Trae 服务端暂时异常（HTTP {claim_response.status_code}）。"
                     else:
-                        message = f"Trae 领取失败（HTTP {claim_response.status_code}）。"
+                        message = f"Trae 签到失败（HTTP {claim_response.status_code}）。"
                     return self._result(
                         claim_http,
                         message,
@@ -1213,7 +1178,7 @@ class TraeProvider(BaseProvider):
                 if claim_code is None:
                     return self._result(
                         CheckinStatus.SCHEMA_CHANGED,
-                        "Trae 领取响应缺少业务码，接口可能已变更。",
+                        "Trae 签到响应缺少业务码，接口可能已变更。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -1223,16 +1188,15 @@ class TraeProvider(BaseProvider):
                 if claim_code == 9004:
                     return self._result(
                         CheckinStatus.ALREADY_DONE,
-                        "今日 Trae 积分已领取。",
+                        "今日 Trae 国内版已完成签到。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
-                        snapshot=CreditSnapshot(delta=0),
                     )
                 if claim_code == 9095:
                     return self._result(
                         CheckinStatus.NEEDS_MANUAL,
-                        "本机设备今日已签到其他 Trae 账号，当前账号未领取；请更换设备或明日再试。",
+                        "本机设备今日已签到其他 Trae 账号，当前账号未签到；请更换设备或明日再试。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -1241,7 +1205,7 @@ class TraeProvider(BaseProvider):
                 if claim_code == 9074:
                     return self._result(
                         CheckinStatus.FAILED,
-                        "Trae 设备校验或排队限流（code=9074），本次未领取，稍后重试。",
+                        "Trae 设备校验或排队限流（code=9074），本次未签到，稍后重试。",
                         biz_date,
                         started=started,
                         dry_run=dry_run,
@@ -1266,45 +1230,25 @@ class TraeProvider(BaseProvider):
                         raw_error_type=f"TraeCode_{claim_code}",
                     )
 
-                emit("info", "Trae 领取接口返回成功，正在二次确认到账状态...")
-                claim_amount = _payload_amount(claim_payload)
-                amount = claim_amount or info.reward_hint or config.checkin_credits
-                verify_info, verify_state = await self._verify_claim_status(
+                emit("info", "Trae 签到接口返回成功，正在二次确认签到状态...")
+                verify_state = await self._verify_claim_status(
                     client, config, creds, version
                 )
                 verification_warning = ""
                 verify_error: Optional[str] = None
-                if verify_state == "confirmed":
-                    amount = (
-                        claim_amount
-                        or (verify_info.reward_hint if verify_info else None)
-                        or amount
-                    )
-                elif verify_state == "unconfirmed":
+                if verify_state == "unconfirmed":
                     verification_warning = "（状态暂未刷新，请稍后在 Trae 客户端确认）"
                     verify_error = "TraeClaimUnconfirmed"
-                else:
+                elif verify_state != "confirmed":
                     verification_warning = "（二次确认暂不可用）"
                     verify_error = "TraeClaimUnconfirmed"
 
-                amount = min(max(amount, 0), MAX_CHECKIN_CREDITS)
-                snapshot = CreditSnapshot(
-                    delta=amount,
-                    expiring_soon=amount if amount > 0 else None,
-                    expiring_at=(
-                        datetime.now(timezone.utc)
-                        + timedelta(days=DEFAULT_CREDIT_VALIDITY_DAYS)
-                    ).isoformat()
-                    if amount > 0
-                    else None,
-                )
                 return self._result(
                     CheckinStatus.SUCCESS,
-                    f"已领取 Trae 国内版每日 {amount} 积分{verification_warning}。",
+                    f"已完成 Trae 国内版今日签到{verification_warning}。",
                     biz_date,
                     started=started,
                     dry_run=dry_run,
-                    snapshot=snapshot,
                     raw_error_type=verify_error,
                 )
         except httpx.HTTPError as exc:

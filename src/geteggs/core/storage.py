@@ -11,7 +11,6 @@ from typing import Any, Iterator, Optional
 
 from geteggs.core.config import get_db_path, get_timezone, today_biz_date
 from geteggs.core.models import (
-    DEFAULT_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
     GlobalSettings,
@@ -25,7 +24,7 @@ DEFAULT_DISABLED_PROVIDERS = {"qoder", "trae"}
 # Keep in sync with provider fixed_business_day_start values.
 FIXED_BUSINESS_DAY_START = {"qoder": "10:00", "trae": "00:00"}
 
-SCHEMA_SQL = f"""
+SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,
@@ -38,8 +37,7 @@ CREATE TABLE IF NOT EXISTS provider_configs (
     earliest_time TEXT NOT NULL DEFAULT '00:00',
     business_day_start TEXT NOT NULL DEFAULT '00:00',
     jitter_minutes INTEGER NOT NULL DEFAULT 10,
-    checkin_credits INTEGER NOT NULL DEFAULT {DEFAULT_CHECKIN_CREDITS},
-    extra_json TEXT NOT NULL DEFAULT '{{}}',
+    extra_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL
 );
 
@@ -58,10 +56,6 @@ CREATE TABLE IF NOT EXISTS checkin_records (
     display_name TEXT NOT NULL,
     biz_date TEXT NOT NULL,
     status TEXT NOT NULL,
-    delta INTEGER NOT NULL DEFAULT 0,
-    streak_days INTEGER,
-    expiring_soon INTEGER,
-    expiring_at TEXT,
     message TEXT NOT NULL,
     raw_error_type TEXT,
     duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -140,8 +134,12 @@ class Storage:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.executescript(SCHEMA_SQL)
-            self._drop_legacy_balance_column(conn)
-            self._add_missing_provider_credit_column(conn)
+            self._drop_legacy_columns(
+                conn,
+                "checkin_records",
+                ("balance", "streak_days", "delta", "expiring_soon", "expiring_at"),
+            )
+            self._drop_legacy_columns(conn, "provider_configs", ("checkin_credits",))
             self._add_missing_business_day_column(conn)
             self._normalize_fixed_business_day(conn)
 
@@ -182,37 +180,22 @@ class Storage:
             )
 
     @staticmethod
-    def _add_missing_provider_credit_column(conn: sqlite3.Connection) -> None:
-        """Add the configurable check-in credit field to older databases."""
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(provider_configs)")
-        }
-        if "checkin_credits" in columns:
-            return
-        try:
-            conn.execute(
-                "ALTER TABLE provider_configs "
-                f"ADD COLUMN checkin_credits INTEGER NOT NULL DEFAULT {DEFAULT_CHECKIN_CREDITS}"
-            )
-        except sqlite3.OperationalError as exc:
-            # Another process may have completed the migration between the check and ALTER.
-            if "duplicate column" not in str(exc).lower():
-                raise
-
-    @staticmethod
-    def _drop_legacy_balance_column(conn: sqlite3.Connection) -> None:
-        """Remove the retired balance column and its data from older databases."""
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(checkin_records)")
-        }
-        if "balance" not in columns:
-            return
-        try:
-            conn.execute("ALTER TABLE checkin_records DROP COLUMN balance")
-        except sqlite3.OperationalError as exc:
-            # Another process may have completed the migration between the check and ALTER.
-            if "no such column" not in str(exc).lower():
-                raise
+    def _drop_legacy_columns(
+        conn: sqlite3.Connection,
+        table: str,
+        retired_columns: tuple[str, ...],
+    ) -> None:
+        """Remove retired credit/streak columns from older databases while preserving rows."""
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column in retired_columns:
+            if column not in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+            except sqlite3.OperationalError as exc:
+                # Another process may have completed the migration between the check and ALTER.
+                if "no such column" not in str(exc).lower():
+                    raise
 
     # ---- Global settings ----
 
@@ -268,7 +251,6 @@ class Storage:
             earliest_time=row["earliest_time"],
             business_day_start=row["business_day_start"],
             jitter_minutes=row["jitter_minutes"],
-            checkin_credits=row["checkin_credits"],
             extra=json.loads(row["extra_json"] or "{}"),
         )
 
@@ -279,15 +261,14 @@ class Storage:
                 """
                 INSERT INTO provider_configs (
                     provider_id, enabled, earliest_time, business_day_start,
-                    jitter_minutes, checkin_credits, extra_json, updated_at
+                    jitter_minutes, extra_json, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider_id) DO UPDATE SET
                     enabled = excluded.enabled,
                     earliest_time = excluded.earliest_time,
                     business_day_start = excluded.business_day_start,
                     jitter_minutes = excluded.jitter_minutes,
-                    checkin_credits = excluded.checkin_credits,
                     extra_json = excluded.extra_json,
                     updated_at = excluded.updated_at
                 """,
@@ -297,7 +278,6 @@ class Storage:
                     cfg.earliest_time,
                     cfg.business_day_start,
                     cfg.jitter_minutes,
-                    cfg.checkin_credits,
                     json.dumps(cfg.extra, ensure_ascii=False),
                     now,
                 ),
@@ -328,16 +308,14 @@ class Storage:
             )
 
     def save_checkin_result(self, run_id: str, result: CheckinResult) -> None:
-        snap = result.snapshot
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO checkin_records (
                     run_id, provider_id, display_name, biz_date, status,
-                    delta, streak_days, expiring_soon, expiring_at,
                     message, raw_error_type, duration_ms, dry_run, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -345,10 +323,6 @@ class Storage:
                     result.display_name,
                     result.biz_date,
                     result.status.value,
-                    snap.delta if snap else 0,
-                    snap.streak_days if snap else None,
-                    snap.expiring_soon if snap else None,
-                    snap.expiring_at if snap else None,
                     result.message,
                     result.raw_error_type,
                     result.duration_ms,
@@ -410,36 +384,17 @@ class Storage:
             ).fetchone()
         return dict(row) if row else None
 
-    def get_latest_snapshot_record(self, provider_id: str) -> Optional[dict[str, Any]]:
-        """Return the latest record carrying a positive streak snapshot."""
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM checkin_records
-                WHERE provider_id = ?
-                  AND dry_run = 0
-                  AND streak_days IS NOT NULL
-                  AND streak_days > 0
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (provider_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
     def get_today_summary(
         self, provider_id: str, biz_date: str
     ) -> Optional[dict[str, Any]]:
         """Aggregate all non-dry-run attempts for one provider on a business day.
 
-        A later failed retry must not erase an earlier successful check-in, so the
-        status is based on any completed attempt while deltas are summed.
+        A later failed retry must not erase an earlier successful check-in.
         """
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT status, delta, streak_days, expiring_soon,
-                       expiring_at, message, created_at
+                SELECT status, message, created_at
                 FROM checkin_records
                 WHERE provider_id = ? AND biz_date = ? AND dry_run = 0
                 ORDER BY id ASC
@@ -456,57 +411,17 @@ class Storage:
         message = (latest_success or latest)["message"]
         if completed and latest["status"] not in ("success", "already_done"):
             message = f"今日已完成签到；最近一次重跑异常：{latest['message']}"
-        streak_days = next(
-            (r["streak_days"] for r in reversed(rows) if (r["streak_days"] or 0) > 0),
-            None,
-        )
-        expiring_soon = next(
-            (r["expiring_soon"] for r in reversed(rows) if r["expiring_soon"] is not None),
-            None,
-        )
-        expiring_at = next(
-            (r["expiring_at"] for r in reversed(rows) if r["expiring_at"] is not None), None
-        )
 
         return {
             "provider_id": provider_id,
             "biz_date": biz_date,
             "status": "success" if "success" in completed else (completed[0] if completed else latest["status"]),
             "ok": bool(completed),
-            "delta": sum(int(r["delta"] or 0) for r in rows),
-            "streak_days": streak_days,
-            "expiring_soon": expiring_soon,
-            "expiring_at": expiring_at,
             "message": message,
             "last_status": latest["status"],
             "record_count": len(rows),
             "updated_at": latest["created_at"],
         }
-
-    def get_trend_30_days(self, tz_name: str = "Asia/Shanghai") -> list[dict[str, Any]]:
-        """Aggregate daily credit delta across all providers for the past 30 days."""
-        tz = get_timezone(tz_name)
-        today = datetime.now(tz).date()
-        start_date = (today - timedelta(days=29)).strftime("%Y-%m-%d")
-
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT biz_date, SUM(delta) AS total_delta
-                FROM checkin_records
-                WHERE dry_run = 0 AND biz_date >= ?
-                GROUP BY biz_date
-                ORDER BY biz_date ASC
-                """,
-                (start_date,),
-            ).fetchall()
-        by_date = {r["biz_date"]: int(r["total_delta"] or 0) for r in rows}
-
-        series: list[dict[str, Any]] = []
-        for offset in range(29, -1, -1):
-            d = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
-            series.append({"date": d, "delta": by_date.get(d, 0)})
-        return series
 
     def get_history(
         self,
@@ -548,8 +463,7 @@ class Storage:
             calendar_rows = conn.execute(
                 f"""
                 SELECT biz_date,
-                       MAX(CASE WHEN status IN ('success', 'already_done') THEN 1 ELSE 0 END) AS ok,
-                       SUM(delta) AS delta
+                       MAX(CASE WHEN status IN ('success', 'already_done') THEN 1 ELSE 0 END) AS ok
                 FROM checkin_records
                 WHERE {base_where}
                 GROUP BY biz_date
@@ -611,9 +525,6 @@ class Storage:
                        COALESCE(SUM(
                            CASE WHEN c.status IN ('success', 'already_done') THEN 1 ELSE 0 END
                        ), 0) AS ok_count,
-                       COALESCE(SUM(
-                           CASE WHEN c.dry_run = 0 THEN COALESCE(c.delta, 0) ELSE 0 END
-                       ), 0) AS total_delta,
                        COALESCE(MAX(c.dry_run), 0) AS dry_run
                 FROM (
                     SELECT run_id, trigger_type, started_at, finished_at, status
@@ -643,9 +554,8 @@ class Storage:
                 return None
             records = conn.execute(
                 """
-                SELECT provider_id, display_name, biz_date, status, delta,
-                       streak_days, expiring_soon, expiring_at, message,
-                       raw_error_type, duration_ms, dry_run, created_at
+                SELECT provider_id, display_name, biz_date, status,
+                       message, raw_error_type, duration_ms, dry_run, created_at
                 FROM checkin_records
                 WHERE run_id = ?
                 ORDER BY id ASC

@@ -13,10 +13,8 @@ import pytest
 from geteggs.core.config import business_date, today_biz_date
 from geteggs.core.lock import RunLockBusyError, acquire_run_lock
 from geteggs.core.models import (
-    DEFAULT_CHECKIN_CREDITS,
     CheckinResult,
     CheckinStatus,
-    CreditSnapshot,
     DoctorResult,
     GlobalSettings,
     LogEvent,
@@ -37,14 +35,12 @@ class FakeProvider(BaseProvider):
     def __init__(
         self,
         status: CheckinStatus = CheckinStatus.SUCCESS,
-        delta: int = 80,
         provider_id: str = "fake",
         display_name: str = "FakeTool",
     ) -> None:
         self.id = provider_id
         self.display_name = display_name
         self._status = status
-        self._delta = delta
         self.calls = 0
 
     def detect_client_exe(self, config: ProviderConfig) -> Optional[str]:
@@ -76,7 +72,6 @@ class FakeProvider(BaseProvider):
             status=self._status,
             message="done" if self._status.is_done_for_today else "need login",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(delta=self._delta, streak_days=3),
             dry_run=dry_run,
         )
 
@@ -117,7 +112,6 @@ class SlowProvider(FakeProvider):
             status=CheckinStatus.SUCCESS,
             message="done",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(delta=1),
             dry_run=dry_run,
         )
 
@@ -175,7 +169,7 @@ def test_runner_missed_only_skips_already_completed_today(tmp_path: Path) -> Non
     storage = Storage(tmp_path / "test.db")
     notifier = RecordingNotifier()
     runner = CheckinRunner(storage=storage, notifier=notifier, lock_path=tmp_path / "run.lock")
-    provider = FakeProvider(status=CheckinStatus.SUCCESS, delta=80)
+    provider = FakeProvider(status=CheckinStatus.SUCCESS)
 
     first = asyncio.run(
         runner.run(
@@ -212,9 +206,8 @@ def test_runner_missed_only_uses_provider_business_date(tmp_path: Path) -> None:
             provider_id="qoder",
             display_name="Qoder",
             status=CheckinStatus.SUCCESS,
-            message="上一业务日已领取",
+            message="上一业务日已完成签到",
             biz_date="2026-11-18",
-            snapshot=CreditSnapshot(delta=100),
         ),
     )
     runner = CheckinRunner(
@@ -280,7 +273,7 @@ def test_runner_deduplicates_action_alert_same_day(tmp_path: Path) -> None:
     storage = Storage(tmp_path / "test.db")
     notifier = RecordingNotifier()
     runner = CheckinRunner(storage=storage, notifier=notifier, lock_path=tmp_path / "run.lock")
-    provider = FakeProvider(status=CheckinStatus.AUTH_EXPIRED, delta=0)
+    provider = FakeProvider(status=CheckinStatus.AUTH_EXPIRED)
 
     asyncio.run(runner.run(providers_override=[provider]))
     asyncio.run(runner.run(providers_override=[provider]))
@@ -380,7 +373,6 @@ def test_runner_notifies_both_success_and_failure(tmp_path: Path) -> None:
     success = FakeProvider(provider_id="alpha", display_name="Alpha")
     failed = FakeProvider(
         status=CheckinStatus.FAILED,
-        delta=0,
         provider_id="beta",
         display_name="Beta",
     )
@@ -389,6 +381,10 @@ def test_runner_notifies_both_success_and_failure(tmp_path: Path) -> None:
 
     assert len(notifier.sent) == 2
     assert {item[0] for item in notifier.sent} == {"info", "error"}
+    info_messages = [item[2] for item in notifier.sent if item[0] == "info"]
+    assert len(info_messages) == 1
+    assert "Alpha 签到成功" in info_messages[0]
+    assert "+" not in info_messages[0]
 
     # Re-running the same fixed outcomes must not spam duplicate notifications.
     asyncio.run(runner.run(providers_override=[success, failed]))
@@ -406,12 +402,6 @@ def test_storage_today_summary_keeps_success_after_later_failure(tmp_path: Path)
             status=CheckinStatus.SUCCESS,
             message="签到成功",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(
-                delta=100,
-                streak_days=7,
-                expiring_soon=20,
-                expiring_at="2026-12-01T00:00:00+00:00",
-            ),
         ),
     )
     storage.save_checkin_result(
@@ -429,17 +419,18 @@ def test_storage_today_summary_keeps_success_after_later_failure(tmp_path: Path)
     assert summary is not None
     assert summary["status"] == "success"
     assert summary["ok"] is True
-    assert summary["delta"] == 100
     assert "balance" not in summary
-    assert summary["streak_days"] == 7
-    assert summary["expiring_soon"] == 20
+    assert "streak_days" not in summary
+    assert "delta" not in summary
+    assert "expiring_soon" not in summary
     assert summary["last_status"] == "failed"
     assert summary["record_count"] == 2
 
-    latest_snapshot = storage.get_latest_snapshot_record("fake")
-    assert latest_snapshot is not None
-    assert "balance" not in latest_snapshot
-    assert latest_snapshot["streak_days"] == 7
+    latest = storage.get_latest_record("fake")
+    assert latest is not None
+    assert "balance" not in latest
+    assert "streak_days" not in latest
+    assert "delta" not in latest
 
     page = storage.get_history(limit=1, offset=1)
     assert len(page["records"]) == 1
@@ -447,7 +438,7 @@ def test_storage_today_summary_keeps_success_after_later_failure(tmp_path: Path)
     assert page["offset"] == 1
 
 
-def test_storage_today_summary_prefers_positive_streak_and_success_message(
+def test_storage_today_summary_prefers_success_message(
     tmp_path: Path,
 ) -> None:
     storage = Storage(tmp_path / "test.db")
@@ -458,9 +449,8 @@ def test_storage_today_summary_prefers_positive_streak_and_success_message(
             provider_id="workbuddy",
             display_name="WorkBuddy",
             status=CheckinStatus.SUCCESS,
-            message="WorkBuddy 今日签到成功，+100 积分，已连续 33 天。",
+            message="WorkBuddy 今日签到成功。",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(delta=100, streak_days=33),
         ),
     )
     storage.save_checkin_result(
@@ -471,23 +461,18 @@ def test_storage_today_summary_prefers_positive_streak_and_success_message(
             status=CheckinStatus.ALREADY_DONE,
             message="今日已完成签到。",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(delta=0, streak_days=0),
         ),
     )
 
     summary = storage.get_today_summary("workbuddy", biz_date)
     assert summary is not None
     assert summary["status"] == "success"
-    assert summary["delta"] == 100
-    assert summary["streak_days"] == 33
-    assert "已连续 33 天" in summary["message"]
-
-    latest_snapshot = storage.get_latest_snapshot_record("workbuddy")
-    assert latest_snapshot is not None
-    assert latest_snapshot["streak_days"] == 33
+    assert "streak_days" not in summary
+    assert "delta" not in summary
+    assert "今日签到成功" in summary["message"]
 
 
-def test_storage_drops_legacy_balance_column_and_preserves_rows(
+def test_storage_drops_legacy_credit_and_streak_columns_and_preserves_rows(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "legacy_balance.db"
@@ -524,13 +509,14 @@ def test_storage_drops_legacy_balance_column_and_preserves_rows(
             enabled INTEGER NOT NULL DEFAULT 1,
             earliest_time TEXT NOT NULL DEFAULT '00:00',
             jitter_minutes INTEGER NOT NULL DEFAULT 10,
+            checkin_credits INTEGER NOT NULL DEFAULT 100,
             extra_json TEXT NOT NULL DEFAULT '{}',
             updated_at TEXT NOT NULL
         );
         INSERT INTO provider_configs (
-            provider_id, enabled, earliest_time, jitter_minutes, extra_json, updated_at
+            provider_id, enabled, earliest_time, jitter_minutes, checkin_credits, extra_json, updated_at
         ) VALUES (
-            'workbuddy', 1, '00:00', 10, '{}', '2026-11-10T00:00:00+00:00'
+            'workbuddy', 1, '00:00', 10, 250, '{}', '2026-11-10T00:00:00+00:00'
         );
         """
     )
@@ -543,27 +529,20 @@ def test_storage_drops_legacy_balance_column_and_preserves_rows(
         columns = {
             row[1] for row in check.execute("PRAGMA table_info(checkin_records)")
         }
+        provider_columns = {
+            row[1] for row in check.execute("PRAGMA table_info(provider_configs)")
+        }
         preserved = check.execute(
-            "SELECT run_id, delta, streak_days, message FROM checkin_records"
+            "SELECT run_id, status, message FROM checkin_records"
         ).fetchone()
-    assert "balance" not in columns
-    assert preserved == ("run-legacy", 100, 7, "旧记录")
+    for retired in ("balance", "streak_days", "delta", "expiring_soon", "expiring_at"):
+        assert retired not in columns
+    assert "checkin_credits" not in provider_columns
+    assert preserved == ("run-legacy", "success", "旧记录")
     record = storage.get_history(limit=1)["records"][0]
-    assert "balance" not in record
-    assert (
-        storage.get_provider_config("workbuddy").checkin_credits
-        == DEFAULT_CHECKIN_CREDITS
-    )
-
-
-def test_provider_config_checkin_credits_persists(tmp_path: Path) -> None:
-    storage = Storage(tmp_path / "credits.db")
-    cfg = storage.get_provider_config("workbuddy")
-    assert cfg.checkin_credits == DEFAULT_CHECKIN_CREDITS
-
-    cfg.checkin_credits = 250
-    storage.save_provider_config(cfg)
-    assert storage.get_provider_config("workbuddy").checkin_credits == 250
+    for retired in ("balance", "streak_days", "delta", "expiring_soon", "expiring_at"):
+        assert retired not in record
+    assert storage.get_provider_config("workbuddy").business_day_start == "00:00"
 
 
 def test_provider_config_business_day_start_persists(tmp_path: Path) -> None:
@@ -867,7 +846,6 @@ def test_storage_get_runs_includes_summary_counts(tmp_path: Path) -> None:
             status=CheckinStatus.SUCCESS,
             message="ok",
             biz_date="2026-11-18",
-            snapshot=CreditSnapshot(delta=30, streak_days=2),
         ),
     )
     storage.save_checkin_result(
@@ -891,7 +869,6 @@ def test_storage_get_runs_includes_summary_counts(tmp_path: Path) -> None:
             status=CheckinStatus.ALREADY_DONE,
             message="dry",
             biz_date="2026-11-18",
-            snapshot=CreditSnapshot(delta=99, streak_days=2),
             dry_run=True,
         ),
     )
@@ -900,13 +877,18 @@ def test_storage_get_runs_includes_summary_counts(tmp_path: Path) -> None:
     runs = {run["run_id"]: run for run in storage.get_runs()}
     assert runs["run-real"]["record_count"] == 2
     assert runs["run-real"]["ok_count"] == 1
-    assert runs["run-real"]["total_delta"] == 30
+    assert "total_delta" not in runs["run-real"]
     assert runs["run-real"]["dry_run"] == 0
 
     assert runs["run-dry"]["record_count"] == 1
     assert runs["run-dry"]["ok_count"] == 1
-    assert runs["run-dry"]["total_delta"] == 0
+    assert "total_delta" not in runs["run-dry"]
     assert runs["run-dry"]["dry_run"] == 1
+
+    detail = storage.get_run_detail("run-real")
+    assert detail is not None
+    for retired in ("delta", "streak_days", "expiring_soon", "expiring_at"):
+        assert retired not in detail["records"][0]
 
 
 def test_models_validate_assignment_and_timezone() -> None:
@@ -946,7 +928,6 @@ def test_storage_run_id_index_history_biz_date_and_has_more(tmp_path: Path) -> N
                 status=CheckinStatus.SUCCESS,
                 message=f"rec-{idx}",
                 biz_date=day,
-                snapshot=CreditSnapshot(delta=10),
             ),
         )
 
@@ -969,6 +950,7 @@ def test_storage_run_id_index_history_biz_date_and_has_more(tmp_path: Path) -> N
         "2026-11-17",
         "2026-11-18",
     }
+    assert "delta" not in day_only["calendar"][0]
 
 
 def test_storage_count_consecutive_failures_only_counts_action_required(

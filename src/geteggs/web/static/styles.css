@@ -17,7 +17,6 @@
   /* Primary Electric Cobalt Blue */
   --accent: #2546f5;
   --accent-hover: #1a37d9;
-  --accent-bar: #6b82fb;
   --accent-soft: #eaeeff;
   --accent-border: #b8c4fd;
   --accent-glow: rgba(37, 70, 245, 0.24);
@@ -1085,54 +1084,10 @@ code {
   padding: 1px 8px;
 }
 
-.provider-stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin: 14px 0 10px;
-  padding: 10px 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-}
-
-.stat-item { min-width: 0; }
-
-.stat-item + .stat-item {
-  border-left: 1px solid var(--border);
-  padding-left: 12px;
-}
-
-.stat-item span {
-  display: block;
-  font-size: var(--fs-xs);
-  color: var(--muted);
-}
-
-.stat-item strong {
-  display: block;
-  margin-top: 2px;
-  font-size: var(--fs-lg);
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  font-variant-numeric: tabular-nums;
-}
-
-.provider-expiry-note {
-  margin: 0 0 10px;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-  background: var(--warn-soft);
-  border: 1px solid var(--warn-border);
-  color: var(--warn);
-  font-size: var(--fs-xs);
-  font-variant-numeric: tabular-nums;
-}
-
 .provider-msg {
   font-size: var(--fs-sm);
   color: var(--text-secondary);
-  margin: 2px 0 16px;
+  margin: 12px 0 16px;
   min-height: 20px;
   flex: 1;
 }
@@ -1369,73 +1324,6 @@ code {
   font-size: var(--fs-xs);
   font-weight: 500;
   opacity: 0.9;
-}
-
-/* ---- Trend Charts (14d Mini & 30d Full) ---- */
-
-.compact-trend-panel { padding: 18px 20px; }
-.compact-trend-panel .section-header { margin-bottom: 8px; }
-
-.trend-chart-wrap { position: relative; }
-
-.trend-chart {
-  width: 100%;
-  overflow-x: auto;
-  padding-top: 4px;
-}
-
-.trend-bar {
-  transform-box: fill-box;
-  transform-origin: bottom center;
-  animation: barRise 0.28s var(--ease) backwards;
-  animation-delay: var(--bar-delay, 0ms);
-  transition: opacity 0.16s ease, filter 0.16s ease;
-  cursor: pointer;
-}
-
-.trend-chart.no-anim .trend-bar { animation: none; }
-
-.trend-bar:hover,
-.trend-bar:focus {
-  opacity: 0.88;
-  filter: brightness(0.92);
-}
-
-.trend-bar:focus-visible {
-  outline: 2px solid var(--chart-focus, var(--accent));
-  outline-offset: 2px;
-}
-
-@keyframes barRise {
-  from { transform: scaleY(0.2); opacity: 0.55; }
-  to { transform: scaleY(1); opacity: 1; }
-}
-
-.chart-tooltip {
-  position: absolute;
-  top: 0;
-  left: 0;
-  background: var(--dark-bg);
-  color: var(--dark-text);
-  border: 1px solid var(--dark-border);
-  border-radius: var(--radius-sm);
-  padding: 5px 10px;
-  font-size: var(--fs-xs);
-  font-family: var(--mono);
-  white-space: nowrap;
-  pointer-events: none;
-  box-shadow: var(--shadow-lg);
-  visibility: hidden;
-  opacity: 0;
-  transform: translate(-50%, -8px);
-  transition: opacity 0.14s ease, transform 0.14s var(--ease);
-  z-index: 5;
-}
-
-.chart-tooltip.visible {
-  visibility: visible;
-  opacity: 1;
-  transform: translate(-50%, -12px);
 }
 
 /* ---- Auxia Dark Event Matrix & Enterprise Trust Band ---- */
@@ -2390,7 +2278,7 @@ input[type="checkbox"]:not(.switch-input) {
 
 .lifecycle-row p { margin: 0; }
 
-/* ---- Auxia Cobalt Dot-Grid + Warm-Cream Display Cards (History & Settings) ---- */
+/* ---- Auxia Cobalt Dot-Grid + Warm-Cream Display Cards (Settings) ---- */
 
 .aux-cobalt-card {
   padding: 0;
@@ -2415,48 +2303,9 @@ input[type="checkbox"]:not(.switch-input) {
   background: var(--accent);
 }
 
-.aux-index-on-blue {
-  background: rgba(255, 255, 255, 0.16);
-  border-color: rgba(255, 255, 255, 0.28);
-  color: #ffffff;
-}
-
-.aux-meta-on-blue {
-  color: rgba(255, 255, 255, 0.78);
-}
-
 .aux-cobalt-card h2,
 .aux-cobalt-card h3 {
   color: #ffffff;
-}
-
-.aux-pill-static {
-  cursor: default;
-  pointer-events: none;
-}
-
-/* Warm-cream & white chart palette inside cobalt card */
-.aux-cobalt-trend-card {
-  --chart-bar: rgba(241, 240, 232, 0.72);
-  --chart-bar-today: #ffffff;
-  --chart-empty: rgba(255, 255, 255, 0.18);
-  --chart-grid: rgba(255, 255, 255, 0.18);
-  --chart-axis-line: rgba(255, 255, 255, 0.34);
-  --chart-axis: rgba(255, 255, 255, 0.78);
-  --chart-focus: #ffffff;
-}
-
-.aux-cobalt-bottom-grid {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 20px;
-}
-
-.aux-cobalt-display-wrap {
-  display: grid;
-  gap: 4px;
 }
 
 .aux-cobalt-kicker {

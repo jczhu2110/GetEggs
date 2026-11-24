@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 from geteggs.core.models import (
     CheckinResult,
     CheckinStatus,
-    CreditSnapshot,
     DoctorResult,
     ProviderConfig,
 )
@@ -82,7 +81,6 @@ class FakeWebProvider(BaseProvider):
             status=CheckinStatus.ALREADY_DONE,
             message="fake already done",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(delta=0, streak_days=1),
             dry_run=dry_run,
         )
 
@@ -175,7 +173,7 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     body = overview.json()
     assert body["providers"][0]["provider_id"] == "workbuddy"
     assert body["providers"][0]["supports_browser_auth"] is True
-    assert body["providers"][0]["supports_streak"] is True
+    assert "supports_streak" not in body["providers"][0]
 
     # Notifier test endpoint succeeds.
     toast_resp = client.post("/api/notifiers/test")
@@ -191,7 +189,6 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
             "auth_file_path": "C:/custom/workbuddy-desktop.info",
             "browser_state_path": browser_state_target,
             "jitter_minutes": 5,
-            "checkin_credits": 250,
             "business_day_start": "10:00",
         },
     )
@@ -200,20 +197,19 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert provider_extra["auth_file_path"] == "C:/custom/workbuddy-desktop.info"
     assert provider_extra["browser_state_path"] == browser_state_target
     assert provider_extra["jitter_override"] is True
-    assert upd.json()["provider"]["checkin_credits"] == 250
+    assert "checkin_credits" not in upd.json()["provider"]
     assert upd.json()["provider"]["business_day_start"] == "10:00"
     assert "checkin_credits" not in client.get("/api/overview").json()["providers"][0]
     settings_provider = client.get("/api/settings").json()["providers"][0]
-    assert settings_provider["checkin_credits"] == 250
+    assert "checkin_credits" not in settings_provider
     assert settings_provider["business_day_start"] == "10:00"
-    assert settings_provider["supports_streak"] is True
+    assert "supports_streak" not in settings_provider
 
     reset_jitter = client.put(
         "/api/providers/workbuddy/config", json={"jitter_override": False}
     )
     assert reset_jitter.status_code == 200
     assert "jitter_override" not in reset_jitter.json()["provider"]["extra"]
-    assert reset_jitter.json()["provider"]["checkin_credits"] == 250
 
     # Invalid inputs are rejected before touching the database.
     assert client.put("/api/settings", json={"schedule_time": "25:99"}).status_code == 422
@@ -226,12 +222,6 @@ def test_web_auth_exchange_and_origin_guard(tmp_path: Path, monkeypatch) -> None
     assert (
         client.put(
             "/api/providers/workbuddy/config", json={"earliest_time": "9:00"}
-        ).status_code
-        == 422
-    )
-    assert (
-        client.put(
-            "/api/providers/workbuddy/config", json={"checkin_credits": -1}
         ).status_code
         == 422
     )
@@ -351,7 +341,6 @@ def test_web_overview_keeps_success_after_later_failure(
             status=CheckinStatus.SUCCESS,
             message="签到成功",
             biz_date=biz_date,
-            snapshot=CreditSnapshot(delta=100, streak_days=5),
         ),
     )
     storage.save_checkin_result(
@@ -376,11 +365,13 @@ def test_web_overview_keeps_success_after_later_failure(
     client = TestClient(app)
     overview = client.get("/api/overview").json()
 
-    assert overview["today_delta"] == 100
+    assert "today_delta" not in overview
+    assert "trend_30d" not in overview
     assert "total_balance" not in overview
     card = overview["providers"][0]
     assert card["today_record"]["status"] == "success"
     assert "balance" not in card["today_record"]
+    assert "delta" not in card["today_record"]
     assert "最近一次重跑异常" in card["today_record"]["message"]
 
 
@@ -499,12 +490,12 @@ def test_web_trae_allow_token_refresh_persists(tmp_path: Path) -> None:
 
     response = client.put(
         "/api/providers/trae/config",
-        json={"allow_token_refresh": False, "checkin_credits": 150},
+        json={"allow_token_refresh": False},
     )
     assert response.status_code == 200
     provider = response.json()["provider"]
     assert provider["extra"]["allow_token_refresh"] is False
-    assert provider["checkin_credits"] == 150
+    assert "checkin_credits" not in provider
 
     settings_provider = client.get("/api/settings").json()["providers"][0]
     assert settings_provider["extra"]["allow_token_refresh"] is False
@@ -651,7 +642,6 @@ def test_web_overview_uses_provider_business_date(tmp_path: Path) -> None:
             status=CheckinStatus.SUCCESS,
             message="上一业务日签到成功",
             biz_date="2026-11-18",
-            snapshot=CreditSnapshot(delta=120, streak_days=3),
         ),
     )
     runner = CheckinRunner(
@@ -667,7 +657,7 @@ def test_web_overview_uses_provider_business_date(tmp_path: Path) -> None:
 
     body = client.get("/api/overview").json()
 
-    assert body["today_delta"] == 120
+    assert "today_delta" not in body
     assert body["providers"][0]["today_record"]["biz_date"] == "2026-11-18"
     assert body["providers"][0]["today_record"]["status"] == "success"
 
@@ -702,20 +692,29 @@ def test_web_static_assets_and_settings_metadata(
     assert 'id="metric-balance-list"' not in html_resp.text
     overview_js = client.get("/static/overview.js")
     assert overview_js.status_code == 200
+    assert "formatDateTime," in overview_js.text
     assert "当前余额" not in overview_js.text
     assert "metric-balance-list" not in overview_js.text
+
+    utils_js = client.get("/static/utils.js")
+    assert utils_js.status_code == 200
+    assert "animateNumber" not in utils_js.text
+
+    styles_css = client.get("/static/styles.css")
+    assert styles_css.status_code == 200
+    assert ".trend-bar" not in styles_css.text
 
     for asset in (
         "/static/styles.css",
         "/static/app.js",
         "/static/utils.js",
-        "/static/charts.js",
         "/static/overview.js",
         "/static/history.js",
         "/static/settings.js",
     ):
         resp = client.get(asset)
         assert resp.status_code == 200, f"failed to fetch {asset}"
+    assert client.get("/static/charts.js").status_code == 404
 
 
 def test_web_security_headers_csrf_and_custom_config_toggle(
@@ -935,7 +934,6 @@ def test_web_history_month_validation_biz_date_and_provider_config_edges(
                 status=CheckinStatus.SUCCESS,
                 message=f"ok-{idx}",
                 biz_date=day,
-                snapshot=CreditSnapshot(delta=50),
             ),
         )
     runner = CheckinRunner(
@@ -994,18 +992,12 @@ def test_web_history_month_validation_biz_date_and_provider_config_edges(
 
         # Verify P2 WCAG accessibility & frontend hygiene fixes remain intact.
         html_text = client.get("/").text
-        assert 'role="tooltip"' in html_text
         assert 'aria-controls="subtab-runs"' in html_text
         assert 'id="live-drawer-log" class="live-drawer-log" role="log" aria-live="polite"' in html_text
         assert "一次性令牌" not in html_text
 
         assert "visibility: hidden;" in css_text
         assert 'body[data-tab="settings"] .toast-banner' in css_text
-        assert ".trend-bar:focus-visible" in css_text
-
-        charts_text = client.get("/static/charts.js").text
-        assert 'role="group"' in charts_text
-        assert "delegatedContainers" in charts_text
 
         app_text = client.get("/static/app.js").text
         assert "window.__trendResizeTimer" not in app_text
@@ -1016,14 +1008,21 @@ def test_web_history_month_validation_biz_date_and_provider_config_edges(
         assert 'role="switch"' in settings_text
         assert "appState.stopped = true" in settings_text
         assert "267008" in settings_text
+        assert "checkin_credits" not in settings_text
+        assert "签到积分" not in settings_text
         assert "window.__bannerTimer" not in utils_text
 
-        # Verify follow-up audit regression fixes in frontend assets.
+        # Verify follow-up audit regression fixes & credit/streak removal in frontend assets.
         assert 'aria-describedby="metric-schedule metric-schedule-chip metric-schedule-sub"' in html_text
-        assert "--chart-focus: #ffffff;" in css_text
         assert "outline: none;" not in css_text
         overview_text = client.get("/static/overview.js").text
         assert "updateRunningCardPills();" in overview_text
+        assert "连续天数" not in overview_text
+        assert "今日收益" not in overview_text
+        assert "连签" not in html_text
+        assert "连签" not in history_text
+        assert "今日总收益" not in html_text
+        assert "积分领取趋势" not in html_text
         assert "skipCalendarRender" in history_text
 
 

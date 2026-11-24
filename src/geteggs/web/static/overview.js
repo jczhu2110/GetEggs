@@ -1,7 +1,6 @@
 import {
   $,
   $$,
-  animateNumber,
   apiFetch,
   appState,
   copyText,
@@ -13,7 +12,6 @@ import {
   sleep,
   statusPill,
 } from "./utils.js";
-import { renderFullTrendChart, renderMiniTrendChart } from "./charts.js";
 
 const selectedProviders = new Set();
 const runningProviderIds = new Set();
@@ -26,7 +24,6 @@ let historyProviderOptionsKey = "";
 let callbacks = {
   onRunComplete: () => {},
   onOpenToolConfig: () => {},
-  onOpenHistory: () => {},
   onAuthComplete: () => {},
 };
 
@@ -186,11 +183,7 @@ function finishRun(triggerButton, originalHtml) {
     triggerButton.innerHTML = originalHtml;
   }
   updateSelectionUi();
-  updateAuxiaTelemetry(
-    appState.providers,
-    latestScheduleSnapshot,
-    $("#metric-today-delta")?.dataset?.numVal ?? 0
-  );
+  updateAuxiaTelemetry(appState.providers, latestScheduleSnapshot);
 }
 
 let scheduleMetricRequest = null;
@@ -206,16 +199,12 @@ function setHeroStepState(el, state) {
   }
 }
 
-function updateAuxiaTelemetry(providers, schedule, todayDelta) {
+function updateAuxiaTelemetry(providers, schedule) {
   const list = providers || [];
   const enabled = list.filter((p) => p.enabled);
   const doneCount = enabled.filter((p) =>
     ["success", "already_done"].includes(p.today_record?.status)
   ).length;
-  const maxStreak = list.reduce((best, p) => {
-    const val = Number(p.today_record?.streak_days ?? p.latest_record?.streak_days ?? 0);
-    return Number.isFinite(val) ? Math.max(best, val) : best;
-  }, 0);
 
   const wfRun = $("#hero-wf-run");
   const wfLedger = $("#hero-wf-ledger");
@@ -251,17 +240,15 @@ function updateAuxiaTelemetry(providers, schedule, todayDelta) {
   const vTitle = $("#hero-variant-title");
   const vSub = $("#hero-variant-sub");
   if (vTitle && vSub) {
-    const deltaVal = Number(todayDelta) || 0;
     if (enabled.length > 0 && doneCount === enabled.length) {
-      vTitle.textContent = `今日全部就绪 (+${deltaVal})`;
-      vSub.textContent = maxStreak > 0
-        ? `已完成 ${doneCount}/${enabled.length} 项工具 · 最高连签 ${maxStreak} 天`
-        : `已完成 ${doneCount}/${enabled.length} 项工具 · 账本已同步`;
+      vTitle.textContent = "今日全部就绪";
+      vSub.textContent = `已完成 ${doneCount}/${enabled.length} 项工具 · 账本已同步`;
     } else if (enabled.length > 0) {
       vTitle.textContent = `${doneCount} / ${enabled.length} 已完成`;
-      vSub.textContent = deltaVal > 0
-        ? `今日累计 +${deltaVal} 积分 · 仍有工具待签`
-        : "点击左侧发送或下方预检，自动核验会话并执行。";
+      vSub.textContent =
+        doneCount > 0
+          ? `已完成 ${doneCount} 项 · 仍有工具待签`
+          : "点击左侧发送或下方预检，自动核验会话并执行。";
     } else {
       vTitle.textContent = "等待启用工具";
       vSub.textContent = "前往「工具与设置」开启每日自动调度。";
@@ -280,9 +267,11 @@ function updateAuxiaTelemetry(providers, schedule, todayDelta) {
       if (status === "running") {
         decision = "✦ EXECUTING AGENT";
         pillClass = " is-active";
-      } else if (status === "success" || status === "already_done") {
-        const d = Number(p.today_record?.delta) || 0;
-        decision = d > 0 ? `✓ CREDITED +${d}` : "✓ IDEMPOTENT SKIP";
+      } else if (status === "success") {
+        decision = "✓ CHECKED IN";
+        pillClass = " is-ok";
+      } else if (status === "already_done") {
+        decision = "✓ IDEMPOTENT SKIP";
         pillClass = " is-ok";
       } else if (ACTION_NEEDED_STATUSES.has(status)) {
         decision = "⚠ ACTION REQUIRED";
@@ -380,11 +369,8 @@ export async function loadOverview(silent = false) {
       return;
     }
 
-    animateNumber($("#metric-today-delta"), data.today_delta ?? 0, "+");
-
     const providers = data.providers || [];
     appState.providers = providers;
-    appState.trend30d = data.trend_30d || [];
     appState.bizDate = data.biz_date || null;
 
     renderAlertStrip(providers);
@@ -393,11 +379,17 @@ export async function loadOverview(silent = false) {
     const doneCount = enabledProviders.filter((p) =>
       ["success", "already_done"].includes(p.today_record?.status)
     ).length;
+    const progressEl = $("#metric-today-progress");
+    if (progressEl) {
+      progressEl.textContent = `${doneCount} / ${enabledProviders.length}`;
+    }
     const compChip = $("#metric-completion-chip");
     if (compChip) {
-      compChip.textContent = enabledProviders.length
-        ? `${doneCount} / ${enabledProviders.length} 已完成`
-        : "暂无启用工具";
+      compChip.textContent = !enabledProviders.length
+        ? "暂无启用工具"
+        : doneCount === enabledProviders.length
+          ? "全部就绪"
+          : `待签 ${enabledProviders.length - doneCount} 项`;
     }
 
     if (data.schedule) {
@@ -433,14 +425,6 @@ export async function loadOverview(silent = false) {
         .map((p) => {
           const todayRec = p.today_record;
           const rec = p.latest_record;
-          const streakValue = todayRec?.streak_days || rec?.streak_days;
-          const streak =
-            p.supports_streak === false ? "不适用" : streakValue || "--";
-          const delta = todayRec?.delta
-            ? `+${todayRec.delta}`
-            : todayRec?.status === "already_done"
-              ? "已签"
-              : "0";
           const msg =
             todayRec?.message ||
             (rec ? `最近记录 (${rec.biz_date})：${rec.message}` : "今日尚未执行签到");
@@ -451,14 +435,6 @@ export async function loadOverview(silent = false) {
             "schema_changed",
             "unavailable",
           ].includes(lastStatus);
-          const expiring = todayRec?.expiring_soon ?? rec?.expiring_soon;
-          const expiringAt = todayRec?.expiring_at ?? rec?.expiring_at;
-          const expiryParts = [];
-          if (Number(expiring) > 0) expiryParts.push(`${expiring} 积分`);
-          if (expiringAt && Number(expiring) > 0) expiryParts.push(`${formatDateTime(expiringAt)} 到期`);
-          const expiryHtml = expiryParts.length
-            ? `<div class="provider-expiry-note">即将过期：${escapeHtml(expiryParts.join(" · "))}</div>`
-            : "";
 
           const displayStatus = runningProviderIds.has(p.provider_id)
             ? "running"
@@ -493,12 +469,6 @@ export async function loadOverview(silent = false) {
                 </div>
                 ${statusPill(displayStatus)}
               </div>
-
-              <div class="provider-stats">
-                <div class="stat-item"><span>今日收益</span><strong>${escapeHtml(delta)}</strong></div>
-                <div class="stat-item"><span>连续天数</span><strong>${escapeHtml(streak)}</strong></div>
-              </div>
-              ${expiryHtml}
 
               <p class="provider-msg">${escapeHtml(msg)}</p>
 
@@ -561,11 +531,7 @@ export async function loadOverview(silent = false) {
       }
     }
 
-    renderMiniTrendChart(appState.trend30d);
-    if (document.body.dataset.tab === "history") {
-      renderFullTrendChart(appState.trend30d);
-    }
-    updateAuxiaTelemetry(providers, data.schedule || latestScheduleSnapshot, data.today_delta ?? 0);
+    updateAuxiaTelemetry(providers, data.schedule || latestScheduleSnapshot);
   } catch (err) {
     if (!silent) {
       showBanner(err.message, true);
@@ -628,7 +594,7 @@ function appendLogLine(level, text) {
 
 async function showRunBusyHint(sessionId) {
   let hint =
-    "另一个签到任务正在执行中（可能是计划任务或另一页面），为防重复领取已取消本次操作，请等待其完成后再试。";
+    "另一个签到任务正在执行中（可能是计划任务或另一页面），为防重复签到已取消本次操作，请等待其完成后再试。";
   try {
     const data = await apiFetch("/api/runs?limit=5");
     if (sessionId !== runSessionSeq) return;
@@ -641,9 +607,9 @@ async function showRunBusyHint(sessionId) {
           1,
           Math.round((Date.now() - started.getTime()) / 60000)
         );
-        hint = `${label}正在执行（已运行约 ${minutes} 分钟），为防重复领取已取消本次操作，请等待其完成后再试。`;
+        hint = `${label}正在执行（已运行约 ${minutes} 分钟），为防重复签到已取消本次操作，请等待其完成后再试。`;
       } else {
-        hint = `${label}正在执行，为防重复领取已取消本次操作，请等待其完成后再试。`;
+        hint = `${label}正在执行，为防重复签到已取消本次操作，请等待其完成后再试。`;
       }
     }
   } catch {
@@ -682,7 +648,7 @@ async function triggerRun(providerIds = null, dryRun = false, triggerButton = nu
   activeTargets.forEach((id) => runningProviderIds.add(id));
   updateRunningCardPills();
   setRunButtonsBusy(true);
-  updateAuxiaTelemetry(appState.providers, latestScheduleSnapshot, $("#metric-today-delta")?.dataset?.numVal ?? 0);
+  updateAuxiaTelemetry(appState.providers, latestScheduleSnapshot);
 
   const targetLabel = ids ? `${ids.length} 个工具` : "全部已启用工具";
   openLiveDrawer(dryRun ? `正在预检（${targetLabel}）` : `正在执行签到（${targetLabel}）`);
@@ -886,7 +852,6 @@ export function initOverview(userCallbacks = {}) {
     triggerRun(null, true, ev.currentTarget)
   );
   $("#btn-refresh-overview")?.addEventListener("click", () => loadOverview());
-  $("#btn-goto-history-trend")?.addEventListener("click", () => callbacks.onOpenHistory());
 
   $("#btn-toggle-select-mode")?.addEventListener("click", () => {
     selectionMode = !selectionMode;

@@ -1,11 +1,9 @@
 import { $, $$, appState } from "./utils.js";
-import { renderFullTrendChart, renderMiniTrendChart } from "./charts.js";
 import { authBrowser, initOverview, launchClient, loadOverview } from "./overview.js";
 import {
   initHistory,
   loadActiveAuditTab,
   loadHistory,
-  renderHistoryTrend,
 } from "./history.js";
 import {
   focusSection,
@@ -20,7 +18,6 @@ import {
 } from "./settings.js";
 
 let activeTab = "overview";
-let trendResizeTimer = null;
 
 function positionNavIndicator() {
   const nav = $(".nav");
@@ -52,13 +49,6 @@ function switchTab(tabName) {
     p.classList.toggle("active", p.id === `tab-${tabName}`);
   });
   requestAnimationFrame(positionNavIndicator);
-
-  if (tabName === "overview") {
-    requestAnimationFrame(() => renderMiniTrendChart(appState.trend30d, true));
-  }
-  if (tabName === "history") {
-    requestAnimationFrame(() => renderHistoryTrend(true));
-  }
 }
 
 function activateTab(tab) {
@@ -117,8 +107,6 @@ $$("[data-goto-tab]").forEach((el) => {
     activateTab(tab);
     if (tab === "settings" && section) {
       focusSection(section);
-    } else if (el.closest(".aux-cobalt-card")) {
-      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   };
   el.addEventListener("click", go);
@@ -167,11 +155,6 @@ document.addEventListener("keydown", (ev) => {
 
 window.addEventListener("resize", () => {
   positionNavIndicator();
-  clearTimeout(trendResizeTimer);
-  trendResizeTimer = setTimeout(() => {
-    if (activeTab === "overview") renderMiniTrendChart(appState.trend30d, true);
-    if (activeTab === "history") renderFullTrendChart(appState.trend30d, true);
-  }, 150);
 });
 
 window.addEventListener("beforeunload", (ev) => {
@@ -194,9 +177,6 @@ initOverview({
   onOpenToolConfig: (providerId) => {
     activateTab("settings");
     focusTool(providerId);
-  },
-  onOpenHistory: () => {
-    activateTab("history");
   },
   onAuthComplete: (providerId) => {
     refreshProviderDoctor(providerId);

@@ -41,7 +41,7 @@ from geteggs.web.app import create_app
 
 app = typer.Typer(
     name="geteggs",
-    help="Local-first AI Agent 自动签到与积分管理工具",
+    help="Local-first AI Agent 自动签到管理工具",
     no_args_is_help=True,
 )
 schedule_app = typer.Typer(help="管理 Windows 系统定时计划任务")
@@ -115,7 +115,7 @@ def doctor(
 
 @app.command()
 def status() -> None:
-    """查看今日各工具签到状态与最近积分快照。"""
+    """查看今日各工具签到状态与最近记录。"""
     storage = Storage()
     settings = storage.get_settings()
     biz_date = today_biz_date(settings.timezone)
@@ -124,33 +124,17 @@ def status() -> None:
     table.add_column("工具", style="bold")
     table.add_column("启用")
     table.add_column("今日状态")
-    table.add_column("今日新增")
-    table.add_column("连签天数")
     table.add_column("说明")
 
     for p in list_providers():
         cfg = storage.get_provider_config(p.id)
         provider_biz_date = p.business_date(cfg, settings.timezone)
         today_rec = storage.get_today_summary(p.id, provider_biz_date)
-        latest = storage.get_latest_snapshot_record(p.id) or storage.get_latest_record(p.id)
-        if today_rec and today_rec["delta"]:
-            delta_text = f"+{today_rec['delta']}"
-        elif today_rec and today_rec["status"] == "already_done":
-            delta_text = "已签"
-        else:
-            delta_text = "0"
-        if not p.supports_streak:
-            streak_text = "不适用"
-        elif latest and latest["streak_days"]:
-            streak_text = str(latest["streak_days"])
-        else:
-            streak_text = "--"
+        latest = storage.get_latest_record(p.id)
         table.add_row(
             p.display_name,
             "是" if cfg.enabled else "否",
             today_rec["status"] if today_rec else "pending",
-            delta_text,
-            streak_text,
             (today_rec or latest or {}).get("message", "尚无记录"),
         )
     console.print(table)

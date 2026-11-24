@@ -422,7 +422,7 @@ async def browser_checkin_session(
                     if (statusRes.status !== 404) break;
                 }
                 if (statusRes.status !== 200 || dryRun) {
-                    return { statusRes, checkinRes: null, postStatusRes: null };
+                    return { statusRes, checkinRes: null };
                 }
 
                 const rootObj = (statusRes.data && typeof statusRes.data === "object") ? statusRes.data : {};
@@ -443,22 +443,14 @@ async def browser_checkin_session(
                 }
                 const already = parseBool(rawState);
                 if (already === null) {
-                    return { statusRes, checkinRes: null, postStatusRes: null };
+                    return { statusRes, checkinRes: null };
                 }
                 if (already) {
-                    return { statusRes, checkinRes: null, postStatusRes: null };
+                    return { statusRes, checkinRes: null };
                 }
 
                 const checkinRes = await postJson(checkinEndpoint);
-                let postStatusRes = null;
-                if (checkinRes.status === 200) {
-                    for (const ep of endpoints) {
-                        const candidate = await postJson(ep);
-                        postStatusRes = candidate;
-                        if (candidate.status !== 404) break;
-                    }
-                }
-                return { statusRes, checkinRes, postStatusRes };
+                return { statusRes, checkinRes };
             }
             """
             result = await page.evaluate(
