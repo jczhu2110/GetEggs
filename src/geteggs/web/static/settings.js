@@ -111,7 +111,6 @@ const GLOBAL_COMPARE_KEYS = [
   "jitter_minutes",
   "notify_toast_enabled",
   "notify_on_already_done",
-  "auto_catchup_on_logon",
   "auto_cleanup_enabled",
   "run_events_retention_days",
   "notification_retention_days",
@@ -167,37 +166,18 @@ function setSettingsButtonsEnabled(enabled) {
 
 /* ---- Global Settings & Sticky Save Bar ---- */
 
-function syncScheduleHeroPreview() {
-  const clock = $("#schedule-hero-clock");
-  const jitter = $("#schedule-hero-jitter");
-  const catchup = $("#schedule-hero-catchup");
-  if (clock) {
-    clock.textContent = $("#set-schedule-time")?.value || "10:15";
-  }
-  if (jitter) {
-    const raw = $("#set-jitter-minutes")?.value;
-    const mins = raw === "" || raw === undefined ? 15 : Number(raw);
-    jitter.textContent = Number.isFinite(mins) ? `±${mins} MIN` : "-- MIN";
-  }
-  if (catchup) {
-    catchup.textContent = $("#set-catchup-logon")?.checked ? "ON LOGON" : "DISABLED";
-  }
-}
-
 function populateGlobalForm(g) {
   if (!g) return;
   $("#set-schedule-time").value = g.schedule_time || "10:15";
   $("#set-jitter-minutes").value = g.jitter_minutes ?? 15;
   $("#set-toast-enabled").checked = Boolean(g.notify_toast_enabled);
   $("#set-notify-already").checked = Boolean(g.notify_on_already_done);
-  $("#set-catchup-logon").checked = Boolean(g.auto_catchup_on_logon);
   $("#set-auto-cleanup").checked = Boolean(g.auto_cleanup_enabled);
   $("#set-events-retention").value = g.run_events_retention_days ?? 30;
   $("#set-notification-retention").value = g.notification_retention_days ?? 90;
   $("#set-run-retention").value = g.run_retention_days ?? 180;
   $("#set-ledger-retention").value = g.ledger_retention_days ?? 365;
   $("#set-vacuum-interval").value = g.vacuum_interval_days ?? 30;
-  syncScheduleHeroPreview();
   syncPresetHighlight();
   updateSaveBarVisibility();
 }
@@ -227,7 +207,6 @@ function collectGlobalSettings() {
     timezone: lastSavedGlobal?.timezone || "Asia/Shanghai",
     notify_toast_enabled: $("#set-toast-enabled").checked,
     notify_on_already_done: $("#set-notify-already").checked,
-    auto_catchup_on_logon: $("#set-catchup-logon").checked,
     auto_cleanup_enabled: $("#set-auto-cleanup").checked,
     run_events_retention_days: retentionValue("#set-events-retention", 30),
     notification_retention_days: retentionValue("#set-notification-retention", 90),
@@ -296,7 +275,6 @@ async function saveGlobalSettings(successMessage) {
     const scheduleChanged = Boolean(
       previous &&
         (previous.schedule_time !== payload.schedule_time ||
-          previous.auto_catchup_on_logon !== payload.auto_catchup_on_logon ||
           previous.jitter_minutes !== payload.jitter_minutes)
     );
     if (scheduleChanged && canAutoSyncSchedule()) {
@@ -396,7 +374,7 @@ function buildProviderAdvancedForm(provider) {
       </label>
       <div class="two-col-fields">
         <label class="field">
-          <span>最早可执行时间（补跑生效）</span>
+          <span>最早可执行时间（定时任务生效）</span>
           <input name="earliest_time" type="time" class="input" value="${earliest}" />
         </label>
         <label class="field">
@@ -908,8 +886,8 @@ function renderScheduleBox(sch) {
     return;
   }
   box.innerHTML = sch.installed
-    ? `上次运行：${escapeHtml(formatDateTime(sch.last_run_time))}<br/>下次计划：${escapeHtml(formatDateTime(sch.next_run_time))}<br/>上次结果：${escapeHtml(formatTaskResult(sch.last_task_result))}`
-    : `尚未注册系统计划任务，点击下方按钮即可按左侧时间自动注册（含登录后补漏）。`;
+    ? `上次运行：${escapeHtml(formatDateTime(sch.last_run_time))} · 下次计划：${escapeHtml(formatDateTime(sch.next_run_time))} · 上次结果：${escapeHtml(formatTaskResult(sch.last_task_result))}`
+    : `尚未注册系统计划任务，点击右侧按钮按上方时间注册每日定时任务。`;
 }
 
 export async function loadMaintenanceInfo() {
@@ -1044,7 +1022,7 @@ async function uninstallSchedule() {
     title: "卸载 Windows 计划任务",
     message: "确定要移除每日自动签到计划任务吗？",
     impacts: [
-      "停止每日定时静默签到与登录自动补漏",
+      "停止每日定时静默签到",
       "已保存的工具配置、凭据和历史账本不会被删除",
       "可随时点击「安装 / 更新计划任务」重新启用",
     ],
@@ -1085,7 +1063,6 @@ export function initSettings(userCallbacks = {}) {
   const globalFieldIds = new Set([
     "set-schedule-time",
     "set-jitter-minutes",
-    "set-catchup-logon",
     "set-toast-enabled",
     "set-notify-already",
     "set-auto-cleanup",
@@ -1102,7 +1079,6 @@ export function initSettings(userCallbacks = {}) {
     if (RETENTION_INPUT_IDS.has(ev.target.id)) {
       syncPresetHighlight();
     }
-    syncScheduleHeroPreview();
     updateSaveBarVisibility();
   };
   $("#tab-settings")?.addEventListener("input", onGlobalChange);
@@ -1367,35 +1343,6 @@ export function initSettings(userCallbacks = {}) {
     } catch (err) {
       showBanner(err.message, true);
     } finally {
-      button.disabled = false;
-      button.textContent = originalText;
-    }
-  });
-
-  $("#btn-shutdown-web")?.addEventListener("click", async (ev) => {
-    const button = ev.currentTarget;
-    const confirmed = await confirmAction({
-      title: "关闭本地 Web 服务",
-      message: "确定关闭当前本地控制台进程吗？",
-      impacts: [
-        "本网页与本地 API 将立即停止响应，如需使用可再次运行 `geteggs ui`",
-        "已安装的 Windows 计划任务不受影响，仍会定时静默执行",
-      ],
-      confirmText: "确认关闭",
-      danger: true,
-    });
-    if (!confirmed) return;
-
-    if (button.disabled) return;
-    const originalText = button.textContent;
-    button.disabled = true;
-    button.textContent = "正在关闭...";
-    try {
-      const res = await apiFetch("/api/system/shutdown", { method: "POST" });
-      appState.stopped = true;
-      showBanner(res.message);
-    } catch (err) {
-      showBanner(err.message, true);
       button.disabled = false;
       button.textContent = originalText;
     }

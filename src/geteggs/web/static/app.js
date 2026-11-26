@@ -120,23 +120,6 @@ $$("[data-goto-tab]").forEach((el) => {
   }
 });
 
-$$("[data-hero-action]").forEach((el) => {
-  el.addEventListener("click", () => {
-    const action = el.dataset.heroAction;
-    if (action === "run-all") {
-      $("#btn-run-all")?.click();
-    } else if (action === "dry-run") {
-      activateTab("overview");
-      $("#btn-dry-run-all")?.click();
-    }
-  });
-});
-
-$("#btn-dismiss-ribbon")?.addEventListener("click", () => {
-  const ribbon = $("#aux-ribbon");
-  if (ribbon) ribbon.hidden = true;
-});
-
 document.addEventListener("click", (ev) => {
   $$(".more-menu[open]").forEach((menu) => {
     if (!menu.contains(ev.target) || ev.target.closest(".more-menu-item")) {

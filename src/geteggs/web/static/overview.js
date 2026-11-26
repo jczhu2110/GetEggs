@@ -3,6 +3,7 @@ import {
   $$,
   apiFetch,
   appState,
+  confirmAction,
   copyText,
   escapeHtml,
   formatDateTime,
@@ -49,9 +50,10 @@ function renderAlertStrip(providers) {
   const issues = providers
     .map((p) => {
       const todayRec = p.today_record;
-      const status = todayRec?.last_status || todayRec?.status;
+      if (!todayRec || todayRec.ok) return null;
+      const status = todayRec.last_status || todayRec.status;
       if (!status || !ACTION_NEEDED_STATUSES.has(status)) return null;
-      return { provider: p, status, message: todayRec?.message || "需要处理" };
+      return { provider: p, status, message: todayRec.message || "需要处理" };
     })
     .filter(Boolean);
 
@@ -69,7 +71,7 @@ function renderAlertStrip(providers) {
       let actionHtml = `<button type="button" class="btn btn-secondary btn-sm" data-alert-config="${pid}">前往检查</button>`;
       if (["auth_expired", "needs_manual"].includes(status) && p.supports_browser_auth) {
         actionHtml = `<button type="button" class="btn btn-primary btn-sm" data-auth-browser="${pid}">去浏览器授权</button>`;
-      } else if (["auth_expired", "needs_manual", "unavailable"].includes(status)) {
+      } else if (["auth_expired", "needs_manual"].includes(status)) {
         actionHtml = `<button type="button" class="btn btn-primary btn-sm" data-alert-config="${pid}">去配置凭据</button>`;
       } else if (status === "failed") {
         actionHtml = `<button type="button" class="btn btn-secondary btn-sm" data-run-provider="${pid}">重试</button>`;
@@ -152,7 +154,7 @@ function setRunButtonsBusy(busy) {
     const button = $(selector);
     if (button) button.disabled = busy;
   });
-  $$("[data-run-provider], [data-dry-provider], [data-provider-select], [data-hero-action]").forEach(
+  $$("[data-run-provider], [data-dry-provider], [data-provider-select]").forEach(
     (button) => {
       button.disabled = busy;
     }
@@ -183,124 +185,11 @@ function finishRun(triggerButton, originalHtml) {
     triggerButton.innerHTML = originalHtml;
   }
   updateSelectionUi();
-  updateAuxiaTelemetry(appState.providers, latestScheduleSnapshot);
 }
 
 let scheduleMetricRequest = null;
-let latestScheduleSnapshot = null;
-
-function setHeroStepState(el, state) {
-  if (!el) return;
-  el.classList.remove("is-done", "is-pending", "is-running");
-  el.classList.add(`is-${state}`);
-  const mark = el.querySelector(".step-mark");
-  if (mark) {
-    mark.textContent = state === "done" ? "✓" : state === "running" ? "◌" : "○";
-  }
-}
-
-function updateAuxiaTelemetry(providers, schedule) {
-  const list = providers || [];
-  const enabled = list.filter((p) => p.enabled);
-  const doneCount = enabled.filter((p) =>
-    ["success", "already_done"].includes(p.today_record?.status)
-  ).length;
-
-  const wfRun = $("#hero-wf-run");
-  const wfLedger = $("#hero-wf-ledger");
-  if (appState.activeRun) {
-    setHeroStepState(wfRun, "running");
-    setHeroStepState(wfLedger, "pending");
-  } else if (enabled.length > 0 && doneCount === enabled.length) {
-    setHeroStepState(wfRun, "done");
-    setHeroStepState(wfLedger, "done");
-  } else if (doneCount > 0) {
-    setHeroStepState(wfRun, "running");
-    setHeroStepState(wfLedger, "done");
-  } else {
-    setHeroStepState(wfRun, "pending");
-    setHeroStepState(wfLedger, "pending");
-  }
-
-  const toolsEl = $("#hero-decision-tools");
-  if (toolsEl) {
-    toolsEl.textContent = `TOOLS · ${enabled.length}/${list.length} ENABLED`;
-  }
-  const schEl = $("#hero-decision-schedule");
-  if (schEl) {
-    schEl.textContent = schedule
-      ? schedule.query_failed
-        ? "SCHEDULER · CHECK NEEDED"
-        : schedule.installed
-          ? `SCHEDULER · ${String(schedule.state || "READY").toUpperCase()}`
-          : "SCHEDULER · MANUAL MODE"
-      : "SCHEDULER · SYNCING";
-  }
-
-  const vTitle = $("#hero-variant-title");
-  const vSub = $("#hero-variant-sub");
-  if (vTitle && vSub) {
-    if (enabled.length > 0 && doneCount === enabled.length) {
-      vTitle.textContent = "今日全部就绪";
-      vSub.textContent = `已完成 ${doneCount}/${enabled.length} 项工具 · 账本已同步`;
-    } else if (enabled.length > 0) {
-      vTitle.textContent = `${doneCount} / ${enabled.length} 已完成`;
-      vSub.textContent =
-        doneCount > 0
-          ? `已完成 ${doneCount} 项 · 仍有工具待签`
-          : "点击左侧发送或下方预检，自动核验会话并执行。";
-    } else {
-      vTitle.textContent = "等待启用工具";
-      vSub.textContent = "前往「工具与设置」开启每日自动调度。";
-    }
-  }
-
-  const matrix = $("#aux-decision-matrix");
-  if (matrix && list.length) {
-    const rows = list.slice(0, 4).map((p) => {
-      const status = runningProviderIds.has(p.provider_id)
-        ? "running"
-        : p.today_record?.status || "pending";
-      const code = escapeHtml(String(p.provider_id || "").toUpperCase());
-      let decision = "✦ QUEUED FOR CHECK-IN";
-      let pillClass = "";
-      if (status === "running") {
-        decision = "✦ EXECUTING AGENT";
-        pillClass = " is-active";
-      } else if (status === "success") {
-        decision = "✓ CHECKED IN";
-        pillClass = " is-ok";
-      } else if (status === "already_done") {
-        decision = "✓ IDEMPOTENT SKIP";
-        pillClass = " is-ok";
-      } else if (ACTION_NEEDED_STATUSES.has(status)) {
-        decision = "⚠ ACTION REQUIRED";
-        pillClass = " is-warn";
-      } else if (!p.enabled) {
-        decision = "○ SCHEDULE PAUSED";
-        pillClass = " is-muted";
-      }
-      return `
-        <div class="aux-matrix-row">
-          <span class="aux-matrix-event">${code} · ${p.enabled ? "AUTO-SCHEDULE" : "MANUAL ONLY"}</span>
-          <span class="aux-matrix-line" aria-hidden="true"></span>
-          <span class="aux-matrix-pill${pillClass}">${escapeHtml(decision)}</span>
-        </div>
-      `;
-    });
-    rows.push(`
-      <div class="aux-matrix-row">
-        <span class="aux-matrix-event">SQLITE WAL · DAILY SNAPSHOT</span>
-        <span class="aux-matrix-line" aria-hidden="true"></span>
-        <span class="aux-matrix-pill is-active">✦ LEDGER PROTECTED</span>
-      </div>
-    `);
-    matrix.innerHTML = rows.join("");
-  }
-}
 
 function applyScheduleMetrics(sch) {
-  latestScheduleSnapshot = sch;
   const failed = Boolean(sch?.query_failed);
   const state = String(sch?.state || "Ready");
   const healthy = ["ready", "running", "queued"].includes(state.toLowerCase());
@@ -323,21 +212,13 @@ function applyScheduleMetrics(sch) {
   const schSub = $("#metric-schedule-sub");
   if (schSub) {
     if (failed) {
-      schSub.textContent = "计划任务状态查询失败，请到设置页重试 →";
+      schSub.textContent = "计划任务状态查询失败，请到设置页重试";
     } else {
       schSub.textContent =
         sch?.installed && sch.next_run_time
           ? `下次运行：${formatDateTime(sch.next_run_time)}`
-          : "点击前往设置计划任务 →";
+          : "点击前往设置计划任务";
     }
-  }
-  const schDecision = $("#hero-decision-schedule");
-  if (schDecision) {
-    schDecision.textContent = failed
-      ? "SCHEDULER · CHECK NEEDED"
-      : sch?.installed
-        ? `SCHEDULER · ${state.toUpperCase()}`
-        : "SCHEDULER · MANUAL MODE";
   }
 }
 
@@ -382,6 +263,14 @@ export async function loadOverview(silent = false) {
     const progressEl = $("#metric-today-progress");
     if (progressEl) {
       progressEl.textContent = `${doneCount} / ${enabledProviders.length}`;
+    }
+    const progressBar = $("#metric-progress-bar");
+    if (progressBar) {
+      const pct = enabledProviders.length
+        ? Math.round((doneCount / enabledProviders.length) * 100)
+        : 0;
+      progressBar.style.width = `${pct}%`;
+      progressBar.classList.toggle("is-complete", enabledProviders.length > 0 && pct === 100);
     }
     const compChip = $("#metric-completion-chip");
     if (compChip) {
@@ -429,23 +318,23 @@ export async function loadOverview(silent = false) {
             todayRec?.message ||
             (rec ? `最近记录 (${rec.biz_date})：${rec.message}` : "今日尚未执行签到");
           const lastStatus = todayRec?.last_status || todayRec?.status;
-          const needsClient = [
-            "auth_expired",
-            "needs_manual",
-            "schema_changed",
-            "unavailable",
-          ].includes(lastStatus);
+          const isDone = ["success", "already_done"].includes(todayRec?.status);
+          const needsAuth = !isDone && ["auth_expired", "needs_manual"].includes(lastStatus);
+          const needsClient =
+            !isDone &&
+            ["auth_expired", "needs_manual", "schema_changed", "unavailable"].includes(
+              lastStatus
+            );
 
           const displayStatus = runningProviderIds.has(p.provider_id)
             ? "running"
             : todayRec?.status;
           const disabledTag = p.enabled
             ? ""
-            : `<span class="provider-subtag">自动调度已停用</span>`;
+            : `<span class="provider-disabled-note">自动调度已停用</span>`;
           const pid = escapeHtml(p.provider_id);
-          const isDone = ["success", "already_done"].includes(todayRec?.status);
-          const authPrimary = needsClient && p.supports_browser_auth;
-          const configPrimary = needsClient && !p.supports_browser_auth;
+          const authPrimary = needsAuth && p.supports_browser_auth;
+          const configPrimary = needsAuth && !p.supports_browser_auth;
           const runPrimary = !isDone && !authPrimary && !configPrimary;
 
           return `
@@ -461,10 +350,7 @@ export async function loadOverview(silent = false) {
                 </label>
                 <span class="provider-monogram" aria-hidden="true">${escapeHtml(providerInitial(p.display_name))}</span>
                 <div class="provider-head-copy">
-                  <div class="provider-title-line">
-                    <h3 class="provider-title">${escapeHtml(p.display_name)}</h3>
-                    <span class="provider-slug">${escapeHtml(String(p.provider_id || "").toUpperCase())}</span>
-                  </div>
+                  <h3 class="provider-title">${escapeHtml(p.display_name)}</h3>
                   ${disabledTag}
                 </div>
                 ${statusPill(displayStatus)}
@@ -483,7 +369,7 @@ export async function loadOverview(silent = false) {
                     ? `<button type="button" class="btn btn-primary btn-sm" data-open-config="${pid}">去配置凭据</button>`
                     : ""
                 }
-                <button type="button" class="btn ${runPrimary ? "btn-primary" : "btn-ghost"} btn-sm" data-run-provider="${pid}">立即签到</button>
+                <button type="button" class="btn ${runPrimary ? "btn-primary" : "btn-secondary"} btn-sm" data-run-provider="${pid}">立即签到</button>
                 <details class="more-menu">
                   <summary class="btn btn-ghost btn-sm more-trigger" aria-label="更多操作" title="更多操作">⋯</summary>
                   <div class="more-menu-list">
@@ -530,8 +416,6 @@ export async function loadOverview(silent = false) {
         providerSelect.value = current;
       }
     }
-
-    updateAuxiaTelemetry(providers, data.schedule || latestScheduleSnapshot);
   } catch (err) {
     if (!silent) {
       showBanner(err.message, true);
@@ -648,7 +532,6 @@ async function triggerRun(providerIds = null, dryRun = false, triggerButton = nu
   activeTargets.forEach((id) => runningProviderIds.add(id));
   updateRunningCardPills();
   setRunButtonsBusy(true);
-  updateAuxiaTelemetry(appState.providers, latestScheduleSnapshot);
 
   const targetLabel = ids ? `${ids.length} 个工具` : "全部已启用工具";
   openLiveDrawer(dryRun ? `正在预检（${targetLabel}）` : `正在执行签到（${targetLabel}）`);
@@ -905,5 +788,42 @@ export function initOverview(userCallbacks = {}) {
   });
   $("#btn-drawer-copy")?.addEventListener("click", () => {
     copyText($("#live-drawer-log")?.textContent || "", "已复制执行日志");
+  });
+
+  $("#btn-shutdown-web")?.addEventListener("click", async (ev) => {
+    const button = ev.currentTarget;
+    const confirmed = await confirmAction({
+      title: "关闭本地 Web 服务",
+      message: "确定关闭当前本地控制台进程吗？",
+      impacts: [
+        "本网页与本地 API 将立即停止响应，如需使用可再次运行 `geteggs ui`",
+        "已安装的 Windows 计划任务不受影响，仍会定时静默执行",
+      ],
+      confirmText: "确认关闭",
+      danger: true,
+    });
+    if (!confirmed) return;
+
+    if (button.disabled) return;
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = "关闭中...";
+    try {
+      const res = await apiFetch("/api/system/shutdown", { method: "POST" });
+      appState.stopped = true;
+      const chip = $("#metric-web-status-chip");
+      if (chip) {
+        chip.textContent = "已停止";
+        chip.classList.remove("metric-chip-ok");
+      }
+      const statusText = $("#metric-web-status");
+      if (statusText) statusText.textContent = "服务已关闭";
+      button.textContent = "已关闭";
+      showBanner(res.message);
+    } catch (err) {
+      showBanner(err.message, true);
+      button.disabled = false;
+      button.textContent = originalText;
+    }
   });
 }

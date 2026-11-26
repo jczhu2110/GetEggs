@@ -610,16 +610,28 @@ def test_web_run_lock_busy_emits_run_busy_code(tmp_path: Path) -> None:
     client = TestClient(app)
 
     with acquire_run_lock(runner.lock_path):
+        # Real check-in respects the exclusive execution lock.
         response = client.post(
-            "/api/runs", json={"provider_ids": ["workbuddy"], "dry_run": True}
+            "/api/runs", json={"provider_ids": ["workbuddy"], "dry_run": False}
         )
         assert response.status_code == 200
         run_id = response.json()["run_id"]
         with client.stream("GET", f"/api/runs/{run_id}/stream") as stream:
             body = "".join(stream.iter_text())
 
+        # Read-only dry-run preflight does not block on the lock.
+        dry_resp = client.post(
+            "/api/runs", json={"provider_ids": ["workbuddy"], "dry_run": True}
+        )
+        assert dry_resp.status_code == 200
+        dry_run_id = dry_resp.json()["run_id"]
+        with client.stream("GET", f"/api/runs/{dry_run_id}/stream") as dry_stream:
+            dry_body = "".join(dry_stream.iter_text())
+
     assert "另一个签到任务正在执行中" in body
     assert '"code": "run_busy"' in body
+    assert "event: done" in dry_body
+    assert '"code": "run_busy"' not in dry_body
 
 
 def test_web_overview_uses_provider_business_date(tmp_path: Path) -> None:
@@ -689,10 +701,17 @@ def test_web_static_assets_and_settings_metadata(
     assert 'id="overview-alert-strip"' in html_resp.text
     assert 'id="settings-save-bar"' in html_resp.text
     assert 'id="confirm-dialog"' in html_resp.text
+    assert 'id="metric-progress-bar"' in html_resp.text
+    assert 'id="metric-web-status"' in html_resp.text
+    assert html_resp.text.index('id="btn-shutdown-web"') < html_resp.text.index('id="tab-history"')
+    assert 'class="schedule-status-bar"' in html_resp.text
     assert 'id="metric-balance-list"' not in html_resp.text
+    for removed_section in ("aux-ribbon", "aux-hero", "aux-dark-band", "aux-cobalt-card"):
+        assert removed_section not in html_resp.text
     overview_js = client.get("/static/overview.js")
     assert overview_js.status_code == 200
     assert "formatDateTime," in overview_js.text
+    assert "updateAuxiaTelemetry" not in overview_js.text
     assert "当前余额" not in overview_js.text
     assert "metric-balance-list" not in overview_js.text
 
@@ -703,6 +722,8 @@ def test_web_static_assets_and_settings_metadata(
     styles_css = client.get("/static/styles.css")
     assert styles_css.status_code == 200
     assert ".trend-bar" not in styles_css.text
+    assert ".aux-hero" not in styles_css.text
+    assert ".aux-cobalt-card" not in styles_css.text
 
     for asset in (
         "/static/styles.css",
@@ -1006,7 +1027,6 @@ def test_web_history_month_validation_biz_date_and_provider_config_edges(
         settings_text = client.get("/static/settings.js").text
         assert "PLANNED_TOOLS" not in settings_text
         assert 'role="switch"' in settings_text
-        assert "appState.stopped = true" in settings_text
         assert "267008" in settings_text
         assert "checkin_credits" not in settings_text
         assert "签到积分" not in settings_text
@@ -1017,12 +1037,15 @@ def test_web_history_month_validation_biz_date_and_provider_config_edges(
         assert "outline: none;" not in css_text
         overview_text = client.get("/static/overview.js").text
         assert "updateRunningCardPills();" in overview_text
+        assert "appState.stopped = true" in overview_text
         assert "连续天数" not in overview_text
         assert "今日收益" not in overview_text
         assert "连签" not in html_text
         assert "连签" not in history_text
         assert "今日总收益" not in html_text
         assert "积分领取趋势" not in html_text
+        assert "set-catchup-logon" not in html_text
+        assert "interrupted" in history_text
         assert "skipCalendarRender" in history_text
 
 
