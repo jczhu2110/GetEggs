@@ -675,6 +675,9 @@ class WorkBuddyProvider(BaseProvider):
             )
         )
 
+    def _parse_activity_active(self, payload: dict[str, Any]) -> Optional[bool]:
+        return _to_bool(extract_first(payload, "active", "isActive", "is_active"))
+
     def _interpret_checkin_payload(
         self,
         body: Any,
@@ -717,11 +720,22 @@ class WorkBuddyProvider(BaseProvider):
             )
 
         if not (200 <= status_code < 300):
+            detail = ""
+            if isinstance(body, dict):
+                raw_code = body.get("code")
+                raw_msg = str(body.get("message") or body.get("msg") or "").strip()
+                parts: list[str] = []
+                if raw_code is not None and str(raw_code).strip():
+                    parts.append(f"code={raw_code}")
+                if raw_msg:
+                    parts.append(" ".join(raw_msg.split())[:120])
+                if parts:
+                    detail = f"：{'，'.join(parts)}"
             return CheckinResult(
                 provider_id=self.id,
                 display_name=self.display_name,
                 status=CheckinStatus.FAILED,
-                message=f"WorkBuddy 签到接口返回异常状态（HTTP {status_code}）。",
+                message=f"WorkBuddy 签到接口返回异常状态（HTTP {status_code}{detail}）。",
                 biz_date=biz_date,
                 duration_ms=duration_ms,
                 raw_error_type=f"HTTP_{status_code}",
@@ -927,8 +941,10 @@ class WorkBuddyProvider(BaseProvider):
             )
 
         pre_checked_in: Optional[bool] = None
+        activity_active: Optional[bool] = None
         if isinstance(status_payload, dict):
             pre_checked_in = self._parse_status_payload(status_payload)
+            activity_active = self._parse_activity_active(status_payload)
 
         if pre_checked_in is True:
             if log:
@@ -941,6 +957,24 @@ class WorkBuddyProvider(BaseProvider):
                 biz_date=biz_date,
                 duration_ms=elapsed_ms(),
                 dry_run=dry_run,
+            )
+
+        if activity_active is False:
+            if log:
+                log("info", "受控浏览器状态显示当前没有可用的 WorkBuddy 每日签到活动。")
+            return CheckinResult(
+                provider_id=self.id,
+                display_name=self.display_name,
+                status=CheckinStatus.UNAVAILABLE,
+                message=(
+                    "[Dry-Run] 当前没有可用的 WorkBuddy 每日签到活动。"
+                    if dry_run
+                    else "当前没有可用的 WorkBuddy 每日签到活动。"
+                ),
+                biz_date=biz_date,
+                duration_ms=elapsed_ms(),
+                dry_run=dry_run,
+                raw_error_type="ActivityInactive",
             )
 
         if dry_run:
@@ -1171,8 +1205,10 @@ class WorkBuddyProvider(BaseProvider):
                 )
 
             pre_checked_in: Optional[bool] = None
+            activity_active: Optional[bool] = None
             if isinstance(status_payload, dict):
                 pre_checked_in = self._parse_status_payload(status_payload)
+                activity_active = self._parse_activity_active(status_payload)
 
             if pre_checked_in is True:
                 if log:
@@ -1185,6 +1221,24 @@ class WorkBuddyProvider(BaseProvider):
                     biz_date=biz_date,
                     duration_ms=elapsed_ms(),
                     dry_run=dry_run,
+                )
+
+            if activity_active is False:
+                if log:
+                    log("info", "远端状态显示当前没有可用的 WorkBuddy 每日签到活动。")
+                return CheckinResult(
+                    provider_id=self.id,
+                    display_name=self.display_name,
+                    status=CheckinStatus.UNAVAILABLE,
+                    message=(
+                        "[Dry-Run] 当前没有可用的 WorkBuddy 每日签到活动。"
+                        if dry_run
+                        else "当前没有可用的 WorkBuddy 每日签到活动。"
+                    ),
+                    biz_date=biz_date,
+                    duration_ms=elapsed_ms(),
+                    dry_run=dry_run,
+                    raw_error_type="ActivityInactive",
                 )
 
             if dry_run:
@@ -1265,8 +1319,12 @@ class WorkBuddyProvider(BaseProvider):
                     )
 
             if not (200 <= checkin_resp.status_code < 300):
+                try:
+                    err_body = checkin_resp.json()
+                except ValueError:
+                    err_body = None
                 return self._interpret_checkin_payload(
-                    None,
+                    err_body,
                     checkin_resp.status_code,
                     biz_date,
                     elapsed_ms(),

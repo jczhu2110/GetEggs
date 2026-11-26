@@ -437,3 +437,74 @@ def test_workbuddy_browser_dry_run_with_unknown_state_is_unavailable(
     res = asyncio.run(provider.checkin(cfg, "2026-11-16", dry_run=True))
     assert res.status == CheckinStatus.UNAVAILABLE
     assert res.raw_error_type == "UnknownCheckinState"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_workbuddy_browser_inactive_activity_returns_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    monkeypatch.delenv("GETEGGS_WORKBUDDY_TOKEN", raising=False)
+    state_file = _write_json(
+        tmp_path / "browser_state.json",
+        {
+            "cookies": [{"name": "session", "value": "cookie_only", "domain": ".workbuddy.cn"}],
+            "origins": [{"origin": "https://www.workbuddy.cn", "localStorage": []}],
+        },
+    )
+
+    async def inactive_browser(state_path: Path, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "authenticated": True,
+            "statusRes": {
+                "status": 200,
+                "data": {"code": 0, "msg": "OK", "data": {"active": False, "today_checked_in": False}},
+            },
+            "checkinRes": None,
+        }
+
+    provider = WorkBuddyProvider(browser_checkin_fn=inactive_browser)
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        extra={
+            "auth_file_path": str(tmp_path / "missing.info"),
+            "browser_state_path": str(state_file),
+        },
+    )
+    res = asyncio.run(provider.checkin(cfg, "2026-11-26", dry_run=dry_run))
+    assert res.status == CheckinStatus.UNAVAILABLE
+    assert res.raw_error_type == "ActivityInactive"
+    assert "没有可用" in res.message
+
+
+def test_workbuddy_browser_already_checked_in_wins_over_inactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GETEGGS_WORKBUDDY_TOKEN", raising=False)
+    state_file = _write_json(
+        tmp_path / "browser_state.json",
+        {
+            "cookies": [{"name": "session", "value": "cookie_only", "domain": ".workbuddy.cn"}],
+            "origins": [{"origin": "https://www.workbuddy.cn", "localStorage": []}],
+        },
+    )
+
+    async def already_done_browser(state_path: Path, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "authenticated": True,
+            "statusRes": {
+                "status": 200,
+                "data": {"code": 0, "msg": "OK", "data": {"active": False, "today_checked_in": True}},
+            },
+            "checkinRes": None,
+        }
+
+    provider = WorkBuddyProvider(browser_checkin_fn=already_done_browser)
+    cfg = ProviderConfig(
+        provider_id="workbuddy",
+        extra={
+            "auth_file_path": str(tmp_path / "missing.info"),
+            "browser_state_path": str(state_file),
+        },
+    )
+    res = asyncio.run(provider.checkin(cfg, "2026-11-26"))
+    assert res.status == CheckinStatus.ALREADY_DONE

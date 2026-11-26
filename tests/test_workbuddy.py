@@ -637,3 +637,55 @@ def test_workbuddy_desktop_fallback_uses_browser_base_url(
     res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
     assert res.status == CheckinStatus.ALREADY_DONE
     assert captured["base_url"] == "https://copilot.tencent.com"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_workbuddy_inactive_activity_returns_unavailable_without_submitting(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+    called_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called_paths.append(request.url.path)
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "msg": "OK", "data": {"active": False, "today_checked_in": False}},
+            )
+        raise AssertionError(f"Should not call {request.url.path} when activity is inactive")
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    res = asyncio.run(provider.checkin(cfg, "2026-11-26", dry_run=dry_run))
+
+    assert res.status == CheckinStatus.UNAVAILABLE
+    assert res.raw_error_type == "ActivityInactive"
+    assert "没有可用" in res.message
+    assert called_paths == ["/v2/billing/meter/checkin-status"]
+
+
+def test_workbuddy_http_400_includes_server_error_detail(tmp_path: Path) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(200, json={"code": 0, "data": {"active": True, "checkedIn": False}})
+        if request.url.path == "/v2/billing/meter/daily-checkin":
+            return httpx.Response(400, json={"code": 10002, "msg": "签到活动未开启"})
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    res = asyncio.run(provider.checkin(cfg, "2026-11-26"))
+
+    assert res.status == CheckinStatus.FAILED
+    assert res.raw_error_type == "HTTP_400"
+    assert "code=10002" in res.message
+    assert "签到活动未开启" in res.message

@@ -442,10 +442,24 @@ async def browser_checkin_session(
                     if (rawState !== undefined) break;
                 }
                 const already = parseBool(rawState);
-                if (already === null) {
+                if (already) {
                     return { statusRes, checkinRes: null };
                 }
-                if (already) {
+                const activeKeys = ["active", "isActive", "is_active"];
+                let rawActive = undefined;
+                for (const src of [nestedObj, rootObj]) {
+                    for (const key of activeKeys) {
+                        if (Object.prototype.hasOwnProperty.call(src, key) && src[key] !== null && src[key] !== undefined) {
+                            rawActive = src[key];
+                            break;
+                        }
+                    }
+                    if (rawActive !== undefined) break;
+                }
+                if (parseBool(rawActive) === false) {
+                    return { statusRes, checkinRes: null };
+                }
+                if (already === null) {
                     return { statusRes, checkinRes: null };
                 }
 
