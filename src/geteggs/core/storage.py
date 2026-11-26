@@ -668,7 +668,7 @@ class Storage:
         records_cutoff = (
             datetime.now(tz).date() - timedelta(days=settings.ledger_retention_days)
         ).strftime("%Y-%m-%d")
-        stale_minutes = max(120, settings.jitter_minutes * 3 + 60)
+        stale_minutes = max(30, settings.jitter_minutes + 20)
         return {
             "now": now_utc.isoformat(),
             "stale": (now_utc - timedelta(minutes=stale_minutes)).isoformat(),
@@ -683,6 +683,33 @@ class Storage:
             ).isoformat(),
             "records": records_cutoff,
         }
+
+    def mark_stale_runs(
+        self,
+        settings: GlobalSettings,
+        *,
+        exclude_run_id: Optional[str] = None,
+    ) -> int:
+        """Mark long-abandoned 'running' batches as 'interrupted'."""
+        cutoffs = self._cleanup_cutoffs(settings)
+        with self._connect() as conn:
+            if exclude_run_id:
+                return conn.execute(
+                    """
+                    UPDATE checkin_runs
+                    SET status = 'interrupted', finished_at = ?
+                    WHERE status = 'running' AND started_at < ? AND run_id <> ?
+                    """,
+                    (cutoffs["now"], cutoffs["stale"], exclude_run_id),
+                ).rowcount
+            return conn.execute(
+                """
+                UPDATE checkin_runs
+                SET status = 'interrupted', finished_at = ?
+                WHERE status = 'running' AND started_at < ?
+                """,
+                (cutoffs["now"], cutoffs["stale"]),
+            ).rowcount
 
     def cleanup_old_data(self, settings: GlobalSettings) -> dict[str, int]:
         cutoffs = self._cleanup_cutoffs(settings)

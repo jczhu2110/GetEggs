@@ -620,13 +620,14 @@ def test_task_timeout_tracks_enabled_jitter_budget() -> None:
     second = ProviderConfig(provider_id="beta")
     disabled = ProviderConfig(provider_id="gamma", enabled=False)
 
-    assert CheckinRunner.estimate_task_timeout_minutes(settings, [enabled]) == 25
+    # Parallel max jitter (15m) + execution budget (enabled_count * 2 + 5).
+    assert CheckinRunner.estimate_task_timeout_minutes(settings, [enabled]) == 22
     assert (
-        CheckinRunner.estimate_task_timeout_minutes(settings, [enabled, second]) == 40
+        CheckinRunner.estimate_task_timeout_minutes(settings, [enabled, second]) == 24
     )
     assert (
         CheckinRunner.estimate_task_timeout_minutes(settings, [enabled, disabled])
-        == 25
+        == 22
     )
 
     override = ProviderConfig(
@@ -634,13 +635,127 @@ def test_task_timeout_tracks_enabled_jitter_budget() -> None:
         jitter_minutes=120,
         extra={"jitter_override": True},
     )
-    assert CheckinRunner.estimate_task_timeout_minutes(settings, [override]) == 130
+    assert CheckinRunner.estimate_task_timeout_minutes(settings, [override]) == 127
+    # Multiple providers overlap their jitter window rather than summing serially.
     assert (
         CheckinRunner.estimate_task_timeout_minutes(
             settings, [override, override, override]
         )
-        == 370
+        == 131
     )
+
+
+def test_runner_dry_run_does_not_block_on_run_lock(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "dry_lock.db")
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=RecordingNotifier(),
+        lock_path=tmp_path / "run.lock",
+    )
+    provider = FakeProvider()
+
+    with acquire_run_lock(runner.lock_path):
+        summary = asyncio.run(
+            runner.run(
+                providers_override=[provider],
+                trigger_type=TriggerType.MANUAL_WEB,
+                dry_run=True,
+            )
+        )
+
+    assert provider.calls == 1
+    assert summary.results[0].status == CheckinStatus.SUCCESS
+    assert summary.results[0].dry_run is True
+
+
+def test_runner_jittered_run_releases_lock_during_sleep_and_skips_completed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from geteggs.core import runner as runner_mod
+    from geteggs.core.lock import is_lock_busy
+
+    storage = Storage(tmp_path / "jitter_lock.db")
+    storage.save_settings(GlobalSettings(jitter_minutes=1))
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=RecordingNotifier(),
+        lock_path=tmp_path / "run.lock",
+    )
+    provider = FakeProvider()
+    lock_busy_during_sleep: list[bool] = []
+    manual_triggered = False
+
+    monkeypatch.setattr(runner_mod.random, "randint", lambda a, b: 10)
+
+    async def fake_sleep(_seconds: float) -> None:
+        nonlocal manual_triggered
+        lock_busy_during_sleep.append(is_lock_busy(runner.lock_path))
+        if not manual_triggered:
+            manual_triggered = True
+            # Manual check-in runs smoothly while scheduled task is waiting on jitter.
+            manual_summary = await runner.run(
+                providers_override=[provider],
+                trigger_type=TriggerType.MANUAL_WEB,
+            )
+            assert manual_summary.results[0].status == CheckinStatus.SUCCESS
+
+    monkeypatch.setattr(runner_mod.asyncio, "sleep", fake_sleep)
+
+    summary = asyncio.run(
+        runner.run(
+            providers_override=[provider],
+            trigger_type=TriggerType.SCHEDULED,
+            missed_only=True,
+            apply_jitter=True,
+        )
+    )
+
+    assert lock_busy_during_sleep == [False]
+    # Manual run executed once; scheduled run saw ledger cache after waking and skipped.
+    assert provider.calls == 1
+    assert summary.results[0].status == CheckinStatus.ALREADY_DONE
+    assert "本地账本缓存命中" in summary.results[0].message
+
+
+def test_runner_scheduled_respects_earliest_time_and_recovers_stale_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from geteggs.core.runner import PROVIDER_TIMEOUT_SECONDS
+
+    assert PROVIDER_TIMEOUT_SECONDS == 90.0
+
+    storage = Storage(tmp_path / "earliest_stale.db")
+    storage.save_provider_config(
+        ProviderConfig(provider_id="fake", enabled=True, earliest_time="23:59")
+    )
+    stale_iso = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    with storage._connect() as conn:
+        conn.execute(
+            "INSERT INTO checkin_runs (run_id, trigger_type, started_at, finished_at, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("stale-old", "scheduled", stale_iso, None, "running"),
+        )
+
+    runner = CheckinRunner(
+        storage=storage,
+        notifier=RecordingNotifier(),
+        lock_path=tmp_path / "run.lock",
+    )
+    monkeypatch.setattr(CheckinRunner, "_is_before_earliest", staticmethod(lambda hhmm, tz: True))
+    provider = FakeProvider()
+
+    summary = asyncio.run(
+        runner.run(
+            providers_override=[provider],
+            trigger_type=TriggerType.SCHEDULED,
+            missed_only=True,
+            apply_jitter=False,
+        )
+    )
+    assert provider.calls == 0
+    assert summary.results == []
+    runs = {r["run_id"]: r for r in storage.get_runs()}
+    assert runs["stale-old"]["status"] == "interrupted"
 
 
 def test_manual_run_persists_maintenance_state(tmp_path: Path) -> None:

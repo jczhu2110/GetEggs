@@ -1,4 +1,4 @@
-"""Windows Task Scheduler integration for silent daily + logon catch-up runs."""
+"""Windows Task Scheduler integration for silent daily check-in runs."""
 
 from __future__ import annotations
 
@@ -291,7 +291,6 @@ def _install_schedule_elevated(
     work_dir: str,
     *,
     schedule_time: str,
-    catchup_on_logon: bool,
     timeout_minutes: int,
     target_user: Optional[str] = None,
 ) -> tuple[bool, str]:
@@ -310,7 +309,6 @@ def _install_schedule_elevated(
         json.dumps(
             {
                 "schedule_time": schedule_time,
-                "catchup_on_logon": bool(catchup_on_logon),
                 "working_dir": work_dir,
                 "timeout_minutes": int(timeout_minutes),
                 "target_user": target_user,
@@ -365,13 +363,12 @@ exit $p.ExitCode
 def install_schedule(
     schedule_time: str = "10:15",
     *,
-    catchup_on_logon: bool = True,
     working_dir: Optional[Path] = None,
     timeout_minutes: int = 25,
     elevate: bool = True,
     target_user: Optional[str] = None,
 ) -> tuple[bool, str]:
-    """Register daily + logon catch-up scheduled task in Windows Task Scheduler."""
+    """Register daily silent scheduled task in Windows Task Scheduler."""
     if os.name != "nt":
         return False, "当前非 Windows 系统，无法注册 Windows 计划任务。"
 
@@ -396,7 +393,6 @@ def install_schedule(
                 probe_exe,
                 work_dir_raw,
                 schedule_time=hhmm,
-                catchup_on_logon=catchup_on_logon,
                 timeout_minutes=timeout,
                 target_user=effective_user,
             )
@@ -408,9 +404,6 @@ def install_schedule(
         if effective_user
         else 'if ($env:USERDOMAIN) { "$env:USERDOMAIN\\$env:USERNAME" } else { $env:USERNAME }'
     )
-    triggers_block = "$triggers = @((New-ScheduledTaskTrigger -Daily -At $scheduleAt))"
-    if catchup_on_logon:
-        triggers_block += "\n$triggers += (New-ScheduledTaskTrigger -AtLogOn -User $userId)"
 
     ps = f"""
 $ErrorActionPreference = 'Stop'
@@ -420,10 +413,9 @@ $scheduleAt = {_ps_b64_expr(hhmm)}
 $taskName = {_ps_b64_expr(TASK_NAME)}
 $executeCmd = if ($pyExe -match '\\s') {{ '"' + $pyExe + '"' }} else {{ $pyExe }}
 $userId = {user_expr}
-$action = New-ScheduledTaskAction -Execute $executeCmd -Argument '-m geteggs run --missed-only --jitter' -WorkingDirectory $workDir
-{triggers_block}
+$action = New-ScheduledTaskAction -Execute $executeCmd -Argument '-m geteggs run --scheduled --missed-only --jitter' -WorkingDirectory $workDir
+$triggers = @((New-ScheduledTaskTrigger -Daily -At $scheduleAt))
 $settings = New-ScheduledTaskSettingsSet `
-    -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Minutes {timeout}) `
@@ -438,11 +430,10 @@ Write-Output 'OK'
     except (subprocess.TimeoutExpired, OSError) as exc:
         return False, f"注册计划任务失败：{exc}"
     if code == 0:
-        logon_note = " + 登录漏签补跑" if catchup_on_logon else ""
         return (
             True,
             f"已成功注册 Windows 计划任务 {TASK_NAME}"
-            f"（每日 {hhmm}{logon_note}，最长执行 {timeout} 分钟）。",
+            f"（每日 {hhmm}，最长执行 {timeout} 分钟）。",
         )
     return False, f"注册计划任务失败：{err or out}"
 

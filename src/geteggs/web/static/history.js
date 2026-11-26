@@ -241,6 +241,7 @@ const TRIGGER_LABELS = {
 const RUN_STATUS_LABELS = {
   running: ["进行中", "pill-warn"],
   completed: ["已完成", "pill-ok"],
+  interrupted: ["已中断", "pill-warn"],
   error: ["异常", "pill-err"],
 };
 

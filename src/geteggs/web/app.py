@@ -901,23 +901,21 @@ def create_app(
     @app.post("/api/schedule/install", dependencies=[Depends(require_auth)])
     async def api_schedule_install() -> dict[str, Any]:
         async with schedule_lock:
-            def _load_schedule_args() -> tuple[str, bool, int]:
+            def _load_schedule_args() -> tuple[str, int]:
                 settings = app_storage.get_settings()
                 configs = [app_storage.get_provider_config(p.id) for p in app_providers]
                 return (
                     settings.schedule_time,
-                    settings.auto_catchup_on_logon,
                     CheckinRunner.estimate_task_timeout_minutes(settings, configs),
                 )
 
-            schedule_time, catchup_on_logon, timeout_minutes = await run_in_threadpool(
+            schedule_time, timeout_minutes = await run_in_threadpool(
                 _load_schedule_args
             )
             try:
                 ok, msg = await run_in_threadpool(
                     install_schedule,
                     schedule_time,
-                    catchup_on_logon=catchup_on_logon,
                     timeout_minutes=timeout_minutes,
                 )
             except ValueError as exc:

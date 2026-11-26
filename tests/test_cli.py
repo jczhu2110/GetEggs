@@ -179,14 +179,12 @@ def test_install_schedule_uses_computed_timeout(monkeypatch) -> None:
 
     assert ok is True
     assert "-Minutes 40" in captured["script"]
+    assert "--scheduled --missed-only --jitter" in captured["script"]
+    assert "-Daily -At $scheduleAt" in captured["script"]
+    assert "-AtLogOn" not in captured["script"]
+    assert "-StartWhenAvailable" not in captured["script"]
     assert "40 分钟" in message
-    assert "登录漏签补跑" in message
-
-    ok_no_catchup, message_no_catchup = windows.install_schedule(
-        "10:15", catchup_on_logon=False, timeout_minutes=40, elevate=False
-    )
-    assert ok_no_catchup is True
-    assert "登录漏签补跑" not in message_no_catchup
+    assert "登录漏签补跑" not in message
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
@@ -273,9 +271,7 @@ def test_install_schedule_requests_elevation_when_not_admin(monkeypatch) -> None
 
     monkeypatch.setattr(windows, "_run_ps", fake_ps)
 
-    ok, message = windows.install_schedule(
-        "08:30", catchup_on_logon=False, timeout_minutes=45
-    )
+    ok, message = windows.install_schedule("08:30", timeout_minutes=45)
 
     assert ok is True
     assert message == "提权安装成功"
@@ -284,7 +280,7 @@ def test_install_schedule_requests_elevation_when_not_admin(monkeypatch) -> None
     assert "--no-elevate" in script_text
     assert "--params-file" in script_text
     assert captured["params"]["schedule_time"] == "08:30"
-    assert captured["params"]["catchup_on_logon"] is False
+    assert "catchup_on_logon" not in captured["params"]
     assert captured["params"]["timeout_minutes"] == 45
     assert not Path(captured["result_file"]).exists()
     assert not Path(captured["params_file"]).exists()
@@ -309,7 +305,9 @@ def test_install_schedule_encodes_unicode_quote_paths_safely(
     assert ok is True
     assert "\u2019" not in captured["script"]
     assert "Write-Output PWN" not in captured["script"]
-    assert "-AtLogOn -User $userId" in captured["script"]
+    assert "-Daily -At $scheduleAt" in captured["script"]
+    assert "-AtLogOn" not in captured["script"]
+    assert "-StartWhenAvailable" not in captured["script"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
@@ -356,7 +354,6 @@ def test_schedule_install_reads_params_file(tmp_path: Path, monkeypatch) -> None
         json.dumps(
             {
                 "schedule_time": "07:45",
-                "catchup_on_logon": False,
                 "working_dir": str(tmp_path),
                 "timeout_minutes": 55,
                 "target_user": "PC\\Alice",
@@ -387,10 +384,36 @@ def test_schedule_install_reads_params_file(tmp_path: Path, monkeypatch) -> None
 
     assert result.exit_code == 0
     assert received["schedule_time"] == "07:45"
-    assert received["catchup_on_logon"] is False
+    assert "catchup_on_logon" not in received
     assert received["timeout_minutes"] == 55
     assert received["target_user"] == "PC\\Alice"
     assert json.loads(result_path.read_text(encoding="utf-8"))["ok"] is True
+
+
+def test_cli_run_scheduled_flag_sets_scheduled_trigger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from geteggs.core.models import RunSummary, TriggerType
+
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+    captured: dict[str, object] = {}
+
+    async def fake_run(self, **kwargs):
+        captured.update(kwargs)
+        return RunSummary(
+            run_id="sched-1",
+            trigger_type=kwargs["trigger_type"],
+            started_at="2026-11-25T00:00:00Z",
+            finished_at="2026-11-25T00:00:01Z",
+            results=[],
+        )
+
+    monkeypatch.setattr(cli.CheckinRunner, "run", fake_run)
+    result = runner.invoke(cli.app, ["run", "--scheduled", "--missed-only", "--jitter"])
+    assert result.exit_code == 0
+    assert captured["trigger_type"] == TriggerType.SCHEDULED
+    assert captured["missed_only"] is True
+    assert captured["apply_jitter"] is True
 
 
 def test_windows_toast_powershell_passes_text_via_env_vars(monkeypatch) -> None:

@@ -143,7 +143,6 @@ class GlobalSettings(BaseModel):
     timezone: str = "Asia/Shanghai"
     notify_toast_enabled: bool = True
     notify_on_already_done: bool = False
-    auto_catchup_on_logon: bool = True
     auto_cleanup_enabled: bool = True
     run_events_retention_days: int = 30
     notification_retention_days: int = 90

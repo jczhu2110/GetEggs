@@ -168,14 +168,20 @@ def maintenance(
 @app.command()
 def run(
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="仅执行指定插件 ID"),
-    missed_only: bool = typer.Option(False, "--missed-only", help="仅补跑本业务日尚未成功的工具"),
+    scheduled: bool = typer.Option(False, "--scheduled", help="标记本次为计划任务触发"),
+    missed_only: bool = typer.Option(False, "--missed-only", help="跳过本业务日已有成功记录的工具"),
     jitter: bool = typer.Option(False, "--jitter", help="执行前启用随机延迟抖动（适合定时任务）"),
     no_notify: bool = typer.Option(False, "--no-notify", help="本次不发送系统弹窗通知"),
     dry_run: bool = typer.Option(False, "--dry-run", help="预检模式：只校验登录态与状态，不提交签到"),
 ) -> None:
     """执行一次签到流程。"""
     runner = CheckinRunner()
-    trigger = TriggerType.MISSED_CATCHUP if missed_only else TriggerType.MANUAL_CLI
+    if scheduled:
+        trigger = TriggerType.SCHEDULED
+    elif missed_only:
+        trigger = TriggerType.MISSED_CATCHUP
+    else:
+        trigger = TriggerType.MANUAL_CLI
 
     def _print_event(ev: LogEvent) -> None:
         style = {"warning": "yellow", "error": "red"}.get(ev.level, "cyan")
@@ -393,7 +399,7 @@ def schedule_install_cmd(
         None, "--params-file", hidden=True, help="内部使用：从 JSON 读取提权安装参数"
     ),
 ) -> None:
-    """安装或更新 Windows 每日定时 + 开机漏签补跑任务。"""
+    """安装或更新 Windows 每日定时签到计划任务。"""
     params: dict[str, object] = {}
     if params_file is not None:
         try:
@@ -417,7 +423,6 @@ def schedule_install_cmd(
 
     if params:
         target_time = str(params.get("schedule_time") or time or "10:15")
-        catchup_on_logon = bool(params.get("catchup_on_logon", True))
         raw_work_dir = params.get("working_dir")
         working_dir = Path(str(raw_work_dir)) if raw_work_dir else None
         timeout_minutes = int(params.get("timeout_minutes") or 25)
@@ -436,7 +441,6 @@ def schedule_install_cmd(
                 raise typer.Exit(1)
             storage.save_settings(settings)
         configs = [storage.get_provider_config(p.id) for p in list_providers()]
-        catchup_on_logon = settings.auto_catchup_on_logon
         working_dir = None
         timeout_minutes = CheckinRunner.estimate_task_timeout_minutes(
             settings, configs
@@ -446,7 +450,6 @@ def schedule_install_cmd(
     try:
         ok, msg = install_schedule(
             target_time,
-            catchup_on_logon=catchup_on_logon,
             working_dir=working_dir,
             timeout_minutes=timeout_minutes,
             elevate=not no_elevate,
