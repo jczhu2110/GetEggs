@@ -824,6 +824,8 @@ function formatTaskResult(code) {
   if (code === null || code === undefined || code === "") return "--";
   const value = Number(code);
   if (value === 0) return "成功";
+  if (value === 1) return "已运行（部分工具未签到，代码 1）";
+  if (value === 2) return "已跳过（任务冲突，代码 2）";
   if (value === 267008) return "已就绪";
   if (value === 267011) return "尚未运行";
   if (value === 267009) return "正在运行";

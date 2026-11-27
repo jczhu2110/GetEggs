@@ -324,12 +324,21 @@ class CheckinRunner:
             lvl = "info" if result.status.is_done_for_today else "warning"
             emit(lvl, result.message, provider.id)
 
-            if not dry_run and result.status.requires_user_action:
+            if (
+                not dry_run
+                and result.status.requires_user_action
+                and result.raw_error_type != "ActivityInactive"
+            ):
                 streak_fail = self.storage.count_consecutive_failures(provider.id)
                 if streak_fail >= 2:
+                    advice = (
+                        "建议检查配置或活动状态。"
+                        if result.status == CheckinStatus.UNAVAILABLE
+                        else "建议打开客户端检查登录态。"
+                    )
                     emit(
                         "warning",
-                        f"{provider.display_name} 已连续 {streak_fail} 次需要人工处理，建议打开客户端检查登录态。",
+                        f"{provider.display_name} 已连续 {streak_fail} 次需要人工处理，{advice}",
                         provider.id,
                     )
             return result

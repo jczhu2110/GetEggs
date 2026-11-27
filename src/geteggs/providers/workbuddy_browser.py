@@ -416,47 +416,59 @@ async def browser_checkin_session(
                     return null;
                 }
 
+                function extractField(data, keys) {
+                    const rootObj = (data && typeof data === "object") ? data : {};
+                    const nestedObj = (rootObj.data && typeof rootObj.data === "object") ? rootObj.data : {};
+                    for (const src of [nestedObj, rootObj]) {
+                        for (const key of keys) {
+                            if (Object.prototype.hasOwnProperty.call(src, key) && src[key] !== null && src[key] !== undefined) {
+                                return src[key];
+                            }
+                        }
+                    }
+                    return undefined;
+                }
+
+                const stateKeys = [
+                    "checkedIn", "checked_in", "todayCheckedIn", "today_checked_in",
+                    "isCheckedIn", "is_checked_in", "signed"
+                ];
+                const activeKeys = ["active", "isActive", "is_active"];
+
                 let statusRes = { status: 0, data: null };
+                let inactiveFallback = null;
                 for (const ep of endpoints) {
-                    statusRes = await postJson(ep);
-                    if (statusRes.status !== 404) break;
+                    const candidate = await postJson(ep);
+                    statusRes = candidate;
+                    if (candidate.status === 404) continue;
+                    if (
+                        candidate.status === 200 &&
+                        candidate.data &&
+                        typeof candidate.data === "object" &&
+                        parseBool(extractField(candidate.data, stateKeys)) !== true &&
+                        parseBool(extractField(candidate.data, activeKeys)) === false
+                    ) {
+                        if (!inactiveFallback) inactiveFallback = candidate;
+                        continue;
+                    }
+                    if (inactiveFallback && (candidate.status === 0 || candidate.status >= 500)) {
+                        continue;
+                    }
+                    inactiveFallback = null;
+                    break;
+                }
+                if (inactiveFallback) {
+                    statusRes = inactiveFallback;
                 }
                 if (statusRes.status !== 200 || dryRun) {
                     return { statusRes, checkinRes: null };
                 }
 
-                const rootObj = (statusRes.data && typeof statusRes.data === "object") ? statusRes.data : {};
-                const nestedObj = (rootObj.data && typeof rootObj.data === "object") ? rootObj.data : {};
-                const stateKeys = [
-                    "checkedIn", "checked_in", "todayCheckedIn", "today_checked_in",
-                    "isCheckedIn", "is_checked_in", "signed"
-                ];
-                let rawState = undefined;
-                for (const src of [nestedObj, rootObj]) {
-                    for (const key of stateKeys) {
-                        if (Object.prototype.hasOwnProperty.call(src, key) && src[key] !== null && src[key] !== undefined) {
-                            rawState = src[key];
-                            break;
-                        }
-                    }
-                    if (rawState !== undefined) break;
-                }
-                const already = parseBool(rawState);
+                const already = parseBool(extractField(statusRes.data, stateKeys));
                 if (already) {
                     return { statusRes, checkinRes: null };
                 }
-                const activeKeys = ["active", "isActive", "is_active"];
-                let rawActive = undefined;
-                for (const src of [nestedObj, rootObj]) {
-                    for (const key of activeKeys) {
-                        if (Object.prototype.hasOwnProperty.call(src, key) && src[key] !== null && src[key] !== undefined) {
-                            rawActive = src[key];
-                            break;
-                        }
-                    }
-                    if (rawActive !== undefined) break;
-                }
-                if (parseBool(rawActive) === false) {
+                if (parseBool(extractField(statusRes.data, activeKeys)) === false) {
                     return { statusRes, checkinRes: null };
                 }
                 if (already === null) {
@@ -471,8 +483,8 @@ async def browser_checkin_session(
                 js_script,
                 {
                     "endpoints": [
-                        "/v2/billing/meter/checkin-status",
                         "/v2/billing/meter/checkin-activity-status",
+                        "/v2/billing/meter/checkin-status",
                     ],
                     "checkinEndpoint": "/v2/billing/meter/daily-checkin",
                     "token": token,

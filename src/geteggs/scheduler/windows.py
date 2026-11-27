@@ -259,6 +259,10 @@ $info = Get-ScheduledTaskInfo -TaskName '{TASK_NAME}'
         message = "尚未安装系统计划任务。"
     elif state and str(state).lower() not in ("ready", "running", "queued"):
         message = f"计划任务已安装，但当前状态为 {state}。"
+    elif last_task_result == 1:
+        message = "计划任务已安装并已运行，但上次存在未完成签到的工具（退出码 1），请查看历史记录。"
+    elif last_task_result == 2:
+        message = "计划任务已安装，上次因已有签到任务运行中而跳过（退出码 2）。"
     elif last_task_result not in (None, 0, 267008, 267009, 267011):
         message = f"计划任务已安装，但上次执行返回异常代码 {last_task_result}。"
     else:
@@ -416,6 +420,7 @@ $userId = {user_expr}
 $action = New-ScheduledTaskAction -Execute $executeCmd -Argument '-m geteggs run --scheduled --missed-only --jitter' -WorkingDirectory $workDir
 $triggers = @((New-ScheduledTaskTrigger -Daily -At $scheduleAt))
 $settings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Minutes {timeout}) `

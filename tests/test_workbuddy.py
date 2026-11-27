@@ -113,7 +113,7 @@ def test_workbuddy_checkin_idempotent_when_already_checked_in(tmp_path: Path) ->
 
     def handler(request: httpx.Request) -> httpx.Response:
         called_paths.append(request.url.path)
-        if request.url.path == "/v2/billing/meter/checkin-status":
+        if request.url.path == "/v2/billing/meter/checkin-activity-status":
             return httpx.Response(
                 200,
                 json={
@@ -128,7 +128,7 @@ def test_workbuddy_checkin_idempotent_when_already_checked_in(tmp_path: Path) ->
     res = asyncio.run(provider.checkin(cfg, "2026-11-16"))
 
     assert res.status == CheckinStatus.ALREADY_DONE
-    assert called_paths == ["/v2/billing/meter/checkin-status"]
+    assert called_paths == ["/v2/billing/meter/checkin-activity-status"]
 
 
 def test_workbuddy_falls_back_to_browser_when_desktop_auth_fails(
@@ -651,7 +651,10 @@ def test_workbuddy_inactive_activity_returns_unavailable_without_submitting(
 
     def handler(request: httpx.Request) -> httpx.Response:
         called_paths.append(request.url.path)
-        if request.url.path == "/v2/billing/meter/checkin-status":
+        if request.url.path in (
+            "/v2/billing/meter/checkin-activity-status",
+            "/v2/billing/meter/checkin-status",
+        ):
             return httpx.Response(
                 200,
                 json={"code": 0, "msg": "OK", "data": {"active": False, "today_checked_in": False}},
@@ -665,7 +668,78 @@ def test_workbuddy_inactive_activity_returns_unavailable_without_submitting(
     assert res.status == CheckinStatus.UNAVAILABLE
     assert res.raw_error_type == "ActivityInactive"
     assert "没有可用" in res.message
-    assert called_paths == ["/v2/billing/meter/checkin-status"]
+    assert called_paths == [
+        "/v2/billing/meter/checkin-activity-status",
+        "/v2/billing/meter/checkin-status",
+    ]
+
+
+def test_workbuddy_prefers_activity_status_over_inactive_legacy_status(
+    tmp_path: Path,
+) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+    called_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called_paths.append(request.url.path)
+        if request.url.path == "/v2/billing/meter/checkin-activity-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "msg": "OK", "data": {"active": True, "today_checked_in": True}},
+            )
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "msg": "OK", "data": {"active": False, "today_checked_in": False}},
+            )
+        raise AssertionError(f"Unexpected call to {request.url.path}")
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    res = asyncio.run(provider.checkin(cfg, "2026-11-27"))
+
+    assert res.status == CheckinStatus.ALREADY_DONE
+    assert called_paths == ["/v2/billing/meter/checkin-activity-status"]
+
+
+def test_workbuddy_falls_back_when_first_status_endpoint_is_inactive(
+    tmp_path: Path,
+) -> None:
+    auth_file = _write_info(
+        tmp_path / "workbuddy-desktop.info",
+        {"accessToken": "tok_ok", "account": {"uid": "u1"}},
+    )
+    called_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called_paths.append(request.url.path)
+        if request.url.path == "/v2/billing/meter/checkin-activity-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "msg": "OK", "data": {"active": False, "today_checked_in": False}},
+            )
+        if request.url.path == "/v2/billing/meter/checkin-status":
+            return httpx.Response(
+                200,
+                json={"code": 0, "msg": "OK", "data": {"active": True, "today_checked_in": False}},
+            )
+        if request.url.path == "/v2/billing/meter/daily-checkin":
+            return httpx.Response(200, json={"code": 0, "data": {"rewardCredits": 100}})
+        return httpx.Response(404)
+
+    provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
+    cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
+    res = asyncio.run(provider.checkin(cfg, "2026-11-27"))
+
+    assert res.status == CheckinStatus.SUCCESS
+    assert called_paths == [
+        "/v2/billing/meter/checkin-activity-status",
+        "/v2/billing/meter/checkin-status",
+        "/v2/billing/meter/daily-checkin",
+    ]
 
 
 def test_workbuddy_http_400_includes_server_error_detail(tmp_path: Path) -> None:

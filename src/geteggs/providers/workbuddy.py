@@ -625,6 +625,11 @@ class WorkBuddyProvider(BaseProvider):
             json={},
         )
 
+    STATUS_ENDPOINTS = (
+        "/v2/billing/meter/checkin-activity-status",
+        "/v2/billing/meter/checkin-status",
+    )
+
     async def _query_status(
         self,
         client: httpx.AsyncClient,
@@ -638,10 +643,8 @@ class WorkBuddyProvider(BaseProvider):
         last_status = 0
         last_url = base_urls[0]
         for base_url in base_urls:
-            for endpoint in (
-                "/v2/billing/meter/checkin-status",
-                "/v2/billing/meter/checkin-activity-status",
-            ):
+            inactive_fallback: Optional[tuple[str, dict[str, Any], int]] = None
+            for endpoint in self.STATUS_ENDPOINTS:
                 try:
                     resp = await self._post_api(client, creds, base_url, endpoint)
                 except (httpx.HTTPError, httpx.InvalidURL) as exc:
@@ -655,10 +658,26 @@ class WorkBuddyProvider(BaseProvider):
                     continue
                 if resp.status_code in (401, 403):
                     return base_url, None, resp.status_code
+                if inactive_fallback is not None and resp.status_code >= 500:
+                    continue
                 try:
-                    return base_url, resp.json(), resp.status_code
+                    payload = resp.json()
                 except ValueError:
+                    if inactive_fallback is not None:
+                        continue
                     return base_url, None, resp.status_code
+                if (
+                    resp.status_code == 200
+                    and isinstance(payload, dict)
+                    and self._parse_status_payload(payload) is not True
+                    and self._parse_activity_active(payload) is False
+                ):
+                    if inactive_fallback is None:
+                        inactive_fallback = (base_url, payload, resp.status_code)
+                    continue
+                return base_url, payload, resp.status_code
+            if inactive_fallback is not None:
+                return inactive_fallback
         return last_url, None, last_status
 
     def _parse_status_payload(self, payload: dict[str, Any]) -> Optional[bool]:

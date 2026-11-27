@@ -155,10 +155,20 @@ def test_schedule_status_distinguishes_missing_and_abnormal_result(monkeypatch) 
     payload = '{"installed": true, "state": "Ready", "last_task_result": 1}'
     monkeypatch.setattr(windows, "_task_missing_fast", lambda: False)
     monkeypatch.setattr(windows, "_run_ps", lambda script: (0, payload, ""))
+    partial = windows.get_schedule_status()
+    assert partial["installed"] is True
+    assert not partial.get("query_failed")
+    assert "退出码 1" in partial["message"]
+
+    payload_busy = '{"installed": true, "state": "Ready", "last_task_result": 2}'
+    monkeypatch.setattr(windows, "_run_ps", lambda script: (0, payload_busy, ""))
+    busy = windows.get_schedule_status()
+    assert "退出码 2" in busy["message"]
+
+    payload_err = '{"installed": true, "state": "Ready", "last_task_result": 2147942402}'
+    monkeypatch.setattr(windows, "_run_ps", lambda script: (0, payload_err, ""))
     abnormal = windows.get_schedule_status()
-    assert abnormal["installed"] is True
-    assert not abnormal.get("query_failed")
-    assert "异常代码 1" in abnormal["message"]
+    assert "异常代码 2147942402" in abnormal["message"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
@@ -182,7 +192,7 @@ def test_install_schedule_uses_computed_timeout(monkeypatch) -> None:
     assert "--scheduled --missed-only --jitter" in captured["script"]
     assert "-Daily -At $scheduleAt" in captured["script"]
     assert "-AtLogOn" not in captured["script"]
-    assert "-StartWhenAvailable" not in captured["script"]
+    assert "-StartWhenAvailable" in captured["script"]
     assert "40 分钟" in message
     assert "登录漏签补跑" not in message
 
@@ -307,7 +317,7 @@ def test_install_schedule_encodes_unicode_quote_paths_safely(
     assert "Write-Output PWN" not in captured["script"]
     assert "-Daily -At $scheduleAt" in captured["script"]
     assert "-AtLogOn" not in captured["script"]
-    assert "-StartWhenAvailable" not in captured["script"]
+    assert "-StartWhenAvailable" in captured["script"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Task Scheduler only")
