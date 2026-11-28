@@ -966,8 +966,6 @@ class WorkBuddyProvider(BaseProvider):
             activity_active = self._parse_activity_active(status_payload)
 
         if pre_checked_in is True:
-            if log:
-                log("info", "受控浏览器预检显示今日已完成签到，幂等跳过。")
             return CheckinResult(
                 provider_id=self.id,
                 display_name=self.display_name,
@@ -979,8 +977,6 @@ class WorkBuddyProvider(BaseProvider):
             )
 
         if activity_active is False:
-            if log:
-                log("info", "受控浏览器状态显示当前没有可用的 WorkBuddy 每日签到活动。")
             return CheckinResult(
                 provider_id=self.id,
                 display_name=self.display_name,
@@ -1230,8 +1226,6 @@ class WorkBuddyProvider(BaseProvider):
                 activity_active = self._parse_activity_active(status_payload)
 
             if pre_checked_in is True:
-                if log:
-                    log("info", "远端状态显示今日已完成签到，幂等跳过。")
                 return CheckinResult(
                     provider_id=self.id,
                     display_name=self.display_name,
@@ -1243,8 +1237,6 @@ class WorkBuddyProvider(BaseProvider):
                 )
 
             if activity_active is False:
-                if log:
-                    log("info", "远端状态显示当前没有可用的 WorkBuddy 每日签到活动。")
                 return CheckinResult(
                     provider_id=self.id,
                     display_name=self.display_name,

@@ -174,9 +174,44 @@ def get_ui_lock_path() -> Path:
     return get_data_dir() / "ui.lock"
 
 
+UI_LOG_MAX_BYTES = 512 * 1024
+UI_LOG_KEEP_BYTES = 256 * 1024
+
+
 def get_ui_state_path() -> Path:
     """Return path to the running Web UI state file."""
     return get_data_dir() / "ui-state.json"
+
+
+def get_ui_log_path() -> Path:
+    """Return path to the hidden-mode UI/launcher log file."""
+    return get_data_dir() / "geteggs-ui.log"
+
+
+def trim_log_file(
+    path: Path,
+    *,
+    max_bytes: int = UI_LOG_MAX_BYTES,
+    keep_bytes: int = UI_LOG_KEEP_BYTES,
+) -> bool:
+    """Keep a text log file bounded by retaining the newest tail on a line boundary."""
+    try:
+        size = path.stat().st_size
+        if size <= max_bytes:
+            return False
+        keep = max(1, min(keep_bytes, max_bytes))
+        with path.open("rb") as handle:
+            handle.seek(-keep, os.SEEK_END)
+            tail = handle.read()
+        newline_idx = tail.find(b"\n")
+        if 0 <= newline_idx < len(tail) - 1:
+            tail = tail[newline_idx + 1 :]
+        else:
+            tail = tail.decode("utf-8", errors="ignore").encode("utf-8")
+        path.write_bytes(tail)
+        return True
+    except OSError:
+        return False
 
 
 def get_qoder_pat_path() -> Path:

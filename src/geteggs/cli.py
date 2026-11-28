@@ -183,7 +183,11 @@ def run(
     else:
         trigger = TriggerType.MANUAL_CLI
 
+    hidden_scheduled = scheduled and os.environ.get("GETEGGS_HIDDEN") == "1"
+
     def _print_event(ev: LogEvent) -> None:
+        if hidden_scheduled and ev.level not in ("warning", "error"):
+            return
         style = {"warning": "yellow", "error": "red"}.get(ev.level, "cyan")
         prefix = f"[{ev.provider_id}] " if ev.provider_id else ""
         console.print(f"[{style}]{rich_escape(prefix + ev.message)}[/{style}]")

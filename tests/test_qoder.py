@@ -654,3 +654,35 @@ def test_qoder_pat_file_accepts_raw_token_with_equals_padding(
     provider = QoderProvider()
     pat, _source = provider._resolve_pat(_cfg(pat_file=str(pat_file)))
     assert pat == "pt-base64token=="
+
+
+def test_qoder_checkin_does_not_duplicate_final_result_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_pat(monkeypatch)
+    events: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sash/api/v1/me/campaigns":
+            return httpx.Response(
+                200,
+                json={
+                    "campaigns": [
+                        {
+                            "campaignId": "camp-1",
+                            "actionType": "CLAIM_BENEFIT",
+                            "claimStatus": "CLAIMABLE",
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/sash/api/v1/me/campaigns/camp-1/claim":
+            return httpx.Response(200, json={"status": "CLAIMED"})
+        return httpx.Response(404)
+
+    provider = QoderProvider(transport=httpx.MockTransport(handler))
+    res = asyncio.run(
+        provider.checkin(_cfg(), BIZ_DATE, log=lambda lvl, msg: events.append((lvl, msg)))
+    )
+    assert res.status == CheckinStatus.SUCCESS
+    assert all(msg != res.message for _lvl, msg in events)

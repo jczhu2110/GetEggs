@@ -663,11 +663,17 @@ def test_workbuddy_inactive_activity_returns_unavailable_without_submitting(
 
     provider = WorkBuddyProvider(transport=httpx.MockTransport(handler))
     cfg = ProviderConfig(provider_id="workbuddy", extra={"auth_file_path": str(auth_file)})
-    res = asyncio.run(provider.checkin(cfg, "2026-11-26", dry_run=dry_run))
+    events: list[tuple[str, str]] = []
+    res = asyncio.run(
+        provider.checkin(
+            cfg, "2026-11-26", dry_run=dry_run, log=lambda lvl, msg: events.append((lvl, msg))
+        )
+    )
 
     assert res.status == CheckinStatus.UNAVAILABLE
     assert res.raw_error_type == "ActivityInactive"
     assert "没有可用" in res.message
+    assert all("没有可用" not in msg for _lvl, msg in events)
     assert called_paths == [
         "/v2/billing/meter/checkin-activity-status",
         "/v2/billing/meter/checkin-status",

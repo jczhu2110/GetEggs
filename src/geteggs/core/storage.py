@@ -9,7 +9,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from geteggs.core.config import get_db_path, get_timezone, today_biz_date
+from geteggs.core.config import (
+    get_db_path,
+    get_timezone,
+    today_biz_date,
+    trim_log_file,
+)
 from geteggs.core.models import (
     CheckinResult,
     CheckinStatus,
@@ -811,6 +816,7 @@ class Storage:
     ) -> dict[str, Any]:
         backup_path = self.backup() if backup else None
         deleted = self.cleanup_old_data(settings)
+        ui_log_trimmed = trim_log_file(self.db_path.parent / "geteggs-ui.log")
         vacuumed = False
         vacuum_error: Optional[str] = None
         if vacuum:
@@ -827,6 +833,7 @@ class Storage:
         return {
             "deleted": deleted,
             "backup": str(backup_path) if backup_path else None,
+            "ui_log_trimmed": ui_log_trimmed,
             "vacuumed": vacuumed,
             "vacuum_error": vacuum_error,
             "info": self.get_maintenance_info(),

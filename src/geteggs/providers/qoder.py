@@ -321,7 +321,6 @@ class QoderProvider(BaseProvider):
 
                 campaigns = self._campaigns_from(payload)
                 if not self._has_campaigns_collection(payload):
-                    emit("warning", "Qoder CN 活动响应缺少 campaigns 字段，接口可能已变更。")
                     return self._result(
                         CheckinStatus.SCHEMA_CHANGED,
                         "Qoder CN 活动响应结构异常（缺少 campaigns 字段），接口可能已变更。",
@@ -358,7 +357,6 @@ class QoderProvider(BaseProvider):
 
                 if claimable is None:
                     if claimed is not None:
-                        emit("info", "Qoder CN 今日已完成签到。")
                         return self._result(
                             CheckinStatus.ALREADY_DONE,
                             "今日 Qoder CN 已完成签到。",
@@ -386,7 +384,6 @@ class QoderProvider(BaseProvider):
                     )
 
                 if dry_run:
-                    emit("info", "Dry-Run：检测到今日可签到活动，未提交签到。")
                     return self._result(
                         CheckinStatus.SUCCESS,
                         "Dry-Run：今日可签到（未提交）。",
@@ -453,7 +450,6 @@ class QoderProvider(BaseProvider):
                         raw_error_type="QoderClaimUnconfirmed",
                     )
 
-                emit("info", "已完成 Qoder CN 今日签到。")
                 return self._result(
                     CheckinStatus.SUCCESS,
                     "已完成 Qoder CN 今日签到。",

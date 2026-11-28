@@ -941,3 +941,86 @@ def test_cli_status_renders_without_credit_or_streak_columns(
     assert "WorkBuddy" in res.output
     assert "连签天数" not in res.output
     assert "今日新增" not in res.output
+
+
+def test_lazy_log_stream_skips_empty_writes_and_trims_oversized_log(
+    tmp_path: Path,
+) -> None:
+    from rich.console import Console
+
+    from geteggs.__main__ import _LazyLogStream
+    from geteggs.core.config import trim_log_file
+
+    log_path = tmp_path / "geteggs-ui.log"
+    stream = _LazyLogStream(log_path, ["open"])
+    stream.write("")
+    stream.write("   \n")
+    stream.flush()
+    stream.close()
+    assert not log_path.exists()
+
+    stream2 = _LazyLogStream(log_path, ["run", "--scheduled"])
+    Console(file=stream2, force_terminal=False).print("[yellow]boom[/yellow]")
+    stream2.close()
+    content = log_path.read_text(encoding="utf-8")
+    assert "argv=['run', '--scheduled']" in content
+    assert "boom" in content
+
+    # Verify size bounding keeps the newest tail aligned on a line boundary.
+    lines = [f"line-{idx:04d} 中文日志内容\n" for idx in range(200)]
+    log_path.write_text("".join(lines), encoding="utf-8")
+    assert trim_log_file(log_path, max_bytes=1024, keep_bytes=512) is True
+    trimmed = log_path.read_text(encoding="utf-8")
+    assert len(trimmed.encode("utf-8")) <= 512
+    assert "line-0199" in trimmed
+    assert "line-0000" not in trimmed
+    assert trim_log_file(log_path, max_bytes=1024, keep_bytes=512) is False
+
+
+def test_cli_run_hidden_scheduled_suppresses_info_logs_but_keeps_warnings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from geteggs.core.models import (
+        CheckinResult,
+        CheckinStatus,
+        LogEvent,
+        RunSummary,
+        TriggerType,
+    )
+
+    monkeypatch.setenv("GETEGGS_HOME", str(tmp_path))
+
+    async def fake_run(self, **kwargs):
+        sink = kwargs.get("event_sink")
+        if sink:
+            sink(LogEvent(level="info", provider_id="qoder", message="INFO_HIDDEN_CHECK"))
+            sink(LogEvent(level="warning", provider_id="qoder", message="WARN_VISIBLE_CHECK"))
+        return RunSummary(
+            run_id="r-hidden",
+            trigger_type=TriggerType.SCHEDULED,
+            started_at="2026-11-28T02:05:00+00:00",
+            finished_at="2026-11-28T02:05:01+00:00",
+            results=[
+                CheckinResult(
+                    provider_id="qoder",
+                    display_name="Qoder",
+                    status=CheckinStatus.SUCCESS,
+                    message="ok",
+                    biz_date="2026-11-28",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(cli.CheckinRunner, "run", fake_run)
+
+    monkeypatch.setenv("GETEGGS_HIDDEN", "1")
+    hidden_res = runner.invoke(cli.app, ["run", "--scheduled"])
+    assert hidden_res.exit_code == 0
+    assert "INFO_HIDDEN_CHECK" not in hidden_res.output
+    assert "WARN_VISIBLE_CHECK" in hidden_res.output
+
+    monkeypatch.delenv("GETEGGS_HIDDEN", raising=False)
+    interactive_res = runner.invoke(cli.app, ["run", "--scheduled"])
+    assert interactive_res.exit_code == 0
+    assert "INFO_HIDDEN_CHECK" in interactive_res.output
+    assert "WARN_VISIBLE_CHECK" in interactive_res.output

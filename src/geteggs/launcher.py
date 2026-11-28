@@ -25,7 +25,12 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from geteggs.core.config import get_data_dir, get_ui_state_path
+from geteggs.core.config import (
+    get_data_dir,
+    get_ui_log_path,
+    get_ui_state_path,
+    trim_log_file,
+)
 
 UI_START_TIMEOUT = 20.0
 SPLASH_REDIRECT_TIMEOUT = 15.0
@@ -415,8 +420,9 @@ def open_url(url: str) -> bool:
 
 
 def notify_failure(message: str) -> None:
-    log_path = get_data_dir() / "geteggs-ui.log"
+    log_path = get_ui_log_path()
     try:
+        trim_log_file(log_path)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
     except OSError:
